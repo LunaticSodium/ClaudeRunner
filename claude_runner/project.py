@@ -253,6 +253,9 @@ class ExecutionConfig(BaseModel):
         Pass ``--dangerously-skip-permissions`` to Claude Code.  Allows the
         model to execute filesystem and shell actions without interactive
         approval prompts.  **Only safe inside a Docker sandbox.**
+        When left unset (``None``), the value is resolved by the parent
+        ``ProjectBook`` validator: ``True`` if a Docker sandbox is configured,
+        ``False`` otherwise.  Set explicitly to override the default.
     context:
         Context-window management settings.
     milestones:
@@ -272,7 +275,14 @@ class ExecutionConfig(BaseModel):
         description="Consecutive rate-limit responses before task is aborted.",
     )
     resume_strategy: ResumeStrategy = "continue"
-    skip_permissions: bool = False
+    skip_permissions: bool | None = Field(
+        default=None,
+        description=(
+            "Pass --dangerously-skip-permissions to Claude Code. "
+            "Defaults to True when a Docker sandbox is configured, False otherwise. "
+            "Set explicitly to override."
+        ),
+    )
     context: ContextConfig = Field(default_factory=ContextConfig)
     milestones: list[Milestone] = Field(default_factory=list)
 
@@ -459,6 +469,18 @@ class ProjectBook(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
+
+    @model_validator(mode="after")
+    def resolve_skip_permissions(self) -> "ProjectBook":
+        """Resolve skip_permissions to a concrete bool based on sandbox mode.
+
+        - Docker sandbox present → default True (safe inside container)
+        - Native / no sandbox   → default False (requires explicit opt-in)
+        - Explicit value in YAML → respected as-is regardless of sandbox mode
+        """
+        if self.execution.skip_permissions is None:
+            self.execution.skip_permissions = self.sandbox is not None
+        return self
 
     @model_validator(mode="after")
     def warn_skip_permissions_without_docker(self) -> "ProjectBook":
