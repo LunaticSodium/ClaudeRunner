@@ -416,6 +416,12 @@ class TaskRunner:
         await _maybe_await(self._sandbox.setup)
         logger.info("[ACTION] Sandbox ready.")
 
+        # --- Seed project book into working dir ----------------------------
+        # Copy the YAML file into the working directory so Claude Code running
+        # inside the sandbox can read the project book directly (e.g. for
+        # self-reference or documentation purposes).
+        self._seed_project_folder()
+
         # --- Progress log --------------------------------------------------
         self._init_progress_log()
 
@@ -1473,6 +1479,33 @@ class TaskRunner:
         """Return the task's working directory as a Path."""
         from .sandbox import resolve_working_dir  # noqa: PLC0415
         return resolve_working_dir(self._book, book_path=self._book_path)
+
+    def _seed_project_folder(self) -> None:
+        """Copy the project book YAML into the working directory.
+
+        This lets Claude Code (running inside the sandbox with the working
+        directory as its root) read the project book directly — e.g. to
+        understand the task spec or refer back to constraints.
+
+        The file is always overwritten so it stays in sync with the source.
+        Skipped silently when no book_path is known (programmatic use).
+        """
+        if self._book_path is None:
+            return
+        wd = self._working_dir()
+        dest = wd / self._book_path.name
+        # Never overwrite if source and destination resolve to the same file.
+        try:
+            if dest.resolve() == self._book_path.resolve():
+                return
+        except OSError:
+            pass
+        try:
+            import shutil as _shutil  # noqa: PLC0415
+            _shutil.copy2(str(self._book_path), str(dest))
+            logger.info("[ACTION] Project book seeded into working dir: %s", dest)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not copy project book to working dir: %s", exc)
 
     def _progress_log_path(self) -> Path:
         """Return the absolute path to progress.log inside the working directory."""
