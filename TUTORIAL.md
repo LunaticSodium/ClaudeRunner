@@ -118,13 +118,13 @@ The `git init` is needed for the runner's git integration to track changes.
 
 ---
 
-## Step 4 — Write the project book
+## Step 4 — Edit the bundled project book
 
-Create a file called `hello_claude.yaml` anywhere you like (or inside the
-`projects/` folder of the repo):
+Open `projects/hello_world.yaml` (included with the repo and inside the exe).
+The only line you need to change is `sandbox.working_dir`:
 
 ```yaml
-# hello_claude.yaml — minimal hello-world project book
+# projects/hello_world.yaml
 
 name: Hello Claude
 description: A simple first task to verify the whole stack is working.
@@ -163,11 +163,9 @@ notify:
     - type: desktop          # Windows toast notification when the task ends
 ```
 
-**Two things to check before saving:**
+**One thing to check before running:**
 
 - `sandbox.working_dir` must match the folder you created in Step 3.
-- `skip_permissions: true` is safe here because there is no Docker sandbox
-  and the task is trivial.  For real tasks always use Docker.
 
 ---
 
@@ -176,7 +174,7 @@ notify:
 Check for typos before running:
 
 ```cmd
-claude-runner validate hello_claude.yaml
+claude-runner validate projects/hello_world.yaml
 ```
 
 Expected output:
@@ -194,7 +192,7 @@ If you see a validation error, check:
 ## Step 6 — Run it
 
 ```cmd
-claude-runner run hello_claude.yaml --tui
+claude-runner run projects/hello_world.yaml --tui
 ```
 
 The `--tui` flag (on by default) shows a live Rich terminal panel:

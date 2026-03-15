@@ -111,27 +111,44 @@ The wizard asks for:
 
 The resulting config file is plain YAML and can be edited by hand at any time (see [Configuration](#configuration)).
 
-### 3. Write a project book
+### 3. Run the hello-world example
 
-Create a YAML file describing your task. See [Project Book Format](#project-book-format) for the full schema.
+The bundled `projects/hello_world.yaml` is the recommended first task.
+Open it, set `sandbox.working_dir` to an empty git-initialised directory, then:
+
+```cmd
+mkdir C:\Projects\hello-claude
+cd C:\Projects\hello-claude
+git init
+claude-runner run projects/hello_world.yaml
+```
+
+Claude will create `hello.py`, run it, write a `README.md`, and commit the result.
+See [TUTORIAL.md](TUTORIAL.md) for a full step-by-step walkthrough.
+
+### 4. Write your own project book
 
 ```yaml
-# projects/my-project.yaml
-name: my-project
+# projects/my-task.yaml
+name: my-task
 description: Refactor the authentication module to use JWTs.
-repo: https://github.com/my-org/my-app.git
-branch: main
-sandbox: docker
-goal: |
+
+prompt: |
   Refactor auth/session.py and auth/middleware.py to issue and verify
   JWT tokens using PyJWT. Remove the legacy cookie-based session store.
   Add unit tests. Do not touch any file outside the auth/ directory.
+
+sandbox:
+  working_dir: C:/Projects/my-app   # must exist on host
+
+notify:
+  on: [complete, error]
+  channels:
+    - type: desktop
 ```
 
-### 4. Run
-
 ```cmd
-claude-runner run my-project
+claude-runner run projects/my-task.yaml
 ```
 
 claude-runner will:
