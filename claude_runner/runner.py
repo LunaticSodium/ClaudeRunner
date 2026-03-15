@@ -240,6 +240,7 @@ class TaskRunner:
         sandbox=None,
         tui=None,
         resume: bool = False,
+        project_book_path: Optional[str] = None,
     ) -> None:
         self._book = project_book
         self._config = config
@@ -247,6 +248,15 @@ class TaskRunner:
         self._tui_callback = tui_callback
         self._tui = tui
         self._resume = resume
+        self._book_path: Optional[Path] = Path(project_book_path) if project_book_path else None
+        # Unique filesystem identifier derived from the YAML filename stem.
+        # Keying off the filename (not book.name) prevents collisions when two
+        # project books share the same name: field but live in the same folder.
+        self._project_id: str = (
+            _safe_name(self._book_path.stem)
+            if self._book_path is not None
+            else _safe_name(self._book.name)
+        )
         self._secrets_config = self._load_secrets_config()
 
         # Resolved lazily once run() begins.
@@ -480,7 +490,7 @@ class TaskRunner:
 
         # --- Persistence ---------------------------------------------------
         state_dir = Path.home() / ".claude-runner" / "state"
-        self._persistence = PersistenceManager(state_dir=state_dir, task_name=self._book.name)
+        self._persistence = PersistenceManager(state_dir=state_dir, task_name=self._project_id)
         self._persistence.save(self._make_state("running", rate_limit_wait_count=0))
         logger.info("[ACTION] State file created (phase=running).")
 
@@ -945,7 +955,7 @@ class TaskRunner:
 
         branch_prefix = getattr(git_cfg, "branch_prefix", "claude-task/")
         auto_push = getattr(git_cfg, "auto_push", False)
-        slug = _safe_name(self._book.name)
+        slug = self._project_id
         timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         branch_name = f"{branch_prefix}{slug}-{timestamp}"
 
@@ -1161,7 +1171,7 @@ class TaskRunner:
         log_dir = self._host_log_dir()
         if log_dir is None:
             return
-        dest = log_dir / f"{_safe_name(self._book.name)}_progress.log"
+        dest = log_dir / f"{self._project_id}_progress.log"
         try:
             dest.write_text(contents or "(empty)", encoding="utf-8")
             logger.info("[ACTION] progress.log saved to host: %s.", dest)
@@ -1188,7 +1198,7 @@ class TaskRunner:
 
         log_dir.mkdir(parents=True, exist_ok=True)
         report_name = (
-            f"{_safe_name(self._book.name)}_"
+            f"{self._project_id}_"
             f"{result.start_time.strftime('%Y%m%d_%H%M%S')}_report.txt"
         )
         report_path = log_dir / report_name
@@ -1530,8 +1540,8 @@ class TaskRunner:
         )
         progress_path = self._progress_log_path()
         defaults = dict(
-            task_name=self._book.name,
-            project_book_path=str(getattr(self, "_book_path", self._book.name)),
+            task_name=self._project_id,
+            project_book_path=str(self._book_path) if self._book_path is not None else self._book.name,
             start_time=start_iso,
             current_phase=phase,
             rate_limit_wait_count=self._rate_limit_cycles,

@@ -522,6 +522,7 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
             tui=tui_manager,
             api_key=api_key,
             resume=resume_session,
+            project_book_path=project_book,
         )
 
         result = asyncio.run(runner.run())
@@ -716,7 +717,7 @@ def validate(project_book: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @cli.command("status")
-@click.option("--task", default=None, help="Task name to inspect (defaults to most recent).")
+@click.option("--task", default=None, help="YAML filename stem to inspect, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 def status(task: Optional[str]) -> None:
     """Check the status of a running or completed task.
 
@@ -764,7 +765,7 @@ def status(task: Optional[str]) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @cli.command("abort")
-@click.option("--task", default=None, help="Task name to abort (defaults to most recent).")
+@click.option("--task", default=None, help="YAML filename stem to abort, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 @click.option("--force", is_flag=True, default=False, help="Skip confirmation prompt.")
 def abort(task: Optional[str], force: bool) -> None:
     """Abort a running task.
@@ -833,7 +834,7 @@ def abort(task: Optional[str], force: bool) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @cli.command("logs")
-@click.option("--task", default=None, help="Task name (defaults to most recent).")
+@click.option("--task", default=None, help="YAML filename stem, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 @click.option("--tail", default=50, show_default=True, help="Number of lines to show.")
 @click.option("--raw", is_flag=True, default=False, help="Print raw log without formatting.")
 def logs(task: Optional[str], tail: int, raw: bool) -> None:
