@@ -1,0 +1,58 @@
+name: furina-ascii
+description: >
+  Generate a Python script that opens a terminal and displays a full-body
+  colored ASCII art portrait of Furina (Focalors) from Genshin Impact,
+  followed by one of her iconic entrance lines. Package as a standalone
+  Windows .exe.
+goal: |
+  You are working in an empty Python project directory.
+
+  1. Search the web for Furina (Focalors) from Genshin Impact:
+     her appearance (blue and white outfit, top hat, color scheme),
+     and one of her most iconic entrance or greeting lines (any language).
+
+  2. Design a full-body colored ASCII art portrait of Furina using ANSI
+     escape codes. The portrait must:
+     - Be recognizably Furina specifically (top hat, outfit colors, pose)
+     - Use her color palette: white, navy blue, gold accents
+     - Be at least 40 lines tall and show her full body
+
+  3. Write furina.py that:
+     - Clears the terminal on launch
+     - Prints the colored ASCII portrait
+     - Prints her iconic line below the portrait
+     - Waits for a keypress before exiting
+     - Handles Windows UTF-8 terminal encoding correctly
+     - Works in both cmd.exe and Windows Terminal
+
+  4. Run the script to confirm it works without errors.
+
+  5. Package it with PyInstaller:
+       pip install pyinstaller
+       pyinstaller --onefile --console furina.py
+     Confirm dist/furina.exe exists.
+
+  Deliverable: dist/furina.exe — a standalone Windows executable.
+
+sandbox: docker
+execution:
+  skip_permissions: true
+  timeout_hours: 2
+sandbox_config:
+  working_dir: C:\temp\furina-test
+  network:
+    allow:
+      - pypi.org
+      - files.pythonhosted.org
+      - www.google.com
+      - wiki.hoyolab.com
+      - genshin-impact.fandom.com
+notify:
+  on: [complete, error]
+  channels:
+    - type: webhook
+      url: https://ntfy.sh/claude-runner-honacoo
+context_anchors: |
+  This is a creative coding task. Prioritize visual quality of the ASCII art
+  over code elegance. The portrait must be recognizably Furina, not a generic
+  anime character.

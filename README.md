@@ -1,5 +1,16 @@
 # claude-runner
 
+## Download
+
+**For most users: download the latest `claude-runner.exe` from
+[Releases](https://github.com/LunaticSodium/ClaudeRunner/releases)
+and skip to [Configuration](#configuration).
+No Python or git required.**
+
+*(Releases not yet published — install from source for now, see [Quick Start](#quick-start).)*
+
+---
+
 `claude-runner` is a Windows CLI tool that orchestrates [Claude Code](https://docs.anthropic.com/claude/docs/claude-code) as a fully autonomous subprocess. You describe a project in a YAML "project book", point the runner at it, and it drives Claude Code end-to-end: spinning up an isolated sandbox, feeding Claude its instructions, monitoring for rate-limit pauses, resuming automatically, routing desktop/email/webhook notifications, and trimming context when the conversation approaches the model's token ceiling. The result is an unattended, long-running automation loop suitable for overnight coding sessions, CI-like pipelines, or any task too large to supervise manually.
 
 ---
@@ -75,7 +86,7 @@ To view or delete stored credentials later:
 
 **From the pre-built executable (recommended for most users)**
 
-Download `claude-runner.exe` from the releases page *(releases not yet available — install from source)* and place it somewhere on your `PATH` (e.g., `C:\Users\<you>\bin\`). No Python installation is required on the target machine.
+Download `claude-runner.exe` from the [Releases](https://github.com/LunaticSodium/ClaudeRunner/releases) page and place it somewhere on your `PATH` (e.g., `C:\Users\<you>\bin\`). No Python installation is required on the target machine.
 
 **From source**
 
