@@ -75,12 +75,12 @@ To view or delete stored credentials later:
 
 **From the pre-built executable (recommended for most users)**
 
-Download `claude-runner.exe` from the releases page and place it somewhere on your `PATH` (e.g., `C:\Users\<you>\bin\`). No Python installation is required on the target machine.
+Download `claude-runner.exe` from the releases page *(releases not yet available — install from source)* and place it somewhere on your `PATH` (e.g., `C:\Users\<you>\bin\`). No Python installation is required on the target machine.
 
 **From source**
 
 ```cmd
-git clone https://github.com/your-org/claude-runner.git
+git clone https://github.com/LunaticSodium/ClaudeRunner.git
 cd claude-runner
 pip install -e ".[dev]"
 ```
@@ -513,7 +513,7 @@ Both commands must succeed before running claude-runner. If `claude auth status`
 ### Install from source
 
 ```cmd
-git clone https://github.com/your-org/claude-runner.git
+git clone https://github.com/LunaticSodium/ClaudeRunner.git
 cd claude-runner
 python -m venv .venv
 .venv\Scripts\activate
