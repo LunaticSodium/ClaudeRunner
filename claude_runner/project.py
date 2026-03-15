@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -309,6 +309,15 @@ class ExecutionConfig(BaseModel):
     )
     context: ContextConfig = Field(default_factory=ContextConfig)
     milestones: list[Milestone] = Field(default_factory=list)
+    silence_timeout_minutes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Minutes of output silence before the runner sends a 'continue' probe "
+            "and, if still silent, declares a hung-process error. "
+            "Defaults to 5 minutes when not set."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

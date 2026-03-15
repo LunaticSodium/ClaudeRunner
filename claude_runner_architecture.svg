@@ -1,0 +1,222 @@
+<svg width="100%" viewBox="0 0 680 920" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+  <style>
+    text { font-family: sans-serif; fill: #3d3d3a; }
+    .t  { font-size: 14px; font-weight: 400; }
+    .ts { font-size: 12px; font-weight: 400; fill: #73726c; }
+    .th { font-size: 14px; font-weight: 500; fill: #3d3d3a; }
+
+    /* c-teal */
+    .c-teal rect  { fill: #E1F5EE; stroke: #0F6E56; }
+    .c-teal .th   { fill: #085041; }
+    .c-teal .ts   { fill: #0F6E56; }
+
+    /* c-purple */
+    .c-purple rect { fill: #EEEDFE; stroke: #534AB7; }
+    .c-purple .th  { fill: #3C3489; }
+    .c-purple .ts  { fill: #534AB7; }
+
+    /* c-blue */
+    .c-blue rect { fill: #E6F1FB; stroke: #185FA5; }
+    .c-blue .th  { fill: #0C447C; }
+    .c-blue .ts  { fill: #185FA5; }
+
+    /* c-amber */
+    .c-amber rect { fill: #FAEEDA; stroke: #BA7517; }
+    .c-amber .th  { fill: #633806; }
+    .c-amber .ts  { fill: #854F0B; }
+
+    /* c-coral */
+    .c-coral rect { fill: #FAECE7; stroke: #993C1D; }
+    .c-coral .th  { fill: #712B13; }
+    .c-coral .ts  { fill: #993C1D; }
+
+    /* c-gray */
+    .c-gray rect { fill: #F1EFE8; stroke: #5F5E5A; }
+    .c-gray .th  { fill: #2C2C2A; }
+    .c-gray .ts  { fill: #5F5E5A; }
+
+    line, path { fill: none; }
+  </style>
+</defs>
+
+<!-- ── LAYER LABELS ── -->
+<text class="ts" x="28" y="108" text-anchor="middle" transform="rotate(-90,28,108)">user</text>
+<text class="ts" x="28" y="310" text-anchor="middle" transform="rotate(-90,28,310)">host machine</text>
+<text class="ts" x="28" y="570" text-anchor="middle" transform="rotate(-90,28,570)">docker container</text>
+<text class="ts" x="28" y="790" text-anchor="middle" transform="rotate(-90,28,790)">external</text>
+
+<!-- ── LAYER BANDS ── -->
+<rect x="44" y="56"  width="624" height="110" rx="10" fill="none" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+<rect x="44" y="176" width="624" height="270" rx="10" fill="none" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+<rect x="44" y="456" width="624" height="250" rx="10" fill="none" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+<rect x="44" y="716" width="624" height="130" rx="10" fill="none" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3"/>
+
+<!-- ══ ROW 1 — USER INPUTS ══ -->
+<g class="c-teal">
+  <rect x="64"  y="72" width="140" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="134" y="90"  text-anchor="middle" dominant-baseline="central">project book</text>
+  <text class="ts" x="134" y="107" text-anchor="middle" dominant-baseline="central">YAML file</text>
+</g>
+<g class="c-teal">
+  <rect x="226" y="72" width="140" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="296" y="90"  text-anchor="middle" dominant-baseline="central">CLI / GUI menu</text>
+  <text class="ts" x="296" y="107" text-anchor="middle" dominant-baseline="central">run / configure</text>
+</g>
+<g class="c-teal">
+  <rect x="388" y="72" width="140" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="458" y="90"  text-anchor="middle" dominant-baseline="central">phone / ntfy</text>
+  <text class="ts" x="458" y="107" text-anchor="middle" dominant-baseline="central">cmd channel (v2)</text>
+</g>
+<g class="c-gray">
+  <rect x="540" y="72" width="116" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="598" y="90"  text-anchor="middle" dominant-baseline="central">secrets</text>
+  <text class="ts" x="598" y="107" text-anchor="middle" dominant-baseline="central">Win Credential Mgr</text>
+</g>
+
+<!-- ══ ROW 2 — HOST PYTHON ══ -->
+<g class="c-purple">
+  <rect x="64"  y="192" width="120" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="124" y="210" text-anchor="middle" dominant-baseline="central">main.py</text>
+  <text class="ts" x="124" y="227" text-anchor="middle" dominant-baseline="central">click CLI entry</text>
+</g>
+<g class="c-purple">
+  <rect x="64"  y="264" width="120" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="124" y="282" text-anchor="middle" dominant-baseline="central">project.py</text>
+  <text class="ts" x="124" y="299" text-anchor="middle" dominant-baseline="central">pydantic schema</text>
+</g>
+<g class="c-purple">
+  <rect x="64"  y="336" width="120" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="124" y="354" text-anchor="middle" dominant-baseline="central">config.py</text>
+  <text class="ts" x="124" y="371" text-anchor="middle" dominant-baseline="central">4-source key chain</text>
+</g>
+<g class="c-blue">
+  <rect x="224" y="210" width="160" height="56" rx="8" stroke-width="1"/>
+  <text class="th" x="304" y="232" text-anchor="middle" dominant-baseline="central">runner.py</text>
+  <text class="ts" x="304" y="252" text-anchor="middle" dominant-baseline="central">orchestration loop</text>
+</g>
+<g class="c-purple">
+  <rect x="224" y="298" width="120" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="284" y="316" text-anchor="middle" dominant-baseline="central">rate_limit.py</text>
+  <text class="ts" x="284" y="333" text-anchor="middle" dominant-baseline="central">detect · wait · resume</text>
+</g>
+<g class="c-purple">
+  <rect x="224" y="364" width="140" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="294" y="382" text-anchor="middle" dominant-baseline="central">context_manager</text>
+  <text class="ts" x="294" y="399" text-anchor="middle" dominant-baseline="central">token est · checkpoint</text>
+</g>
+<g class="c-gray">
+  <rect x="400" y="192" width="110" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="455" y="210" text-anchor="middle" dominant-baseline="central">tui.py</text>
+  <text class="ts" x="455" y="227" text-anchor="middle" dominant-baseline="central">rich terminal UI</text>
+</g>
+<g class="c-amber">
+  <rect x="400" y="258" width="110" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="455" y="276" text-anchor="middle" dominant-baseline="central">notify.py</text>
+  <text class="ts" x="455" y="293" text-anchor="middle" dominant-baseline="central">apprise · guard</text>
+</g>
+<g class="c-gray">
+  <rect x="400" y="324" width="110" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="455" y="342" text-anchor="middle" dominant-baseline="central">persistence.py</text>
+  <text class="ts" x="455" y="359" text-anchor="middle" dominant-baseline="central">JSON state · trash log</text>
+</g>
+<g class="c-coral">
+  <rect x="400" y="390" width="110" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="455" y="408" text-anchor="middle" dominant-baseline="central">sandbox/</text>
+  <text class="ts" x="455" y="425" text-anchor="middle" dominant-baseline="central">docker · native</text>
+</g>
+<g class="c-purple">
+  <rect x="536" y="258" width="116" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="594" y="276" text-anchor="middle" dominant-baseline="central">process.py</text>
+  <text class="ts" x="594" y="293" text-anchor="middle" dominant-baseline="central">ConPTY · wexpect</text>
+</g>
+
+<!-- ══ ROW 3 — DOCKER CONTAINER ══ -->
+<rect x="64" y="472" width="500" height="218" rx="12" fill="none" stroke="#888780" stroke-width="1" stroke-dasharray="6 3"/>
+<text class="ts" x="84" y="492">docker container (claude-runner-base)</text>
+<g class="c-blue">
+  <rect x="90"  y="504" width="150" height="56" rx="8" stroke-width="1"/>
+  <text class="th" x="165" y="526" text-anchor="middle" dominant-baseline="central">claude code CLI</text>
+  <text class="ts" x="165" y="546" text-anchor="middle" dominant-baseline="central">Node.js · npm pkg</text>
+</g>
+<g class="c-teal">
+  <rect x="270" y="504" width="130" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="335" y="522" text-anchor="middle" dominant-baseline="central">/workspace</text>
+  <text class="ts" x="335" y="539" text-anchor="middle" dominant-baseline="central">working_dir mount</text>
+</g>
+<g class="c-teal">
+  <rect x="270" y="568" width="130" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="335" y="586" text-anchor="middle" dominant-baseline="central">progress.log</text>
+  <text class="ts" x="335" y="603" text-anchor="middle" dominant-baseline="central">.claude-runner/</text>
+</g>
+<g class="c-gray">
+  <rect x="420" y="504" width="130" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="485" y="522" text-anchor="middle" dominant-baseline="central">/ref/* mounts</text>
+  <text class="ts" x="485" y="539" text-anchor="middle" dominant-baseline="central">readonly bind mounts</text>
+</g>
+<text class="ts" x="594" y="535" text-anchor="middle">PTY stdin</text>
+<text class="ts" x="594" y="550" text-anchor="middle">PTY stdout</text>
+
+<!-- ══ ROW 4 — EXTERNAL ══ -->
+<g class="c-blue">
+  <rect x="64"  y="732" width="130" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="129" y="750" text-anchor="middle" dominant-baseline="central">Anthropic API</text>
+  <text class="ts" x="129" y="767" text-anchor="middle" dominant-baseline="central">api.anthropic.com</text>
+</g>
+<g class="c-amber">
+  <rect x="216" y="732" width="130" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="281" y="750" text-anchor="middle" dominant-baseline="central">ntfy.sh</text>
+  <text class="ts" x="281" y="767" text-anchor="middle" dominant-baseline="central">push notifications</text>
+</g>
+<g class="c-gray">
+  <rect x="368" y="732" width="130" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="433" y="750" text-anchor="middle" dominant-baseline="central">PyPI / GitHub</text>
+  <text class="ts" x="433" y="767" text-anchor="middle" dominant-baseline="central">packages · git remote</text>
+</g>
+<g class="c-gray">
+  <rect x="520" y="732" width="130" height="44" rx="8" stroke-width="0.5"/>
+  <text class="th" x="585" y="750" text-anchor="middle" dominant-baseline="central">SMTP / desktop</text>
+  <text class="ts" x="585" y="767" text-anchor="middle" dominant-baseline="central">email · toast</text>
+</g>
+
+<!-- ══ ARROWS ══ -->
+<path d="M134 116 L124 192" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M296 116 L200 214" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M458 116 L370 232" stroke="#888780" stroke-width="1" stroke-dasharray="5 3" marker-end="url(#arrow)"/>
+<path d="M540 94  L184 358" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="124" y1="236" x2="124" y2="264" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M184 286 L224 238" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M184 358 L224 256" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="284" y1="266" x2="284" y2="298" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M294 266 L294 364" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M384 230 L400 214" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M384 248 L400 276" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M384 252 L400 342" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M384 256 L400 408" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M510 412 L594 302" stroke="#993C1D" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="594" y1="302" x2="594" y2="532" stroke="#888780" stroke-width="1.5" stroke-dasharray="4 2"/>
+<line x1="594" y1="532" x2="240" y2="532" stroke="#888780" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arrow)"/>
+<path d="M455 434 L310 504" stroke="#993C1D" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="240" y1="526" x2="270" y2="526" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<line x1="335" y1="548" x2="335" y2="568" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M165 560 L129 732" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M240 532 L433 732" stroke="#888780" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M455 302 L281 732" stroke="#BA7517" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M510 280 L585 732" stroke="#BA7517" stroke-width="1" marker-end="url(#arrow)"/>
+<path d="M400 600 L433 732" stroke="#888780" stroke-width="1" stroke-dasharray="4 2" marker-end="url(#arrow)"/>
+
+<!-- ── LEGEND ── -->
+<line x1="64"  y1="870" x2="90"  y2="870" stroke="#888780" stroke-width="1.5"/>
+<text class="ts" x="96"  y="874">data / control flow</text>
+<line x1="200" y1="870" x2="226" y2="870" stroke="#888780" stroke-width="1.5" stroke-dasharray="4 2"/>
+<text class="ts" x="232" y="874">PTY stream / optional</text>
+<rect x="348" y="862" width="12" height="12" rx="2" fill="#1D9E75" opacity="0.5"/>
+<text class="ts" x="366" y="874">user-facing I/O</text>
+<rect x="440" y="862" width="12" height="12" rx="2" fill="#534AB7" opacity="0.5"/>
+<text class="ts" x="458" y="874">Python modules</text>
+<rect x="536" y="862" width="12" height="12" rx="2" fill="#378ADD" opacity="0.5"/>
+<text class="ts" x="554" y="874">Claude Code / API</text>
+</svg>

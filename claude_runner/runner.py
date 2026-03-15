@@ -38,6 +38,7 @@ import re
 import shutil
 import subprocess
 import textwrap
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,6 +73,10 @@ _STATE_CHECKPOINT_INTERVAL_S: float = 30.0
 # How often (in seconds) the main loop polls the process for new output when
 # using the polling fallback (non-PTY modes).
 _POLL_INTERVAL_S: float = 0.05
+
+# Default silence window before the watchdog sends a probe (seconds).
+# Overridable per-task via execution.silence_timeout_minutes in the project book.
+_SILENCE_TIMEOUT_S: float = 300.0  # 5 minutes
 
 # Directory name created inside the working directory for claude-runner artefacts.
 _RUNNER_DIR = ".claude-runner"
@@ -268,6 +273,10 @@ class TaskRunner:
         self._runner_complete_event: asyncio.Event = asyncio.Event()
         self._runner_error_event: asyncio.Event = asyncio.Event()
         self._runner_error_message: Optional[str] = None
+
+        # Silence watchdog: tracks last output time and the background task.
+        self._last_output_time: float = time.monotonic()
+        self._silence_watchdog_task: Optional[asyncio.Task] = None
 
         # Filesystem snapshot taken at task start (fallback when git unavailable).
         self._fs_snapshot_start: dict[str, tuple[int, float]] = {}  # path → (size, mtime)
@@ -481,9 +490,22 @@ class TaskRunner:
         # Start background state-checkpoint heartbeat.
         self._checkpoint_task = asyncio.create_task(self._state_checkpoint_loop())
 
+        # Start silence watchdog (detects hung process / missed rate limits).
+        exec_cfg = getattr(self._book, "execution", None)
+        _silence_min = getattr(exec_cfg, "silence_timeout_minutes", None)
+        silence_timeout_s = float(_silence_min * 60) if _silence_min is not None else _SILENCE_TIMEOUT_S
+        self._last_output_time = time.monotonic()
+        self._silence_watchdog_task = asyncio.create_task(
+            self._silence_watchdog(silence_timeout_s)
+        )
+
         # --- Build initial prompt -----------------------------------------
         initial_prompt = self._build_initial_prompt()
-        self._context_manager.set_original_prompt(initial_prompt)  # for 'restate' strategy
+        # Store only the decorated portion (RUNNER_PROTOCOL + anchors + task prompt,
+        # without _PROGRESS_LOG_INSTRUCTION) so the 'restate' resume strategy
+        # does not re-send the one-time log maintenance instruction.
+        decorated = initial_prompt[len(_PROGRESS_LOG_INSTRUCTION):]
+        self._context_manager.set_original_prompt(decorated)
         self._context_manager.count_input(initial_prompt)
 
         # --- Notify TUI about context_anchors status ----------------------
@@ -798,6 +820,7 @@ class TaskRunner:
 
         if clean:
             self._output_lines.append(clean)
+            self._last_output_time = time.monotonic()
 
         # Feed rate-limit / runner-marker detector (works on the clean line).
         if self._rate_detector is not None:
@@ -811,9 +834,10 @@ class TaskRunner:
                 self._runner_error_message = msg
                 self._runner_error_event.set()
 
-        # Token counting.
+        # Token counting + checkpoint-end detection.
         if self._context_manager is not None:
             self._context_manager.count_output(clean)
+            self._context_manager.notify_output_line(clean)
 
         # TUI update.
         self._tui_update("output_line", {"line": clean, "raw": line})
@@ -1249,18 +1273,64 @@ class TaskRunner:
             logger.debug("Heartbeat checkpoint: saving state.")
             self._checkpoint_state()
 
+    async def _silence_watchdog(self, silence_timeout_s: float) -> None:
+        """
+        Background coroutine that detects prolonged output silence.
+
+        On each wake cycle (every *silence_timeout_s* seconds):
+          1. If no output was received during the sleep → log a warning and
+             send a ``continue`` probe to the process.
+          2. Sleep another *silence_timeout_s*.
+          3. If still no output after the probe → set _runner_error_event and exit.
+
+        Resets automatically whenever _last_output_time is updated (i.e. whenever
+        a non-empty output line arrives).
+        """
+        while True:
+            await asyncio.sleep(silence_timeout_s)
+
+            elapsed = time.monotonic() - self._last_output_time
+            if elapsed < silence_timeout_s:
+                # New output arrived during our sleep — nothing to do.
+                continue
+
+            logger.warning(
+                "No output for %.0fs — possible undetected rate limit.  Sending probe.",
+                elapsed,
+            )
+            try:
+                self._send_to_process("continue\n")
+            except Exception as exc:
+                logger.warning("Silence probe send failed: %s", exc)
+
+            # Wait one more window; if output resumes, the next cycle is a no-op.
+            await asyncio.sleep(silence_timeout_s)
+
+            elapsed2 = time.monotonic() - self._last_output_time
+            if elapsed2 >= silence_timeout_s:
+                msg = (
+                    f"Silence timeout: no output for {elapsed2:.0f}s after probe — "
+                    "possible hung process or undetected rate limit."
+                )
+                logger.error(msg)
+                self._runner_error_message = msg
+                self._runner_error_event.set()
+                return
+
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
     async def _cleanup(self) -> None:
         """Tear down resources unconditionally."""
-        if self._checkpoint_task is not None and not self._checkpoint_task.done():
-            self._checkpoint_task.cancel()
-            try:
-                await self._checkpoint_task
-            except asyncio.CancelledError:
-                pass
+        for task_attr in ("_checkpoint_task", "_silence_watchdog_task"):
+            task = getattr(self, task_attr, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         if self._sandbox is not None:
             try:

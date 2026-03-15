@@ -159,6 +159,13 @@ class ContextManager:
         self._checkpoint_count: int = 0
         self._original_prompt: str = ""
 
+        # Checkpoint response exclusion: while True, count_output() is a no-op
+        # so Claude's checkpoint-response tokens don't inflate the estimate.
+        self._in_checkpoint: bool = False
+        # Becomes True when a blank line or "Then continue" appears in output
+        # while _in_checkpoint is set; the next non-empty line clears both.
+        self._checkpoint_saw_signal: bool = False
+
         # Lock protects _token_estimate so that count_input / count_output can
         # be called safely from background I/O threads if needed.
         self._lock = threading.Lock()
@@ -210,6 +217,10 @@ class ContextManager:
             character count is still meaningful for estimation purposes).
         """
         if not text:
+            return
+        # While Claude is writing its checkpoint response, skip token counting
+        # so the response itself does not push us immediately over threshold again.
+        if self._in_checkpoint:
             return
         tokens = _chars_to_tokens(len(text))
         with self._lock:
@@ -289,6 +300,11 @@ class ContextManager:
 
         self.reset()
         self._checkpoint_count += 1
+        # Suppress token counting for Claude's checkpoint response until we see
+        # a signal that it has finished (blank line, "Then continue", or the
+        # next substantive output line after either of those).
+        self._in_checkpoint = True
+        self._checkpoint_saw_signal = False
         logger.info("Token counter reset after checkpoint injection (checkpoint #%d).", self._checkpoint_count)
 
     # ------------------------------------------------------------------
@@ -479,6 +495,46 @@ class ContextManager:
     def context_anchors_active(self) -> bool:
         """True if context_anchors are configured and will be prepended to prompts."""
         return bool(self._context_anchors)
+
+    def acknowledge_checkpoint_end(self) -> None:
+        """
+        Signal that Claude has finished writing its checkpoint response.
+
+        After this call, ``count_output()`` resumes normal token counting and
+        ``_in_checkpoint`` is False.  Called by runner.py when it detects the
+        end of Claude's checkpoint reply (blank line followed by a non-empty
+        line, or a "Then continue" line followed by a non-empty line).
+        """
+        self._in_checkpoint = False
+        self._checkpoint_saw_signal = False
+        logger.debug("Checkpoint response acknowledged — token counting resumed.")
+
+    def notify_output_line(self, clean_line: str) -> None:
+        """
+        Feed one clean output line to the checkpoint-end detector.
+
+        Should be called for every line while the task is running.  When
+        ``_in_checkpoint`` is True this method watches for the end-of-response
+        signal and calls :meth:`acknowledge_checkpoint_end` automatically.
+
+        Signal heuristics
+        -----------------
+        - Empty line (``not clean_line``)  → set the "saw signal" flag.
+        - Line containing ``"Then continue"`` → set the "saw signal" flag
+          (matches the last sentence of ``CHECKPOINT_PROMPT``).
+        - Non-empty line after the signal flag is set → acknowledge end.
+        """
+        if not self._in_checkpoint:
+            return
+        if not clean_line or "Then continue" in clean_line:
+            self._checkpoint_saw_signal = True
+        elif self._checkpoint_saw_signal and clean_line:
+            self.acknowledge_checkpoint_end()
+
+    @property
+    def in_checkpoint(self) -> bool:
+        """True while Claude is writing its checkpoint response."""
+        return self._in_checkpoint
 
     def build_initial_prompt(self, task_prompt: str) -> str:
         """

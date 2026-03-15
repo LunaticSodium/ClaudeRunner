@@ -153,7 +153,8 @@ class RateLimitDetector:
     """
 
     # Fallback wait when no timestamp is found in the message (seconds).
-    _FALLBACK_WAIT_SECONDS: float = 3_600.0  # 1 hour — conservative default
+    # 5 hours — Anthropic's usage limits typically reset on a 5-hour rolling window.
+    _FALLBACK_WAIT_SECONDS: float = 18_000.0
 
     def __init__(
         self,
