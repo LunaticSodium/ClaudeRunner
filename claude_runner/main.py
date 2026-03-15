@@ -345,26 +345,13 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
             _warn("TUI unavailable (rich not installed). Continuing without TUI.")
             tui_manager = None
 
-    # ── Set up sandbox ─────────────────────────────────────────────────────────
-    try:
-        from claude_runner.sandbox import create_sandbox  # type: ignore[import]
-        sandbox = create_sandbox(pb, config, api_key)
-    except ImportError:
-        if tui_manager:
-            tui_manager.stop()
-        _abort("claude_runner.sandbox module not found. Ensure claude-runner is fully installed.")
-    except RuntimeError as exc:
-        if tui_manager:
-            tui_manager.stop()
-        _abort(str(exc))
-
     # ── Create runner and execute ──────────────────────────────────────────────
+    # Sandbox creation and setup are handled inside runner._initialise().
     try:
         from claude_runner.runner import ClaudeRunner  # type: ignore[import]
         runner = ClaudeRunner(
             project_book=pb,
             config=config,
-            sandbox=sandbox,
             tui=tui_manager,
             api_key=api_key,
             resume=resume_session,

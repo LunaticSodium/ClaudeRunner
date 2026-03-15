@@ -383,10 +383,10 @@ class TaskRunner:
         if self._sandbox is None:
             logger.info("[ACTION] Creating sandbox (backend=%r)", getattr(self._config, "sandbox_backend", "auto"))
             self._sandbox = create_sandbox(self._book, self._config, self._api_key)
-            await _maybe_await(self._sandbox.setup)
-            logger.info("[ACTION] Sandbox ready.")
         else:
             logger.info("[ACTION] Using pre-provided sandbox.")
+        await _maybe_await(self._sandbox.setup)
+        logger.info("[ACTION] Sandbox ready.")
 
         # --- Progress log --------------------------------------------------
         self._init_progress_log()

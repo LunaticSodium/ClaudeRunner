@@ -68,6 +68,14 @@ DATA_FILES_WIN = [
     ("projects/*.yaml", "projects/"),
 ]
 
+# apprise loads notification plugins by scanning its own package directory at
+# runtime, which fails inside a PyInstaller onefile exe (filesystem not present).
+# We collect the apprise package path here and pass it via --add-data so the
+# extracted temp dir contains a real apprise/plugins/ tree.
+import importlib.util as _ilu
+_apprise_spec = _ilu.find_spec("apprise")
+APPRISE_PKG_DIR = str(Path(_apprise_spec.origin).parent) if _apprise_spec else None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -119,13 +127,13 @@ def _resolve_data_args() -> list[str]:
     Expand glob patterns in DATA_FILES_WIN and return a flat list of
     --add-data arguments suitable for subprocess.
     """
+    sep = ";" if platform.system() == "Windows" else ":"
     args: list[str] = []
     for src_pattern, dest_dir in DATA_FILES_WIN:
-        src_path = PROJECT_ROOT / src_pattern
-        # Let PyInstaller handle glob expansion; just pass as-is using the
-        # Windows semicolon separator.  On non-Windows builds use colon.
-        sep = ";" if platform.system() == "Windows" else ":"
         args += ["--add-data", f"{src_pattern}{sep}{dest_dir}"]
+    # Bundle the entire apprise package so its plugin scanner finds a real filesystem tree.
+    if APPRISE_PKG_DIR and Path(APPRISE_PKG_DIR).is_dir():
+        args += ["--add-data", f"{APPRISE_PKG_DIR}{sep}apprise"]
     return args
 
 
