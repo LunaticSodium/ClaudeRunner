@@ -81,6 +81,11 @@ _SILENCE_TIMEOUT_S: float = 300.0  # 5 minutes
 # Directory name created inside the working directory for claude-runner artefacts.
 _RUNNER_DIR = ".claude-runner"
 
+# Windows ConPTY artefact: pywinpty sometimes reports STATUS_CONTROL_C_EXIT
+# (0xC000013A) as the exit code when the PTY session closes normally.
+# This is indistinguishable from a real Ctrl+C kill, so we treat it like -1.
+_WINPTY_CONTROL_C_EXIT: int = 0xC000013A  # 3221225786
+
 # Progress log filename (relative to _RUNNER_DIR inside working directory).
 _PROGRESS_LOG_NAME = "progress.log"
 
@@ -301,6 +306,10 @@ class TaskRunner:
         # Set by _state_checkpoint_loop to allow cancellation.
         self._checkpoint_task: Optional[asyncio.Task] = None
 
+        # CLAUDE.md content read from <working_dir>/.claude/CLAUDE.md at task start.
+        # None means no file was found or it was empty.
+        self._claude_md_content: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Secrets config loader
     # ------------------------------------------------------------------
@@ -424,6 +433,9 @@ class TaskRunner:
 
         # --- Progress log --------------------------------------------------
         self._init_progress_log()
+
+        # --- CLAUDE.md injection -------------------------------------------
+        self._claude_md_content = self._read_claude_md()
 
         # --- Filesystem snapshot (git fallback) ----------------------------
         self._fs_snapshot_start = self._take_fs_snapshot()
@@ -638,13 +650,18 @@ class TaskRunner:
                     return await self._handle_completion()
 
                 exit_code = done_task.result()
-                if exit_code in (0, -1):
-                    # 0 = clean exit; -1 = pywinpty couldn't read exit status
-                    # (common on Windows when the process closes its ConPTY).
-                    # In both cases, no error marker was detected, so treat as
-                    # a clean completion.
+                if exit_code == 0:
+                    logger.info("Claude Code exited cleanly (exit code 0).")
+                    return await self._handle_completion()
+                elif exit_code in (-1, _WINPTY_CONTROL_C_EXIT):
+                    # -1: pywinpty couldn't read exit status.
+                    # 0xC000013A (3221225786, STATUS_CONTROL_C_EXIT): ConPTY artefact
+                    # on Windows — the PTY host closes the session with a synthetic
+                    # Ctrl+C signal; the child's actual exit code is not recoverable.
+                    # Both are treated as clean exits when no error markers were detected.
                     logger.info(
-                        "Claude Code exited (exit code %s) with no error markers — treating as success.",
+                        "Claude Code exited (pywinpty exit status unavailable / "
+                        "ConPTY STATUS_CONTROL_C_EXIT artefact, code=%s) — treating as clean exit.",
                         exit_code,
                     )
                     return await self._handle_completion()
@@ -803,7 +820,7 @@ class TaskRunner:
             change_summary = change_summary + "\n\n--- git workflow ---\n" + git_summary if change_summary else git_summary
 
         # --- Read final progress log -------------------------------------
-        progress_log_text = self._context_manager.read_progress_log()
+        progress_log_text = self._context_manager.read_progress_log_full()
 
         # --- Copy progress.log to host log_dir ---------------------------
         self._save_progress_log_to_host(progress_log_text)
@@ -1089,8 +1106,17 @@ class TaskRunner:
                 "A task prompt is required."
             )
 
+        # Prepend CLAUDE.md project context if available.
+        if self._claude_md_content:
+            claude_md_block = (
+                "--- Project context from CLAUDE.md ---\n"
+                + self._claude_md_content
+                + "\n--- End of project context ---"
+            )
+            task_prompt = claude_md_block + "\n\n" + task_prompt
+
         # Apply RUNNER_PROTOCOL + context_anchors via ContextManager so the
-        # ordering is always: runner protocol → anchors → progress log → task.
+        # ordering is always: runner protocol → anchors → CLAUDE.md → task.
         decorated = (
             self._context_manager.build_initial_prompt(task_prompt)
             if self._context_manager
@@ -1185,6 +1211,36 @@ class TaskRunner:
             warn = f"Could not create progress log at {log_path}: {exc}"
             logger.warning(warn)
             self._fault_log.append(f"[WARN] {warn}")
+
+    def _read_claude_md(self) -> Optional[str]:
+        """
+        Read <working_dir>/.claude/CLAUDE.md if it exists and is non-empty.
+
+        Called once during _initialise() after progress.log is created.
+        The returned content is stored in self._claude_md_content and injected
+        at the top of the initial prompt by _build_initial_prompt().
+
+        Returns None if the file does not exist, is empty, or cannot be read
+        (backwards compatible — missing CLAUDE.md is silently ignored).
+        """
+        try:
+            wd = self._working_dir()
+        except Exception:
+            return None
+        claude_md = wd / ".claude" / "CLAUDE.md"
+        if not claude_md.exists():
+            return None
+        try:
+            content = claude_md.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logger.warning("Could not read %s: %s", claude_md, exc)
+            return None
+        if not content:
+            return None
+        logger.info(
+            "[ACTION] Injected CLAUDE.md into initial prompt (%d chars).", len(content)
+        )
+        return content
 
     def _save_progress_log_to_host(self, contents: str) -> None:
         """
@@ -1620,7 +1676,7 @@ class TaskRunner:
         """Build a TaskResult from current runner state."""
         end_time = datetime.now(tz=timezone.utc)
         progress_log = (
-            self._context_manager.read_progress_log()
+            self._context_manager.read_progress_log_full()
             if self._context_manager is not None
             else ""
         )

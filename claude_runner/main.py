@@ -172,16 +172,8 @@ def _ensure_initialized() -> None:
             "Run: [cyan]npm install -g @anthropic-ai/claude-code[/cyan]"
         )
 
-    # 3. API key (env var or secrets file)
-    api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
-    if not api_key_present and _DEFAULT_SECRETS_FILE.exists():
-        try:
-            import yaml  # noqa: PLC0415
-            with open(_DEFAULT_SECRETS_FILE, encoding="utf-8") as _f:
-                _s = yaml.safe_load(_f) or {}
-            api_key_present = bool(_s.get("api_key") or _s.get("anthropic_api_key"))
-        except Exception:
-            pass
+    # 3. API key (env var, secrets file, keyring, or OAuth session)
+    api_key_present = bool(_resolve_api_key())
     if not api_key_present:
         _err_console.print(
             "[bold yellow][WARN][/bold yellow]  No API key configured. "
@@ -756,6 +748,45 @@ notify:
     yaml_path.write_text(yaml_content, encoding="utf-8")
     _ok(f"Created project book: {yaml_path}")
 
+    # Create .claude/ directory with settings and CLAUDE.md template.
+    claude_dir = work_dir / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+
+    settings_content = """\
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "MultiEdit(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "LS(*)",
+      "TodoRead(*)",
+      "TodoWrite(*)"
+    ],
+    "deny": []
+  }
+}
+"""
+    (claude_dir / "settings.json").write_text(settings_content, encoding="utf-8")
+    _ok(f"Created: {claude_dir / 'settings.json'}")
+
+    claude_md_content = f"""\
+# Project: {name}
+# Created by claude-runner
+
+## Context
+(Describe your project here — this file is read by Claude Code at session start)
+
+## Constraints
+(Any rules Claude should follow in this project)
+"""
+    (claude_dir / "CLAUDE.md").write_text(claude_md_content, encoding="utf-8")
+    _ok(f"Created: {claude_dir / 'CLAUDE.md'}")
+
     # Initialise git repo.
     if not no_git:
         git_dir = work_dir / ".git"
@@ -768,6 +799,15 @@ notify:
                 # Basic .gitignore
                 (work_dir / ".gitignore").write_text(
                     "# claude-runner internals\n.claude-runner/\n", encoding="utf-8"
+                )
+                # Initial commit with .gitignore and .claude/ scaffold.
+                _sp.run(
+                    ["git", "add", ".gitignore", ".claude/settings.json", ".claude/CLAUDE.md"],
+                    cwd=str(work_dir), check=True, capture_output=True,
+                )
+                _sp.run(
+                    ["git", "commit", "-m", f"Initial scaffold for {name}"],
+                    cwd=str(work_dir), check=True, capture_output=True,
                 )
                 _ok(f"Initialised git repo in: {work_dir}")
             except Exception as exc:

@@ -373,47 +373,63 @@ def _load_yaml_file(path: Path) -> dict[str, Any]:
 
 
 def _detect_oauth_session() -> bool:
-    """Return True if Claude Code has a usable OAuth session stored on disk.
+    """Return True if Claude Code has a usable authenticated session.
 
-    Detection logic
-    ---------------
-    1. The ``claude`` CLI must be on PATH (if it isn't, there can be no session).
-    2. ``~/.claude/.credentials.json`` must exist.
-    3. The JSON must contain a non-empty ``claudeAiOauth.accessToken``.
-    4. If ``expiresAt`` is present and the token is expired, a ``refreshToken``
-       must also be present — Claude Code will refresh it automatically on next
-       invocation.
+    Detection logic (tried in order, first hit wins)
+    -------------------------------------------------
+    1. ``~/.claude/.credentials.json`` — classic OAuth token file.
+    2. ``claude auth status`` CLI probe — covers claude.ai login via Windows
+       Credential Manager or other platform-native storage that doesn't write
+       a credentials file.
 
-    All I/O errors are caught and treated as "no session" so that this probe
-    never blocks startup.
+    All I/O and subprocess errors are caught and treated as "no session".
     """
     import json  # noqa: PLC0415
     import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
     import time  # noqa: PLC0415
 
     if shutil.which("claude") is None:
         return False
 
+    # --- Method 1: credentials file ---
     creds_path = Path.home() / ".claude" / ".credentials.json"
-    if not creds_path.exists():
-        return False
+    if creds_path.exists():
+        try:
+            data = json.loads(creds_path.read_text(encoding="utf-8"))
+            oauth = data.get("claudeAiOauth") or {}
+            access_token = (oauth.get("accessToken") or "").strip()
+            if access_token:
+                expires_at_ms = oauth.get("expiresAt", 0)
+                if expires_at_ms:
+                    expires_at_s = expires_at_ms / 1000
+                    if expires_at_s < time.time():
+                        return bool((oauth.get("refreshToken") or "").strip())
+                return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("OAuth credentials file probe failed: %s", exc)
 
+    # --- Method 2: `claude auth status` CLI probe ---
     try:
-        data = json.loads(creds_path.read_text(encoding="utf-8"))
-        oauth = data.get("claudeAiOauth") or {}
-        access_token = (oauth.get("accessToken") or "").strip()
-        if not access_token:
-            return False
-        expires_at_ms = oauth.get("expiresAt", 0)
-        if expires_at_ms:
-            expires_at_s = expires_at_ms / 1000
-            if expires_at_s < time.time():
-                # Access token expired — only usable if a refresh token exists.
-                return bool((oauth.get("refreshToken") or "").strip())
-        return True
+        result = subprocess.run(
+            ["claude", "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        output = (result.stdout + result.stderr).strip()
+        # `claude auth status` outputs JSON; parse it.
+        data = json.loads(output)
+        if data.get("loggedIn"):
+            logger.debug(
+                "Claude auth status: loggedIn=true (method=%s)",
+                data.get("authMethod", "unknown"),
+            )
+            return True
     except Exception as exc:  # noqa: BLE001
-        logger.debug("OAuth session probe failed (treating as no session): %s", exc)
-        return False
+        logger.debug("claude auth status probe failed: %s", exc)
+
+    return False
 
 
 def _resolve_from_keyring() -> str:

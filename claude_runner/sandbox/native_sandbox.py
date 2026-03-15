@@ -80,7 +80,12 @@ class NativeSandbox:
 
         # Derive sandbox config ----------------------------------------
         sandbox_cfg = getattr(config, "sandbox", None) or {}
-        self._use_sandbox_flag: bool = _cfg_get(sandbox_cfg, "use_claude_sandbox_flag", True)
+        # Default False on Windows: Claude Code's --sandbox uses OS primitives
+        # (Linux namespaces / macOS sandbox) that don't exist on Windows and
+        # cause an immediate crash (exit 0xC000013A).
+        import sys as _sys  # noqa: PLC0415
+        _default_sandbox_flag = _sys.platform != "win32"
+        self._use_sandbox_flag: bool = _cfg_get(sandbox_cfg, "use_claude_sandbox_flag", _default_sandbox_flag)
         self._extra_env: dict = _cfg_get(sandbox_cfg, "extra_env", {})
 
         # Runtime state ------------------------------------------------
@@ -191,6 +196,7 @@ class NativeSandbox:
             on_line=on_line,
             on_exit=on_exit,
         )
+        self._process.start()
         return self._process
 
     def teardown(self) -> None:
