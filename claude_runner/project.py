@@ -580,10 +580,26 @@ def load_project_book(path: Path) -> ProjectBook:
     logger.debug("Loading project book from %s", path)
 
     with path.open("r", encoding="utf-8") as fh:
-        raw: Any = yaml.load(fh, Loader=_Yaml12Loader)  # noqa: S506
+        content = fh.read()
 
-    if raw is None:
+    # Handle multi-document YAML (files with --- separators, e.g. examples.yaml).
+    # Load all documents and take the first; warn when more are present so the
+    # user knows to copy a single document to its own file to run the others.
+    all_docs: list[Any] = [
+        d for d in yaml.load_all(content, Loader=_Yaml12Loader) if d is not None  # noqa: S506
+    ]
+    if not all_docs:
         raw = {}
+    elif len(all_docs) > 1:
+        logger.warning(
+            "%s contains %d YAML documents — loading the first one only. "
+            "Copy the document you want to run into its own .yaml file.",
+            path.name,
+            len(all_docs),
+        )
+        raw = all_docs[0]
+    else:
+        raw = all_docs[0]
 
     if not isinstance(raw, dict):
         raise yaml.YAMLError(

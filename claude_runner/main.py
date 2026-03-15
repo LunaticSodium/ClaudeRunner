@@ -90,7 +90,11 @@ def _find_example_template() -> Optional[pathlib.Path]:
 
 
 def _copy_example_with_header(src: pathlib.Path, dest: pathlib.Path) -> None:
-    """Copy a project book template, prepending a usage comment header."""
+    """Copy the first YAML document from *src* to *dest*, prepending a usage header.
+
+    If *src* is a multi-document file (sections separated by ``---``), only the
+    first document is written so the result is a valid single-document project book.
+    """
     header = (
         "# claude-runner example project book\n"
         "# Copy this file, rename it, and edit the 'prompt' field to\n"
@@ -98,7 +102,13 @@ def _copy_example_with_header(src: pathlib.Path, dest: pathlib.Path) -> None:
         "#   claude-runner run your-project.yaml\n"
         "#\n"
     )
-    dest.write_text(header + src.read_text(encoding="utf-8"), encoding="utf-8")
+    content = src.read_text(encoding="utf-8")
+    # Split on a '---' document separator that starts at the beginning of a line.
+    # Take only the first section so the output is a valid single-document file.
+    import re as _re  # noqa: PLC0415
+    parts = _re.split(r"(?m)^---[ \t]*$", content)
+    first_doc = parts[0].strip()
+    dest.write_text(header + first_doc + "\n", encoding="utf-8")
 
 
 def _project_search_dirs() -> list[pathlib.Path]:
