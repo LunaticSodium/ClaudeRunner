@@ -103,15 +103,15 @@ class NetworkConfig(BaseModel):
         Explicit list of hostnames or IP addresses permitted outbound.
         Wildcards are not supported; use exact hostnames.
     deny_all_others:
-        When ``True`` (recommended), all egress not in *allow* is blocked.
-        When ``False``, the container has unrestricted internet access except
-        for any entries in a future ``deny`` list (not yet implemented).
+        When ``True``, all egress not in *allow* is blocked (strict mode).
+        When ``False`` (default), the container has full outbound access so
+        Claude Code can reach api.anthropic.com and package registries.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     allow: list[str] = Field(default_factory=list)
-    deny_all_others: bool = True
+    deny_all_others: bool = False
 
 
 class SandboxConfig(BaseModel):
@@ -133,8 +133,13 @@ class SandboxConfig(BaseModel):
         Useful for reference material (API specs, documentation) that Claude
         should be able to read but not modify.
     network:
-        Egress firewall configuration.  Defaults to no allow-list with
-        ``deny_all_others=True``, which blocks all outbound traffic.
+        Egress firewall configuration.  Defaults to full outbound access
+        (``deny_all_others=False``).  Set ``deny_all_others: true`` with an
+        explicit ``allow`` list for strict network isolation.
+    env:
+        Additional environment variables injected into the container.
+        ``ANTHROPIC_API_KEY`` and ``GIT_TOKEN`` are managed automatically
+        and cannot be overridden here.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -149,6 +154,14 @@ class SandboxConfig(BaseModel):
     working_dir: Path
     readonly_mounts: list[ReadonlyMount] = Field(default_factory=list)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
+    env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Additional environment variables injected into the sandbox container. "
+            "These are merged on top of the system defaults; they cannot override "
+            "ANTHROPIC_API_KEY or GIT_TOKEN which are managed by claude-runner."
+        ),
+    )
 
     @field_validator("working_dir", mode="before")
     @classmethod

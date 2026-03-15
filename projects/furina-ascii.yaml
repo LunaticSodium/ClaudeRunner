@@ -39,13 +39,6 @@ execution:
   timeout_hours: 2
 sandbox_config:
   working_dir: C:\temp\furina-test
-  network:
-    allow:
-      - pypi.org
-      - files.pythonhosted.org
-      - www.google.com
-      - wiki.hoyolab.com
-      - genshin-impact.fandom.com
 notify:
   on: [complete, error]
   channels:

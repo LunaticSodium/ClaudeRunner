@@ -41,13 +41,25 @@ log = logging.getLogger(__name__)
 # Patterns
 # ---------------------------------------------------------------------------
 
+# Runner protocol markers — these are injected into every initial prompt by
+# context_manager.RUNNER_PROTOCOL.  They are checked *first* so the detector
+# can distinguish a deliberate task-complete / task-error signal from a
+# rate-limit event.  The caller must inspect ``matched_runner_complete`` or
+# ``matched_runner_error`` to determine which type of match fired.
+#
 # Each pattern must either:
 #   - Contain a capture group ``(\d{10,})`` that yields a Unix timestamp, OR
-#   - Contain no capture group, indicating a "soft" signal (interactive menu
-#     displayed) where no timestamp can be extracted.
+#   - Contain no capture group, indicating a "soft" signal where no timestamp
+#     can be extracted.
+
+RUNNER_COMPLETE_PATTERN: str = r"##RUNNER:COMPLETE##"
+RUNNER_ERROR_PATTERN: str = r"##RUNNER:ERROR:(.+)##"
 
 RATE_LIMIT_PATTERNS: list[str] = [
-    # Primary structured format: "Claude AI usage limit reached|<ts>"
+    # Primary: runner protocol markers (checked before any rate-limit pattern)
+    RUNNER_COMPLETE_PATTERN,
+    RUNNER_ERROR_PATTERN,
+    # Fallback: structured rate-limit format "Claude AI usage limit reached|<ts>"
     r"Claude AI usage limit reached\|(\d{10,})",
     # Prose variants emitted by different Claude Code versions
     r"usage limit reached[^\d]*(\d{10,})",
@@ -60,6 +72,10 @@ RATE_LIMIT_PATTERNS: list[str] = [
 _COMPILED_PATTERNS: list[re.Pattern[str]] = [
     re.compile(p, re.IGNORECASE) for p in RATE_LIMIT_PATTERNS
 ]
+
+# Pre-compiled runner marker patterns for fast isinstance checks in the detector.
+_RUNNER_COMPLETE_RE = re.compile(RUNNER_COMPLETE_PATTERN)
+_RUNNER_ERROR_RE = re.compile(RUNNER_ERROR_PATTERN)
 
 # Minimum plausible Unix timestamp: 2020-01-01T00:00:00Z
 _MIN_TIMESTAMP = 1_577_836_800
@@ -146,6 +162,10 @@ class RateLimitDetector:
         self._on_rate_limit = on_rate_limit
         self._reset_at: Optional[datetime] = None
         self._detected: bool = False
+        # Set when a ##RUNNER:COMPLETE## marker is matched.
+        self._runner_complete: bool = False
+        # Set to the error description when a ##RUNNER:ERROR:...## marker is matched.
+        self._runner_error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -153,18 +173,43 @@ class RateLimitDetector:
 
     def feed(self, clean_line: str) -> bool:
         """
-        Inspect *clean_line* (ANSI-stripped) for rate limit indicators.
+        Inspect *clean_line* (ANSI-stripped) for runner protocol markers and
+        rate-limit indicators.
 
-        Returns True (and fires ``on_rate_limit``) on the **first** match.
-        Subsequent calls keep returning True while ``_detected`` is set but
-        the callback is only fired once per detection event.  Call
-        :meth:`reset` to re-arm the detector for the next task.
+        Returns True (and fires ``on_rate_limit`` for rate-limit matches) on
+        the **first** match.  Subsequent calls keep returning True while
+        ``_detected`` is set but the callback is only fired once per detection
+        event.  Call :meth:`reset` to re-arm the detector for the next task.
+
+        Use :attr:`matched_runner_complete` and :attr:`matched_runner_error`
+        to distinguish runner-protocol matches from rate-limit matches.
         """
         if self._detected:
             # Already in a detected state; keep signalling but don't refire.
             return True
 
+        # --- Check runner protocol markers first (highest priority) ----------
+        m_complete = _RUNNER_COMPLETE_RE.search(clean_line)
+        if m_complete is not None:
+            log.info("Runner protocol: ##RUNNER:COMPLETE## detected in output.")
+            self._runner_complete = True
+            self._detected = True
+            return True
+
+        m_error = _RUNNER_ERROR_RE.search(clean_line)
+        if m_error is not None:
+            description = m_error.group(1).strip()
+            log.info("Runner protocol: ##RUNNER:ERROR## detected — %r", description)
+            self._runner_error = description
+            self._detected = True
+            return True
+
+        # --- Fallback: rate-limit patterns -----------------------------------
         for pattern in _COMPILED_PATTERNS:
+            # Skip runner marker patterns already handled above.
+            if pattern.pattern in (RUNNER_COMPLETE_PATTERN, RUNNER_ERROR_PATTERN):
+                continue
+
             match = pattern.search(clean_line)
             if match is None:
                 continue
@@ -202,8 +247,30 @@ class RateLimitDetector:
         return self._reset_at
 
     def is_detected(self) -> bool:
-        """Return True if a rate limit has been detected since the last :meth:`reset`."""
+        """Return True if any match has been detected since the last :meth:`reset`."""
         return self._detected
+
+    @property
+    def matched_runner_complete(self) -> bool:
+        """True if ``##RUNNER:COMPLETE##`` was detected in the output stream."""
+        return self._runner_complete
+
+    @property
+    def matched_runner_error(self) -> Optional[str]:
+        """
+        The error description extracted from ``##RUNNER:ERROR:<description>##``,
+        or ``None`` if no such marker was detected.
+        """
+        return self._runner_error
+
+    def is_rate_limit(self) -> bool:
+        """
+        True if the match was a rate-limit signal (not a runner protocol marker).
+
+        Use this to distinguish between a rate-limit wait and a runner
+        completion/error event when :meth:`feed` returns True.
+        """
+        return self._detected and not self._runner_complete and self._runner_error is None
 
     def reset(self) -> None:
         """
@@ -212,6 +279,8 @@ class RateLimitDetector:
         """
         self._detected = False
         self._reset_at = None
+        self._runner_complete = False
+        self._runner_error = None
 
     # ------------------------------------------------------------------
     # Internal helpers

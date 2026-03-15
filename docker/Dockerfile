@@ -5,6 +5,14 @@
 # Build:
 #   docker build -t claude-runner-base:latest .
 #   docker build --build-arg CLAUDE_CODE_VERSION=1.2.3 -t claude-runner-base:1.2.3 .
+#
+# Network requirements (must be reachable from the container):
+#   api.anthropic.com   — Claude Code API calls (always required)
+#   registry.npmjs.org  — only needed at image build time
+#   deb.nodesource.com  — only needed at image build time
+#
+# The container runs with full outbound access by default (deny_all_others=false).
+# Set sandbox.network.deny_all_others: true in your project book for strict isolation.
 
 FROM debian:bookworm-slim
 

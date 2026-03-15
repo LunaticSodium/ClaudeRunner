@@ -45,6 +45,19 @@ CHARS_PER_TOKEN: int = 4  # approximation for English / code
 # Matches the spec path: /workspace/.claude-runner/progress.log
 _DEFAULT_PROGRESS_LOG_SUBPATH = ".claude-runner/progress.log"
 
+# Runner protocol injected at the top of every initial prompt, before any
+# project-level context_anchors.  These markers let the orchestration layer
+# detect task completion and fatal errors from the output stream rather than
+# relying solely on the subprocess exit code.
+RUNNER_PROTOCOL: str = """\
+RUNNER PROTOCOL (mandatory):
+When your task is complete, output exactly on its own line:
+  ##RUNNER:COMPLETE##
+When you encounter a fatal error you cannot recover from, output:
+  ##RUNNER:ERROR:<one line description>##
+These markers are read by the orchestration layer. Do not omit them.\
+"""
+
 CHECKPOINT_PROMPT: str = """
 Please pause and write a structured progress update to the file:
   .claude-runner/progress.log
@@ -466,6 +479,37 @@ class ContextManager:
     def context_anchors_active(self) -> bool:
         """True if context_anchors are configured and will be prepended to prompts."""
         return bool(self._context_anchors)
+
+    def build_initial_prompt(self, task_prompt: str) -> str:
+        """
+        Decorate *task_prompt* with the mandatory runner protocol and any
+        project-level context anchors.
+
+        Ordering (top → bottom in the final prompt):
+          1. RUNNER_PROTOCOL  — always injected; tells Claude to emit
+             ``##RUNNER:COMPLETE##`` / ``##RUNNER:ERROR:…##`` markers.
+          2. context_anchors  — project-level standing instructions (if set).
+          3. task_prompt      — the actual task text from the project book.
+
+        The RUNNER_PROTOCOL is placed *before* context_anchors so that it
+        cannot be shadowed or omitted by a project-level anchor block.
+
+        Parameters
+        ----------
+        task_prompt:
+            The raw task prompt from the project book (no decorations).
+
+        Returns
+        -------
+        str
+            Fully decorated initial prompt, ready for the ``_PROGRESS_LOG_INSTRUCTION``
+            prefix that runner.py prepends before sending to Claude Code.
+        """
+        parts: list[str] = [RUNNER_PROTOCOL]
+        if self._context_anchors:
+            parts.append(self._context_anchors)
+        parts.append(task_prompt)
+        return "\n\n".join(parts)
 
     def _prepend_anchors(self, text: str) -> str:
         """

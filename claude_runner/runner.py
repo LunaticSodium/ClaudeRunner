@@ -263,6 +263,12 @@ class TaskRunner:
         self._rate_limit_event: Optional[asyncio.Event] = None
         self._rate_limit_reset_time: Optional[datetime] = None
 
+        # asyncio.Events for runner protocol markers (##RUNNER:COMPLETE## / ##RUNNER:ERROR##).
+        # Initialised in _initialise() once an event loop is available.
+        self._runner_complete_event: asyncio.Event = asyncio.Event()
+        self._runner_error_event: asyncio.Event = asyncio.Event()
+        self._runner_error_message: Optional[str] = None
+
         # Filesystem snapshot taken at task start (fallback when git unavailable).
         self._fs_snapshot_start: dict[str, tuple[int, float]] = {}  # path → (size, mtime)
 
@@ -537,28 +543,42 @@ class TaskRunner:
                 self._checkpoint_state()
                 return self._make_result("failed", error_message=msg)
 
-            # Wait for the process to exit OR for a rate-limit event,
+            # Wait for: process exit, rate-limit, or runner protocol markers,
             # whichever comes first.  We poll with a short timeout so
             # we can service the deadline check.
             remaining_s = (deadline - now).total_seconds()
             done_task = asyncio.ensure_future(self._process.wait())
             rl_task = asyncio.ensure_future(self._rate_limit_event.wait())
+            rc_task = asyncio.ensure_future(self._runner_complete_event.wait())
+            re_task = asyncio.ensure_future(self._runner_error_event.wait())
 
             try:
                 finished, pending = await asyncio.wait(
-                    {done_task, rl_task},
+                    {done_task, rl_task, rc_task, re_task},
                     timeout=min(remaining_s, _STATE_CHECKPOINT_INTERVAL_S),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             except Exception:
-                for t in (done_task, rl_task):
+                for t in (done_task, rl_task, rc_task, re_task):
                     t.cancel()
                 raise
 
-            # Cancel whichever future is still pending.
-            for t in (done_task, rl_task):
+            # Cancel whichever futures are still pending.
+            for t in (done_task, rl_task, rc_task, re_task):
                 if not t.done():
                     t.cancel()
+
+            # --- Runner protocol markers (highest priority) ----------------
+            if rc_task in finished:
+                logger.info("##RUNNER:COMPLETE## — treating as clean task completion.")
+                return await self._handle_completion()
+
+            if re_task in finished:
+                msg = f"Claude reported fatal error: {self._runner_error_message or '(no description)'}"
+                logger.error(msg)
+                self._fault_log.append(f"[ERROR] {msg}")
+                await self._dispatch("error", {"error": msg, "task": self._book.name})
+                return self._make_result("failed", error_message=msg)
 
             if done_task in finished:
                 # Process has exited.
@@ -574,7 +594,7 @@ class TaskRunner:
                     return self._make_result("failed", error_message=msg)
 
             elif rl_task in finished:
-                # Rate-limit event detected.
+                # Rate-limit event detected (not a runner marker).
                 reset_time: datetime = self._rate_limit_reset_time or datetime.now(tz=timezone.utc)
                 # Clear the event so it can fire again in subsequent cycles.
                 self._rate_limit_event.clear()
@@ -779,9 +799,17 @@ class TaskRunner:
         if clean:
             self._output_lines.append(clean)
 
-        # Feed rate-limit detector (works on the raw/clean line).
+        # Feed rate-limit / runner-marker detector (works on the clean line).
         if self._rate_detector is not None:
             self._rate_detector.feed(clean)
+            if self._rate_detector.matched_runner_complete:
+                logger.info("[MARKER] ##RUNNER:COMPLETE## detected — signalling task done.")
+                self._runner_complete_event.set()
+            elif self._rate_detector.matched_runner_error is not None:
+                msg = self._rate_detector.matched_runner_error
+                logger.info("[MARKER] ##RUNNER:ERROR## detected — %r", msg)
+                self._runner_error_message = msg
+                self._runner_error_event.set()
 
         # Token counting.
         if self._context_manager is not None:
@@ -995,11 +1023,14 @@ class TaskRunner:
                 "A task prompt is required."
             )
 
-        # Prepend context_anchors if present (same text that is injected on every
-        # resume and checkpoint).  The ContextManager handles resume/checkpoint;
-        # the runner handles the initial prompt here.
-        anchored_task_prompt = self._context_manager._prepend_anchors(task_prompt) if self._context_manager else task_prompt
-        full_prompt = _PROGRESS_LOG_INSTRUCTION + anchored_task_prompt
+        # Apply RUNNER_PROTOCOL + context_anchors via ContextManager so the
+        # ordering is always: runner protocol → anchors → progress log → task.
+        decorated = (
+            self._context_manager.build_initial_prompt(task_prompt)
+            if self._context_manager
+            else task_prompt
+        )
+        full_prompt = _PROGRESS_LOG_INSTRUCTION + decorated
         logger.debug(
             "Initial prompt built: instruction=%d chars, task=%d chars, total=%d chars.",
             len(_PROGRESS_LOG_INSTRUCTION),
