@@ -23,6 +23,7 @@ import logging
 import os
 import pathlib
 import platform
+import shutil
 import smtplib
 import socket
 import sys
@@ -50,16 +51,167 @@ _DEFAULT_CONFIG_DIR = pathlib.Path.home() / ".claude-runner"
 _DEFAULT_SECRETS_FILE = _DEFAULT_CONFIG_DIR / "secrets.yaml"
 _DEFAULT_STATE_DIR = _DEFAULT_CONFIG_DIR / "state"
 _DEFAULT_LOG_DIR = _DEFAULT_CONFIG_DIR / "logs"
+_DEFAULT_TRASH_DIR = _DEFAULT_CONFIG_DIR / "trash"
+_DEFAULT_PROJECTS_DIR = _DEFAULT_CONFIG_DIR / "projects"
+_INITIALIZED_MARKER = _DEFAULT_CONFIG_DIR / ".initialized"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _ensure_dirs() -> None:
-    """Create ~/.claude-runner/* directories if they do not exist."""
-    for d in (_DEFAULT_CONFIG_DIR, _DEFAULT_STATE_DIR, _DEFAULT_LOG_DIR):
+def _check_docker_quick() -> bool:
+    """Check Docker availability without the full SDK (instant, no timeout)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            GENERIC_READ = 0x80000000
+            OPEN_EXISTING = 3
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+            h = ctypes.windll.kernel32.CreateFileW(
+                r"\\.\pipe\docker_engine", GENERIC_READ, 0, None, OPEN_EXISTING, 0, None
+            )
+            if h != INVALID_HANDLE_VALUE:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        except Exception:
+            return False
+    return pathlib.Path("/var/run/docker.sock").exists()
+
+
+def _find_example_template() -> Optional[pathlib.Path]:
+    """Return the path to the bundled examples.yaml template."""
+    if getattr(sys, "frozen", False):
+        p = pathlib.Path(getattr(sys, "_MEIPASS", "")) / "examples.yaml"
+    else:
+        p = pathlib.Path(__file__).parent.parent / "projects" / "examples.yaml"
+    return p if p.exists() else None
+
+
+def _copy_example_with_header(src: pathlib.Path, dest: pathlib.Path) -> None:
+    """Copy a project book template, prepending a usage comment header."""
+    header = (
+        "# claude-runner example project book\n"
+        "# Copy this file, rename it, and edit the 'prompt' field to\n"
+        "# describe your task. Then run:\n"
+        "#   claude-runner run your-project.yaml\n"
+        "#\n"
+    )
+    dest.write_text(header + src.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _project_search_dirs() -> list[pathlib.Path]:
+    """Return ordered directories to search for bare project book filenames."""
+    dirs: list[pathlib.Path] = [pathlib.Path.cwd()]
+    exe_dir = pathlib.Path(sys.argv[0]).parent
+    if exe_dir != pathlib.Path.cwd():
+        dirs.append(exe_dir)
+    dirs.append(_DEFAULT_PROJECTS_DIR)
+    return dirs
+
+
+def _resolve_project_book_path(name: str) -> str:
+    """Resolve a bare project book filename by searching known locations.
+
+    If *name* contains a path separator or is absolute it is returned unchanged.
+    Otherwise searches: CWD → exe directory → ~/.claude-runner/projects/.
+    """
+    p = pathlib.Path(name)
+    if p.is_absolute() or len(p.parts) > 1:
+        return name
+    for search_dir in _project_search_dirs():
+        candidate = search_dir / p
+        if candidate.exists():
+            return str(candidate)
+    return name  # unchanged; _load_project_book will surface a clear error
+
+
+def _ensure_initialized() -> None:
+    """Idempotent setup: create config dirs, run preflight checks, handle first run.
+
+    Called at the start of every CLI command. Never aborts — only warns.
+    """
+    # ── Create directories ─────────────────────────────────────────────────────
+    for d in (
+        _DEFAULT_CONFIG_DIR,
+        _DEFAULT_LOG_DIR,
+        _DEFAULT_STATE_DIR,
+        _DEFAULT_TRASH_DIR,
+        _DEFAULT_PROJECTS_DIR,
+    ):
         d.mkdir(parents=True, exist_ok=True)
+
+    # ── First-run detection ────────────────────────────────────────────────────
+    first_run = not _INITIALIZED_MARKER.exists()
+
+    # ── Preflight checks (warn only, never abort) ──────────────────────────────
+
+    # 1. Docker Desktop
+    if not _check_docker_quick():
+        _err_console.print(
+            "[bold yellow][WARN][/bold yellow]  Docker Desktop is not running. "
+            "Required for [cyan]sandbox: {backend: docker}[/cyan] tasks. "
+            "Start it or use [cyan]sandbox: {backend: native}[/cyan]."
+        )
+
+    # 2. Claude Code CLI
+    if shutil.which("claude") is None:
+        _err_console.print(
+            "[bold yellow][WARN][/bold yellow]  Claude Code not found on PATH. "
+            "Run: [cyan]npm install -g @anthropic-ai/claude-code[/cyan]"
+        )
+
+    # 3. API key (env var or secrets file)
+    api_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if not api_key_present and _DEFAULT_SECRETS_FILE.exists():
+        try:
+            import yaml  # noqa: PLC0415
+            with open(_DEFAULT_SECRETS_FILE, encoding="utf-8") as _f:
+                _s = yaml.safe_load(_f) or {}
+            api_key_present = bool(_s.get("api_key") or _s.get("anthropic_api_key"))
+        except Exception:
+            pass
+    if not api_key_present:
+        _err_console.print(
+            "[bold yellow][WARN][/bold yellow]  No API key configured. "
+            "Run: [cyan]claude-runner configure[/cyan]"
+        )
+
+    # ── First-run actions ──────────────────────────────────────────────────────
+    if not first_run:
+        return
+
+    # Copy example project book next to the exe (frozen builds only)
+    example_dest: Optional[pathlib.Path] = None
+    if getattr(sys, "frozen", False):
+        exe_dir = pathlib.Path(sys.argv[0]).parent
+        if not list(exe_dir.glob("*.yaml")):
+            template = _find_example_template()
+            if template is not None:
+                example_dest = exe_dir / "claude-runner-example.yaml"
+                try:
+                    _copy_example_with_header(template, example_dest)
+                except Exception as exc:
+                    logger.debug("Could not copy example template: %s", exc)
+                    example_dest = None
+
+    if example_dest is not None:
+        _console.print(
+            "\n[bold green]First run detected.[/bold green] "
+            "An example project book has been copied to:\n"
+            f"  [cyan]{example_dest}[/cyan]\n"
+            "Edit it to describe your first task, then run:\n"
+            "  [cyan]claude-runner run claude-runner-example.yaml[/cyan]\n"
+        )
+    else:
+        _console.print(
+            "\n[bold green]First run detected.[/bold green] "
+            "Run [cyan]claude-runner configure[/cyan] to set up "
+            "notifications and verify your environment.\n"
+        )
+
+    _INITIALIZED_MARKER.touch()
 
 
 def _abort(message: str, exit_code: int = 1) -> None:
@@ -236,7 +388,7 @@ def cli() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @cli.command("run")
-@click.argument("project_book", type=click.Path(exists=True))
+@click.argument("project_book", type=click.Path())
 @click.option("--tui/--no-tui", default=True, help="Show the Rich terminal UI (default: on).")
 @click.option(
     "--dry-run",
@@ -253,16 +405,21 @@ def cli() -> None:
 def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
     """Run a claude-runner project book.
 
-    PROJECT_BOOK is the path to a .yaml project book file.
+    PROJECT_BOOK is the path to a .yaml project book file.  A bare filename
+    (no path separator) is searched in: current directory → exe directory →
+    ~/.claude-runner/projects/.
 
     Example:
 
-        claude-runner run projects/my_task.yaml --tui
+        claude-runner run my_task.yaml --tui
     """
     if verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    _ensure_dirs()
+    _ensure_initialized()
+
+    # Resolve bare filename to a full path before loading.
+    project_book = _resolve_project_book_path(project_book)
 
     # ── Load project book ──────────────────────────────────────────────────────
     pb = _load_project_book(project_book)
@@ -451,7 +608,7 @@ def queue(queue_file: str, tui: bool) -> None:
     except ImportError:
         _abort("pyyaml is required. Install with: pip install pyyaml")
 
-    _ensure_dirs()
+    _ensure_initialized()
 
     with open(queue_file, "r", encoding="utf-8") as fh:
         queue_cfg = yaml.safe_load(fh)
@@ -517,6 +674,7 @@ def validate(project_book: str) -> None:
 
     PROJECT_BOOK is the path to a .yaml project book file.
     """
+    _ensure_initialized()
     pb = _load_project_book(project_book)
 
     _console.print(
@@ -554,7 +712,7 @@ def status(task: Optional[str]) -> None:
 
     If --task is omitted, shows the most recently modified state file.
     """
-    _ensure_dirs()
+    _ensure_initialized()
     state_file = _find_state_file(task)
 
     if not state_file:
@@ -605,7 +763,7 @@ def abort(task: Optional[str], force: bool) -> None:
     Docker container (if any).  The state file is preserved so the task can be
     resumed later.
     """
-    _ensure_dirs()
+    _ensure_initialized()
     state_file = _find_state_file(task)
 
     if not state_file:
@@ -673,7 +831,7 @@ def logs(task: Optional[str], tail: int, raw: bool) -> None:
 
     Searches ~/.claude-runner/logs/ for a log file matching the task name.
     """
-    _ensure_dirs()
+    _ensure_initialized()
 
     if task:
         candidates = sorted(
@@ -734,7 +892,7 @@ def configure() -> None:
       - Testing SMTP connectivity
       - Saving credentials to secrets.yaml or Windows Credential Manager
     """
-    _ensure_dirs()
+    _ensure_initialized()
 
     _console.print(
         Panel(
@@ -1190,6 +1348,7 @@ def docker_group() -> None:
 @docker_group.command("status")
 def docker_status_cmd() -> None:
     """Show Docker Desktop availability and claude-runner-base image status."""
+    _ensure_initialized()
     try:
         import docker as docker_sdk  # type: ignore[import]
     except ImportError:
@@ -1244,6 +1403,7 @@ def docker_update_cmd(no_cache: bool) -> None:
     This does NOT auto-update to unpinned 'latest'. Update the Dockerfile
     version pins deliberately after testing.
     """
+    _ensure_initialized()
     try:
         import docker as docker_sdk  # type: ignore[import]
     except ImportError:
