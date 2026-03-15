@@ -201,7 +201,7 @@ def _find_state_file(task_name: Optional[str]) -> Optional[pathlib.Path]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="claude-runner")
+@click.version_option(version="0.2.0", prog_name="claude-runner")
 def cli() -> None:
     """
     claude-runner — autonomous Claude Code execution framework.
@@ -1310,11 +1310,100 @@ def docker_update_cmd(no_cache: bool) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Interactive launcher (double-click / no-args mode)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_VERSION = "0.2.0"
+
+_BANNER = f"""
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
+\u2551      claude-runner v{_VERSION}           \u2551
+\u2551  Self-orchestrating Claude Code runner  \u2551
+\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d
+"""
+
+_MENU = """
+  [1] Run a project          (claude-runner run <project.yaml>)
+  [2] Configure              (claude-runner configure)
+  [3] Check status           (claude-runner status)
+  [4] View logs              (claude-runner logs)
+  [5] Build Docker image     (claude-runner docker update)
+  [Q] Quit
+
+  Choice: """
+
+
+def _getch() -> str:
+    """Read a single keypress on Windows (no Enter needed)."""
+    import msvcrt  # noqa: PLC0415
+    ch = msvcrt.getch()
+    try:
+        return ch.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _wait_for_key(prompt: str = "\nPress any key to exit...") -> None:
+    print(prompt, end="", flush=True)
+    _getch()
+    print()
+
+
+def _run_interactive_menu() -> None:
+    """Interactive launcher shown when the exe is double-clicked."""
+    import subprocess  # noqa: PLC0415
+
+    # Enable ANSI / UTF-8 in cmd.exe
+    if sys.platform == "win32":
+        import ctypes  # noqa: PLC0415
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+
+    print(_BANNER)
+    print(_MENU, end="", flush=True)
+
+    key = _getch().lower()
+    print(key)  # echo the choice
+
+    exe = sys.executable if not getattr(sys, "frozen", False) else sys.argv[0]
+
+    if key == "1":
+        path = input("\n  Project book path (e.g. projects/hello_world.yaml): ").strip()
+        if not path:
+            print("  No path entered — returning to menu.")
+            _wait_for_key()
+            return
+        cmd = [exe, "run", path]
+    elif key == "2":
+        cmd = [exe, "configure"]
+    elif key == "3":
+        cmd = [exe, "status"]
+    elif key == "4":
+        cmd = [exe, "logs"]
+    elif key == "5":
+        cmd = [exe, "docker", "update"]
+    else:
+        return  # Q or anything else → exit cleanly
+
+    print()
+    try:
+        subprocess.run(cmd, check=False)
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n[ERROR] {exc}")
+
+    _wait_for_key()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     """Package entry point (defined in pyproject.toml [project.scripts])."""
+    # Double-click / no-args mode: show interactive menu instead of help text.
+    if not sys.argv[1:] and sys.stdout.isatty():
+        _run_interactive_menu()
+        return
     cli(prog_name="claude-runner")
 
 

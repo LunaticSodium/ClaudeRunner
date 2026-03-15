@@ -20,7 +20,11 @@ env/
 # PyInstaller
 *.spec.bak
 dist/
+build/
+
+# Track release/ but ignore stray .exe files elsewhere
 *.exe
+!release/*.exe
 
 # Testing
 .pytest_cache/
