@@ -386,9 +386,14 @@ def cli() -> None:
     See 'claude-runner COMMAND --help' for details on each command.
     Run 'claude-runner configure' to set up your API key and notifications.
     """
-    # Configure root-level logging; individual commands may adjust this.
+    # Default to DEBUG until a successful run has been recorded.
+    _default_log_level = (
+        logging.WARNING
+        if (_INITIALIZED_MARKER.parent / ".first_success").exists()
+        else logging.DEBUG
+    )
     logging.basicConfig(
-        level=logging.WARNING,
+        level=_default_log_level,
         format="%(levelname)-8s %(name)s: %(message)s",
     )
 
@@ -540,6 +545,13 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
 
     if result.status == "complete":
         _ok(f"Task '{pb.name}' completed successfully.")
+        # First success: write marker so subsequent runs use quiet logging.
+        _first_success = _INITIALIZED_MARKER.parent / ".first_success"
+        if not _first_success.exists():
+            try:
+                _first_success.touch()
+            except OSError:
+                pass
     else:
         msg = result.error_message or result.status
         _err_console.print(

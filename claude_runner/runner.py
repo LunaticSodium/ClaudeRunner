@@ -627,10 +627,26 @@ class TaskRunner:
                 return self._make_result("failed", error_message=msg)
 
             if done_task in finished:
-                # Process has exited.
+                # Process has exited.  Yield once so any pending
+                # call_soon_threadsafe callbacks (e.g. ##RUNNER:COMPLETE## set
+                # by the on_line thread) are processed before we judge success.
+                await asyncio.sleep(0)
+                if self._runner_complete_event.is_set():
+                    logger.info(
+                        "Process exited; ##RUNNER:COMPLETE## also set — treating as success."
+                    )
+                    return await self._handle_completion()
+
                 exit_code = done_task.result()
-                if exit_code == 0:
-                    logger.info("Claude Code exited cleanly (exit code 0).")
+                if exit_code in (0, -1):
+                    # 0 = clean exit; -1 = pywinpty couldn't read exit status
+                    # (common on Windows when the process closes its ConPTY).
+                    # In both cases, no error marker was detected, so treat as
+                    # a clean completion.
+                    logger.info(
+                        "Claude Code exited (exit code %s) with no error markers — treating as success.",
+                        exit_code,
+                    )
                     return await self._handle_completion()
                 else:
                     msg = f"Claude Code exited with non-zero exit code {exit_code}."

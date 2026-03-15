@@ -20,6 +20,7 @@ Responsibilities
 
 from __future__ import annotations
 
+import asyncio
 import re
 import os
 import sys
@@ -252,6 +253,22 @@ class ClaudeProcess:
         except Exception:
             return False
 
+    async def wait(self) -> int:
+        """
+        Async-compatible wait: resolves when the subprocess exits.
+
+        Blocks in a thread-pool executor until the reader thread finishes,
+        then returns the exit code (-1 if not determinable).
+        """
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._wait_sync)
+        return self._exit_code if self._exit_code is not None else -1
+
+    def _wait_sync(self) -> None:
+        """Block until the PTY reader thread has finished (process exited)."""
+        if self._reader_thread is not None:
+            self._reader_thread.join()
+
     @property
     def pid(self) -> int:
         """OS process ID, or -1 if the process has not been started."""
@@ -336,10 +353,11 @@ class ClaudeProcess:
             # Retrieve and emit exit code
             exit_code = self._collect_exit_code()
             self._exit_code = exit_code
-            try:
-                self._on_exit(exit_code)
-            except Exception as cb_exc:
-                log.warning("on_exit callback raised: %s", cb_exc)
+            if self._on_exit is not None:
+                try:
+                    self._on_exit(exit_code)
+                except Exception as cb_exc:
+                    log.warning("on_exit callback raised: %s", cb_exc)
 
     def _read_chunk(self) -> Optional[str]:
         """
