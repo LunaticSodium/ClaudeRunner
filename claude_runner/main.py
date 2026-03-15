@@ -146,7 +146,7 @@ def _resolve_api_key() -> Optional[str]:
         pass
 
     # Priority 5 — Claude Code OAuth session
-    from .config import _detect_oauth_session  # noqa: PLC0415
+    from claude_runner.config import _detect_oauth_session  # noqa: PLC0415
     if _detect_oauth_session():
         logger.debug("API key resolved via Claude Code OAuth session.")
         return _OAUTH_SENTINEL
@@ -792,7 +792,7 @@ def configure() -> None:
     else:
         _ok(f"Claude Code found: {claude_path}")
 
-        from .config import _detect_oauth_session  # noqa: PLC0415
+        from claude_runner.config import _detect_oauth_session  # noqa: PLC0415
         if _detect_oauth_session():
             _ok(
                 "OAuth session active (Claude.ai account detected in "
