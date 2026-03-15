@@ -55,7 +55,7 @@ during installation.
 ## Step 1 — Install claude-runner
 
 ```cmd
-git clone https://github.com/your-org/claude-runner.git
+git clone https://github.com/LunaticSodium/ClaudeRunner.git
 cd claude-runner
 pip install -e ".[dev]"
 ```
@@ -145,6 +145,7 @@ prompt: |
   After completing all three steps, summarise what you did in one sentence.
 
 sandbox:
+  backend: native                          # no Docker needed
   working_dir: C:/Projects/hello-claude   # <-- the folder you created above
 
 execution:
@@ -281,15 +282,14 @@ Here is what claude-runner did under the hood:
 
 ## Troubleshooting
 
-### "sandbox.working_dir does not exist"
+### Working directory is empty / no git history
 
-Create the directory first:
+The working directory is created automatically if it doesn't exist.
+To get git tracking, run `git init` inside it before launching the task:
 
 ```cmd
-mkdir C:\Projects\hello-claude
+git init C:\Projects\hello-claude
 ```
-
-And if you want git tracking, also run `git init` inside it.
 
 ### "claude: command not found"
 

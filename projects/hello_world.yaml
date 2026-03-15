@@ -26,13 +26,14 @@ prompt: |
   After completing all three steps, summarise what you did in one sentence.
 
 sandbox:
+  backend: native                          # runs Claude Code directly on your machine (no Docker needed)
   working_dir: C:/Projects/hello-claude   # Change to any empty git-initialised directory
 
 execution:
   timeout_hours: 1
   max_rate_limit_waits: 3
   resume_strategy: continue
-  # skip_permissions defaults to True automatically for docker sandbox
+  skip_permissions: true                  # lets Claude run python/write files without prompting you
 
 notify:
   on: [complete, error]

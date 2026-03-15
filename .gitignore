@@ -46,7 +46,7 @@ Thumbs.db
 *.state.json
 *.log
 logs/
-sandbox/
+/sandbox/
 
 # Secrets — never commit these
 secrets.yaml

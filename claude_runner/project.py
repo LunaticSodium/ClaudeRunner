@@ -119,6 +119,11 @@ class SandboxConfig(BaseModel):
 
     Attributes
     ----------
+    backend:
+        Sandbox backend to use for this task.  ``"docker"`` requires Docker
+        Desktop to be running.  ``"native"`` runs Claude Code directly on the
+        host (no container).  ``"auto"`` (default) picks Docker when available
+        and falls back to native.
     working_dir:
         The directory on the *host* that will be bind-mounted as the working
         directory inside the container.  Must exist at the time the project
@@ -134,6 +139,13 @@ class SandboxConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    backend: Literal["auto", "docker", "native"] = Field(
+        default="auto",
+        description=(
+            "Sandbox backend: 'docker' (requires Docker Desktop), "
+            "'native' (runs on host, no container), or 'auto' (docker if available)."
+        ),
+    )
     working_dir: Path
     readonly_mounts: list[ReadonlyMount] = Field(default_factory=list)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
