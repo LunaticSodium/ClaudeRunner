@@ -217,13 +217,14 @@ class TestWorkingDirValidation:
         )
         assert book.sandbox.working_dir == tmp_path
 
-    def test_nonexistent_dir_raises(self, tmp_path):
-        missing = tmp_path / "does_not_exist"
-        with pytest.raises(ValidationError) as exc_info:
-            ProjectBook.model_validate(
-                {"name": "T", "prompt": "P", "sandbox": {"working_dir": str(missing)}}
-            )
-        assert "does not exist" in str(exc_info.value)
+    def test_nonexistent_dir_is_created(self, tmp_path):
+        missing = tmp_path / "auto_created"
+        assert not missing.exists()
+        book = ProjectBook.model_validate(
+            {"name": "T", "prompt": "P", "sandbox": {"working_dir": str(missing)}}
+        )
+        assert book.sandbox.working_dir == missing
+        assert missing.is_dir()
 
     def test_file_instead_of_dir_raises(self, tmp_path):
         f = tmp_path / "a_file.txt"

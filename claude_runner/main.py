@@ -1349,6 +1349,82 @@ def _wait_for_key(prompt: str = "\nPress any key to exit...") -> None:
     print()
 
 
+def _bundled_projects_dir() -> Optional[pathlib.Path]:
+    """Return the directory containing bundled project YAML files.
+
+    In a frozen PyInstaller exe this is sys._MEIPASS/projects.
+    In development it is the repo root's projects/ folder.
+    """
+    if getattr(sys, "frozen", False):
+        base = pathlib.Path(getattr(sys, "_MEIPASS", pathlib.Path(sys.argv[0]).parent))
+    else:
+        base = pathlib.Path(__file__).parent.parent
+    p = base / "projects"
+    return p if p.is_dir() else None
+
+
+def _resolve_project_path(user_input: str) -> str:
+    """Resolve a project book path entered in the interactive menu.
+
+    Resolution order:
+      1. Absolute path — used as-is.
+      2. Relative path that exists under CWD — used as-is.
+      3. Relative path resolved against the bundled projects directory.
+      4. Fallback — return unchanged (run command will surface the error).
+    """
+    p = pathlib.Path(user_input)
+    if p.is_absolute() or p.exists():
+        return str(p)
+    projects_dir = _bundled_projects_dir()
+    if projects_dir:
+        candidate = projects_dir / user_input
+        if candidate.exists():
+            return str(candidate)
+        # Also try treating input as a bare filename inside projects/
+        candidate2 = projects_dir / p.name
+        if candidate2.exists():
+            return str(candidate2)
+    return user_input
+
+
+def _pick_project_interactively() -> Optional[str]:
+    """List bundled project YAML files and let the user pick one by number,
+    or type a custom path.  Returns the resolved path, or None to cancel.
+    """
+    projects_dir = _bundled_projects_dir()
+    yamls: list[pathlib.Path] = sorted(projects_dir.glob("*.yaml")) if projects_dir else []
+
+    print()
+    if yamls:
+        print("  Bundled project books:")
+        for i, y in enumerate(yamls, 1):
+            print(f"    [{i}] {y.name}")
+        print("    [C] Enter a custom path")
+        print("    [B] Back")
+        print()
+        print("  Choice: ", end="", flush=True)
+        key = _getch().lower()
+        print(key)
+
+        if key == "b":
+            return None
+        if key.isdigit():
+            idx = int(key) - 1
+            if 0 <= idx < len(yamls):
+                return str(yamls[idx])
+            print("  Invalid number.")
+            _wait_for_key()
+            return None
+        # Fall through to custom path prompt for 'c' or anything else
+    else:
+        print("  No bundled project books found.")
+
+    path = input("\n  Project book path: ").strip()
+    if not path:
+        return None
+    return _resolve_project_path(path)
+
+
 def _run_interactive_menu() -> None:
     """Interactive launcher shown when the exe is double-clicked."""
     import subprocess  # noqa: PLC0415
@@ -1368,12 +1444,10 @@ def _run_interactive_menu() -> None:
     exe = sys.executable if not getattr(sys, "frozen", False) else sys.argv[0]
 
     if key == "1":
-        path = input("\n  Project book path (e.g. projects/hello_world.yaml): ").strip()
-        if not path:
-            print("  No path entered — returning to menu.")
-            _wait_for_key()
+        project_path = _pick_project_interactively()
+        if not project_path:
             return
-        cmd = [exe, "run", path]
+        cmd = [exe, "run", project_path]
     elif key == "2":
         cmd = [exe, "configure"]
     elif key == "3":

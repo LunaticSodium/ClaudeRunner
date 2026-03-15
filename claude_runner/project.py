@@ -146,22 +146,21 @@ class SandboxConfig(BaseModel):
     @field_validator("working_dir")
     @classmethod
     def working_dir_must_exist(cls, v: Path) -> Path:
-        """Validate that working_dir exists on the host filesystem.
+        """Ensure working_dir exists, creating it (with parents) if necessary.
 
-        Raises
-        ------
-        ValueError
-            If the directory does not exist at load time.
+        A missing directory is not an error — the sandbox would create it
+        anyway.  We create it here so downstream code can rely on it existing
+        immediately after the project book is loaded.
         """
-        if not v.exists():
-            raise ValueError(
-                f"sandbox.working_dir does not exist on the host filesystem: {v!r}.  "
-                "Create the directory or correct the path before loading this project book."
-            )
-        if not v.is_dir():
+        if v.exists() and not v.is_dir():
             raise ValueError(
                 f"sandbox.working_dir exists but is not a directory: {v!r}."
             )
+        if not v.exists():
+            logger.info(
+                "sandbox.working_dir %r does not exist — creating it now.", v
+            )
+            v.mkdir(parents=True, exist_ok=True)
         return v
 
 
