@@ -409,7 +409,13 @@ def cli() -> None:
     default=False,
     help="Enable verbose (DEBUG) logging.",
 )
-def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
+@click.option(
+    "--show-claude",
+    is_flag=True,
+    default=False,
+    help="Open Claude Code in a visible console window. Implies --verbose. For diagnosing process communication issues only.",
+)
+def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude: bool) -> None:
     """Run a claude-runner project book.
 
     PROJECT_BOOK is the path to a .yaml project book file.  A bare filename
@@ -420,7 +426,7 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
 
         claude-runner run my_task.yaml --tui
     """
-    if verbose:
+    if verbose or show_claude:
         logging.getLogger().setLevel(logging.DEBUG)
 
     _ensure_initialized()
@@ -520,7 +526,47 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
             api_key=api_key,
             resume=resume_session,
             project_book_path=project_book,
+            show_claude=show_claude,
         )
+
+        # ── Register cleanup handlers ──────────────────────────────────────
+        # Ensure the child Claude Code process is terminated when the parent
+        # exits for any reason (normal exit, exception, terminal window close).
+
+        import atexit as _atexit  # noqa: PLC0415
+        import signal as _signal  # noqa: PLC0415
+
+        def _emergency_cleanup() -> None:
+            """Best-effort child-process termination on unexpected exit."""
+            # runner._process is assigned only after launch_claude() succeeds.
+            # If startup failed mid-flight, the live handle is on the sandbox.
+            proc = getattr(runner, "_process", None)
+            if proc is None:
+                sandbox = getattr(runner, "_sandbox", None)
+                proc = getattr(sandbox, "_process", None)
+            if proc is None:
+                return
+            try:
+                if hasattr(proc, "stop"):
+                    proc.stop(timeout=3.0)
+                elif hasattr(proc, "terminate"):
+                    proc.terminate()
+            except Exception:
+                pass
+
+        _atexit.register(_emergency_cleanup)
+
+        if sys.platform == "win32":
+            # SIGBREAK fires when the user closes the console window or presses
+            # Ctrl+Break.  Register a handler so the child is not orphaned.
+            def _sigbreak_handler(signum, frame) -> None:  # noqa: ANN001
+                _emergency_cleanup()
+                sys.exit(130)
+
+            try:
+                _signal.signal(_signal.SIGBREAK, _sigbreak_handler)
+            except (OSError, ValueError):
+                pass  # SIGBREAK may be unavailable in some hosted environments.
 
         result = asyncio.run(runner.run())
 

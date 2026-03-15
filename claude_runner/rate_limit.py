@@ -67,10 +67,30 @@ RATE_LIMIT_PATTERNS: list[str] = [
     # Interactive menu prompts (no timestamp embedded)
     r"/rate-limit-options",
     r"Rate limit options",
+    # NPS / satisfaction rating prompts — matched here so they appear in the
+    # pattern list for documentation purposes; actual dismissal is handled by
+    # _RATING_DISMISS_PATTERNS in runner.py (which sends "4\n" and does NOT
+    # set _detected, so normal task execution continues uninterrupted).
+    r"How would you rate",
+    r"Please rate your experience",
+    r"satisfaction survey",
+    r"\brate\b.{0,30}\b(1-10|stars|experience)\b",
 ]
 
+# NPS/rating patterns are listed in RATE_LIMIT_PATTERNS for reference but must
+# NOT be compiled for rate-limit detection — they are dismissed silently by
+# runner.py without triggering a wait cycle.
+_NPS_PATTERN_STRINGS: frozenset[str] = frozenset({
+    r"How would you rate",
+    r"Please rate your experience",
+    r"satisfaction survey",
+    r"\brate\b.{0,30}\b(1-10|stars|experience)\b",
+})
+
 _COMPILED_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(p, re.IGNORECASE) for p in RATE_LIMIT_PATTERNS
+    re.compile(p, re.IGNORECASE)
+    for p in RATE_LIMIT_PATTERNS
+    if p not in _NPS_PATTERN_STRINGS
 ]
 
 # Pre-compiled runner marker patterns for fast isinstance checks in the detector.

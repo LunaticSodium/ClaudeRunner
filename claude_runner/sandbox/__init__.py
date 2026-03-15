@@ -63,7 +63,7 @@ def resolve_working_dir(
     return wd
 
 
-def create_sandbox(project_book, config, api_key: str, book_path: Optional[Path] = None):
+def create_sandbox(project_book, config, api_key: str, book_path: Optional[Path] = None, *, show_claude: bool = False):
     """
     Returns DockerSandbox if docker backend is configured and Docker is available,
     otherwise falls back to NativeSandbox with a warning log.
@@ -104,7 +104,7 @@ def create_sandbox(project_book, config, api_key: str, book_path: Optional[Path]
             "Sandbox backend is 'native'. "
             "NativeSandbox provides significantly weaker isolation than DockerSandbox."
         )
-        return NativeSandbox(project_book, config, api_key, book_path=book_path)
+        return NativeSandbox(project_book, config, api_key, book_path=book_path, show_claude=show_claude)
 
     if backend in ("docker", "auto"):
         if DockerSandbox.check_available():
@@ -123,7 +123,7 @@ def create_sandbox(project_book, config, api_key: str, book_path: Optional[Path]
             "This provides significantly weaker isolation. "
             "Start Docker Desktop to enable the hard sandbox."
         )
-        return NativeSandbox(project_book, config, api_key, book_path=book_path)
+        return NativeSandbox(project_book, config, api_key, book_path=book_path, show_claude=show_claude)
 
     raise ValueError(
         f"Unknown sandbox backend {backend!r}. "

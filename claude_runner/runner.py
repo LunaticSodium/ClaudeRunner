@@ -89,6 +89,16 @@ _WINPTY_CONTROL_C_EXIT: int = 0xC000013A  # 3221225786
 # Progress log filename (relative to _RUNNER_DIR inside working directory).
 _PROGRESS_LOG_NAME = "progress.log"
 
+# Patterns that match Claude Code's NPS / satisfaction-rating prompts.
+# When any of these fires, runner sends "4\n" (neutral mid-scale answer) and
+# continues without raising an error or triggering a rate-limit wait cycle.
+_RATING_DISMISS_PATTERNS: list[re.Pattern] = [
+    re.compile(r"how would you rate", re.IGNORECASE),
+    re.compile(r"please rate your experience", re.IGNORECASE),
+    re.compile(r"satisfaction survey", re.IGNORECASE),
+    re.compile(r"\brate\b.{0,30}\b(1-10|stars|experience)\b", re.IGNORECASE),
+]
+
 # Progress log header written at task start.
 _PROGRESS_LOG_HEADER_TEMPLATE = (
     "# claude-runner progress log\n"
@@ -246,6 +256,7 @@ class TaskRunner:
         tui=None,
         resume: bool = False,
         project_book_path: Optional[str] = None,
+        show_claude: bool = False,
     ) -> None:
         self._book = project_book
         self._config = config
@@ -253,6 +264,7 @@ class TaskRunner:
         self._tui_callback = tui_callback
         self._tui = tui
         self._resume = resume
+        self._show_claude = show_claude
         self._book_path: Optional[Path] = Path(project_book_path) if project_book_path else None
         # Unique filesystem identifier derived from the YAML filename stem.
         # Keying off the filename (not book.name) prevents collisions when two
@@ -418,7 +430,8 @@ class TaskRunner:
         if self._sandbox is None:
             logger.info("[ACTION] Creating sandbox (backend=%r)", getattr(self._config, "sandbox_backend", "auto"))
             self._sandbox = create_sandbox(
-                self._book, self._config, self._api_key, book_path=self._book_path
+                self._book, self._config, self._api_key, book_path=self._book_path,
+                show_claude=self._show_claude,
             )
         else:
             logger.info("[ACTION] Using pre-provided sandbox.")
@@ -892,6 +905,16 @@ class TaskRunner:
                 self._runner_error_message = msg
                 if self._runner_error_event is not None and self._loop is not None:
                     self._loop.call_soon_threadsafe(self._runner_error_event.set)
+
+        # NPS / satisfaction-rating prompt dismissal.
+        # Claude Code occasionally interrupts a session with a rating prompt.
+        # We auto-respond with "4" (neutral mid-scale) so the task continues.
+        if clean:
+            for _pat in _RATING_DISMISS_PATTERNS:
+                if _pat.search(clean):
+                    logger.info("[ACTION] Rating prompt detected — auto-dismissing.")
+                    self._send_to_process("4\n")
+                    break
 
         # Token counting + checkpoint-end detection.
         if self._context_manager is not None:

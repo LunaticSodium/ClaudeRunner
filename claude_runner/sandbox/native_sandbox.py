@@ -35,13 +35,13 @@ logger = logging.getLogger(__name__)
 # where winpty / ConPTY isn't yet set up (e.g. during unit tests).
 # ---------------------------------------------------------------------------
 
-def _import_claude_process():
+def _import_pipe_process():
     try:
-        from claude_runner.process import ClaudeProcess  # noqa: PLC0415
-        return ClaudeProcess
+        from claude_runner.process import PipeProcess  # noqa: PLC0415
+        return PipeProcess
     except ImportError as exc:
         raise RuntimeError(
-            "Could not import ClaudeProcess from claude_runner.process. "
+            "Could not import PipeProcess from claude_runner.process. "
             "Ensure the 'process' module is present in the claude_runner package."
         ) from exc
 
@@ -72,11 +72,12 @@ class NativeSandbox:
     Requirements: Claude Code and Node.js must be installed on the host.
     """
 
-    def __init__(self, project_book, config, api_key: str, book_path=None) -> None:
+    def __init__(self, project_book, config, api_key: str, book_path=None, *, show_claude: bool = False) -> None:
         self._project_book = project_book
         self._config = config
         self._api_key = api_key
         self._book_path = Path(book_path) if book_path is not None else None
+        self._show_claude = show_claude
 
         # Derive sandbox config ----------------------------------------
         sandbox_cfg = getattr(config, "sandbox", None) or {}
@@ -178,25 +179,32 @@ class NativeSandbox:
         if self._env is None:
             raise SandboxError("setup() must be called before launch_claude().")
 
-        ClaudeProcess = _import_claude_process()
+        PipeProcess = _import_pipe_process()
 
         cmd = self._build_command(prompt)
         working_dir = self.get_working_dir_path()
 
         logger.info(
-            "Launching Claude (native): %s  [cwd=%s]",
-            " ".join(cmd),
+            "Launching Claude (native/pipe): %s  [cwd=%s]",
+            " ".join(cmd[:3]),  # omit the prompt from the log line
             working_dir,
         )
 
-        self._process = ClaudeProcess(
+        self._process = PipeProcess(
             command=cmd,
             working_dir=working_dir,
             env=self._env,
             on_line=on_line,
             on_exit=on_exit,
+            show_console=self._show_claude,
         )
-        self._process.start()
+        try:
+            self._process.start()
+        except Exception:
+            # start() already killed the subprocess before raising; clear the
+            # reference so teardown() does not try to touch a dead process.
+            self._process = None
+            raise
         return self._process
 
     def teardown(self) -> None:

@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import re
 import os
+import subprocess
 import sys
 import logging
 import threading
@@ -481,6 +482,248 @@ class ClaudeProcess:
         except Exception as exc:
             log.debug("Could not retrieve exit code: %s", exc)
             return -1
+
+
+# ---------------------------------------------------------------------------
+# PipeProcess — pipe-based alternative to ClaudeProcess (no PTY / ConPTY)
+# ---------------------------------------------------------------------------
+
+
+class PipeProcess:
+    """
+    Manage Claude Code as a plain subprocess using pipe-based I/O.
+
+    Preferred over ClaudeProcess (pywinpty/ConPTY) for NativeSandbox on
+    Windows because ConPTY can deliver a spurious STATUS_CONTROL_C_EXIT
+    (0xC000013A) to the child process before it produces any output,
+    causing an immediate silent failure.
+
+    Claude Code's ``-p`` (print/non-interactive) mode is designed for
+    programmatic use and does not require a real TTY:
+      - All task output goes to stdout.
+      - Checkpoint prompts and resume text can be injected via stdin.
+      - ANSI escape codes are still emitted (stripped by the caller).
+
+    Interface is identical to ClaudeProcess so the rest of the codebase
+    needs no changes.
+    """
+
+    def __init__(
+        self,
+        command: list[str],
+        working_dir: Path,
+        env: dict[str, str],
+        on_line: Callable[[str, str], None],
+        on_exit: Callable[[int], None],
+        *,
+        show_console: bool = False,
+        **_kwargs,  # absorb cols/rows that ClaudeProcess accepts
+    ) -> None:
+        self._command = list(command)
+        self._working_dir = Path(working_dir)
+        self._env = dict(env)
+        self._on_line = on_line
+        self._on_exit = on_exit
+        self._show_console = show_console
+
+        self._proc: Optional[subprocess.Popen] = None
+        self._pid: int = -1
+        self._exit_code: Optional[int] = None
+
+        self._reader_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        # Set by _deliver_line() when the first output line arrives.
+        # Used by start() to verify the process is producing output.
+        self._first_output_event = threading.Event()
+
+    # ------------------------------------------------------------------
+    # Public API (mirrors ClaudeProcess)
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Spawn the subprocess and begin streaming stdout."""
+        if self._proc is not None:
+            raise ProcessError("PipeProcess.start() called more than once")
+
+        import subprocess as _sp  # noqa: PLC0415
+        creation_flags = 0
+        if sys.platform == "win32":
+            if self._show_console:
+                # Open Claude Code in its own visible console window for diagnosis.
+                # CREATE_NEW_CONSOLE gives a separate visible window; stdin=None
+                # (inherited keyboard) avoids Node.js detecting a non-TTY stdin.
+                # stdout is still piped so the runner's TUI receives output.
+                creation_flags = _sp.CREATE_NEW_CONSOLE
+            else:
+                # DETACHED_PROCESS: the child has NO console at all.
+                # This is critical for pipe-based I/O: without it the child
+                # inherits the parent's console and Node.js / Claude Code can
+                # open CONOUT$ directly, bypassing the redirected stdout pipe
+                # and making our reader receive nothing.  With DETACHED_PROCESS
+                # there is no console to open, so all output must go through
+                # the pipe handles set in STARTUPINFO.
+                creation_flags = _sp.DETACHED_PROCESS
+
+        # stdin=None: child inherits the parent's stdin handle (the user's terminal).
+        # This is the key fix: with stdin=PIPE and no writer, Claude Code blocks
+        # on a read(stdin) forever because it supports "echo prompt | claude -p".
+        # With an inherited terminal stdin, Claude Code can start immediately.
+        # Both production mode and show_console mode use None; the only difference
+        # between the modes is the creation flags (DETACHED_PROCESS vs CREATE_NEW_CONSOLE).
+        stdin_handle = None
+
+        try:
+            self._proc = _sp.Popen(
+                self._command,
+                cwd=str(self._working_dir),
+                env=self._env,
+                stdin=stdin_handle,
+                stdout=_sp.PIPE,
+                stderr=_sp.STDOUT,
+                creationflags=creation_flags,
+            )
+        except Exception as exc:
+            raise ProcessError(f"Failed to spawn subprocess: {exc}") from exc
+
+        self._pid = self._proc.pid
+        self._stop_event.clear()
+        self._first_output_event.clear()
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            name="claude-pipe-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+        log.info("PipeProcess started (pid=%d, cmd=%s)", self._pid, self._command[0])
+
+        # Quick crash check: give the process 10 s to either produce output or die.
+        # This catches immediate failures (bad path, missing CLI, auth crash)
+        # without blocking long-running tasks where Claude buffers its entire
+        # response before flushing (which can take 60+ seconds for complex prompts).
+        #
+        # If the process is still alive after 10 s with no output, that is normal
+        # for complex prompts — we log a warning and return so the runner's
+        # 5-minute silence watchdog can handle genuine hangs.
+        _QUICK_CHECK_S = 10.0
+        if not self._first_output_event.wait(timeout=_QUICK_CHECK_S):
+            exit_code = self._exit_code  # set by reader thread if already dead
+            if not self.is_alive():
+                # Process died before producing output — definite startup failure.
+                self._stop_event.set()
+                try:
+                    if self._proc is not None:
+                        self._proc.kill()
+                except Exception:
+                    pass
+                log.error(
+                    "Claude Code exited without producing output "
+                    "(pid=%d, exit_code=%s).",
+                    self._pid, exit_code,
+                )
+                raise ProcessError(
+                    f"Claude Code exited without producing output "
+                    f"(exit_code={exit_code}). "
+                    "Check that the claude CLI is on PATH and the API key is valid."
+                )
+            # Still alive but no output yet — complex prompt, slow API, or OAuth
+            # token refresh.  Hand off to the runner's silence watchdog.
+            log.warning(
+                "Claude Code has not produced output within %.0fs "
+                "(pid=%d, still alive). Proceeding — silence watchdog will "
+                "handle extended silence.",
+                _QUICK_CHECK_S, self._pid,
+            )
+        else:
+            log.info(
+                "PipeProcess startup verified: first output within %.0fs.",
+                _QUICK_CHECK_S,
+            )
+
+    def send(self, text: str) -> None:
+        """Write *text* to the subprocess stdin (no-op in show_console mode)."""
+        if self._proc is None or self._proc.stdin is None:
+            log.warning("PipeProcess.send() called but stdin is not a pipe — ignoring")
+            return
+        if not text.endswith(("\r\n", "\r", "\n")):
+            text = text + "\n"
+        try:
+            self._proc.stdin.write(text.encode("utf-8", errors="replace"))
+            self._proc.stdin.flush()
+        except OSError as exc:
+            log.warning("PipeProcess.send() failed: %s", exc)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Terminate the subprocess and wait for the reader thread."""
+        self._stop_event.set()
+        if self._proc is not None:
+            try:
+                self._proc.terminate()
+            except Exception as exc:
+                log.debug("PipeProcess.stop(): ignoring error on terminate: %s", exc)
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=timeout)
+        log.info("PipeProcess stopped (exit_code=%s)", self._exit_code)
+
+    def is_alive(self) -> bool:
+        """Return True if the subprocess is still running."""
+        if self._proc is None:
+            return False
+        return self._proc.poll() is None
+
+    async def wait(self) -> int:
+        """Async-compatible wait; returns exit code (-1 if unavailable)."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._wait_sync)
+        return self._exit_code if self._exit_code is not None else -1
+
+    def _wait_sync(self) -> None:
+        if self._reader_thread is not None:
+            self._reader_thread.join()
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        return self._exit_code
+
+    # ------------------------------------------------------------------
+    # Internal reader loop
+    # ------------------------------------------------------------------
+
+    def _reader_loop(self) -> None:
+        """Background thread: read stdout line by line and invoke callbacks."""
+        try:
+            assert self._proc is not None and self._proc.stdout is not None
+            while not self._stop_event.is_set():
+                raw = self._proc.stdout.readline()
+                if not raw:
+                    break  # EOF — process exited
+                decoded = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                self._deliver_line(decoded)
+        except Exception as exc:
+            log.exception("Unexpected error in PipeProcess reader loop: %s", exc)
+        finally:
+            # Collect exit code.
+            try:
+                code = self._proc.wait(timeout=10) if self._proc else -1
+            except Exception:
+                code = -1
+            self._exit_code = code
+            if self._on_exit is not None:
+                try:
+                    self._on_exit(code)
+                except Exception as cb_exc:
+                    log.warning("on_exit callback raised: %s", cb_exc)
+
+    def _deliver_line(self, line: str) -> None:
+        self._first_output_event.set()  # unblock startup verification in start()
+        clean = strip_ansi(line)
+        try:
+            self._on_line(line, clean)
+        except Exception as cb_exc:
+            log.warning("on_line callback raised: %s", cb_exc)
 
 
 # ---------------------------------------------------------------------------
