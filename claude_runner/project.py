@@ -151,7 +151,14 @@ class SandboxConfig(BaseModel):
             "'native' (runs on host, no container), or 'auto' (docker if available)."
         ),
     )
-    working_dir: Path
+    working_dir: Optional[Path] = Field(
+        default=None,
+        description=(
+            "Host-side working directory for the task.  When omitted, claude-runner "
+            "automatically uses a sibling folder named after the YAML file "
+            "(e.g. my-task.yaml → ./my-task/).  The folder is created if it does not exist."
+        ),
+    )
     readonly_mounts: list[ReadonlyMount] = Field(default_factory=list)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     env: dict[str, str] = Field(
@@ -165,27 +172,19 @@ class SandboxConfig(BaseModel):
 
     @field_validator("working_dir", mode="before")
     @classmethod
-    def coerce_working_dir(cls, v: Any) -> Path:
-        return Path(v)
+    def coerce_working_dir(cls, v: Any) -> Optional[Path]:
+        return Path(v) if v is not None else None
 
     @field_validator("working_dir")
     @classmethod
-    def working_dir_must_exist(cls, v: Path) -> Path:
-        """Ensure working_dir exists, creating it (with parents) if necessary.
-
-        A missing directory is not an error — the sandbox would create it
-        anyway.  We create it here so downstream code can rely on it existing
-        immediately after the project book is loaded.
-        """
+    def working_dir_must_be_dir(cls, v: Optional[Path]) -> Optional[Path]:
+        """If working_dir is set, validate it is (or can become) a directory."""
+        if v is None:
+            return None
         if v.exists() and not v.is_dir():
             raise ValueError(
                 f"sandbox.working_dir exists but is not a directory: {v!r}."
             )
-        if not v.exists():
-            logger.info(
-                "sandbox.working_dir %r does not exist — creating it now.", v
-            )
-            v.mkdir(parents=True, exist_ok=True)
         return v
 
 

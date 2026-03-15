@@ -408,7 +408,9 @@ class TaskRunner:
         # --- Sandbox -------------------------------------------------------
         if self._sandbox is None:
             logger.info("[ACTION] Creating sandbox (backend=%r)", getattr(self._config, "sandbox_backend", "auto"))
-            self._sandbox = create_sandbox(self._book, self._config, self._api_key)
+            self._sandbox = create_sandbox(
+                self._book, self._config, self._api_key, book_path=self._book_path
+            )
         else:
             logger.info("[ACTION] Using pre-provided sandbox.")
         await _maybe_await(self._sandbox.setup)
@@ -1469,12 +1471,8 @@ class TaskRunner:
 
     def _working_dir(self) -> Path:
         """Return the task's working directory as a Path."""
-        sandbox_cfg = getattr(self._book, "sandbox", None)
-        wd = getattr(sandbox_cfg, "working_dir", None)
-        if wd:
-            return Path(wd)
-        # Fallback: current working directory (native sandbox without explicit config).
-        return Path.cwd()
+        from .sandbox import resolve_working_dir  # noqa: PLC0415
+        return resolve_working_dir(self._book, book_path=self._book_path)
 
     def _progress_log_path(self) -> Path:
         """Return the absolute path to progress.log inside the working directory."""

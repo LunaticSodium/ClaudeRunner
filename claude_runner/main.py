@@ -675,6 +675,99 @@ def queue(queue_file: str, tui: bool) -> None:
 # validate
 # ──────────────────────────────────────────────────────────────────────────────
 
+@cli.command("new")
+@click.argument("name")
+@click.option("--no-git", is_flag=True, default=False, help="Skip 'git init' in the project folder.")
+def new(name: str, no_git: bool) -> None:
+    """Scaffold a new project: create <name>.yaml and the <name>/ working folder.
+
+    The YAML and folder are created in the current directory (or next to the
+    exe when double-clicked).  Running 'claude-runner run <name>.yaml' will
+    automatically use <name>/ as the working directory.
+
+    Example:
+
+        claude-runner new my-coding-task
+    """
+    _ensure_initialized()
+
+    # Resolve the target directory (next to exe when frozen, cwd otherwise).
+    if getattr(sys, "frozen", False):
+        target_dir = pathlib.Path(sys.argv[0]).parent
+    else:
+        target_dir = pathlib.Path.cwd()
+
+    yaml_path = target_dir / f"{name}.yaml"
+    work_dir = target_dir / name
+
+    if yaml_path.exists():
+        _abort(f"'{yaml_path}' already exists. Choose a different name or edit it directly.")
+    if work_dir.exists() and list(work_dir.iterdir()):
+        _warn(f"Folder '{work_dir}' already exists and is not empty — leaving it as-is.")
+    else:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        _ok(f"Created folder: {work_dir}")
+
+    # Write project YAML template.
+    yaml_content = f"""\
+# {name} — claude-runner project book
+#
+# Working directory: ./{name}/  (auto-derived from this filename)
+# Run with: claude-runner run {name}.yaml
+
+name: {name}
+description: >
+  Describe your project here.
+
+prompt: |
+  Describe your task here. Be specific about:
+  - What you want Claude to build or change
+  - The files or directories involved
+  - Any constraints or preferences
+
+  When done, commit your changes with a descriptive message.
+
+sandbox:
+  backend: native   # change to 'docker' for stronger isolation
+
+execution:
+  timeout_hours: 4
+  max_rate_limit_waits: 5
+  resume_strategy: continue
+  skip_permissions: true
+
+notify:
+  on: [complete, error]
+  channels:
+    - type: desktop
+"""
+    yaml_path.write_text(yaml_content, encoding="utf-8")
+    _ok(f"Created project book: {yaml_path}")
+
+    # Initialise git repo.
+    if not no_git:
+        git_dir = work_dir / ".git"
+        if git_dir.exists():
+            _info(f"Git repo already exists in {work_dir} — skipping git init.")
+        else:
+            try:
+                import subprocess as _sp  # noqa: PLC0415
+                _sp.run(["git", "init", str(work_dir)], check=True, capture_output=True)
+                # Basic .gitignore
+                (work_dir / ".gitignore").write_text(
+                    "# claude-runner internals\n.claude-runner/\n", encoding="utf-8"
+                )
+                _ok(f"Initialised git repo in: {work_dir}")
+            except Exception as exc:
+                _warn(f"git init failed ({exc}). You can run it manually: git init {name}/")
+
+    _console.print(
+        f"\n[bold green]Project '{name}' ready.[/bold green]\n"
+        f"  Edit [cyan]{yaml_path.name}[/cyan] to describe your task, then run:\n"
+        f"  [cyan]claude-runner run {name}.yaml[/cyan]\n"
+    )
+
+
 @cli.command("validate")
 @click.argument("project_book", type=click.Path(exists=True))
 def validate(project_book: str) -> None:
