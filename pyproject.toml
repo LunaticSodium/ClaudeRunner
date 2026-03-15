@@ -14,7 +14,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "claude-runner"
-version = "0.1.0"
+version = "0.3.0"
 description = "Self-orchestrating Claude Code execution framework"
 readme = "README.md"
 license = { text = "MIT" }

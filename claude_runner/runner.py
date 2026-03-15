@@ -269,10 +269,11 @@ class TaskRunner:
         self._rate_limit_reset_time: Optional[datetime] = None
 
         # asyncio.Events for runner protocol markers (##RUNNER:COMPLETE## / ##RUNNER:ERROR##).
-        # Initialised in _initialise() once an event loop is available.
-        self._runner_complete_event: asyncio.Event = asyncio.Event()
-        self._runner_error_event: asyncio.Event = asyncio.Event()
+        # Initialised in _initialise() once an event loop is available (NOT here).
+        self._runner_complete_event: Optional[asyncio.Event] = None
+        self._runner_error_event: Optional[asyncio.Event] = None
         self._runner_error_message: Optional[str] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Silence watchdog: tracks last output time and the background task.
         self._last_output_time: float = time.monotonic()
@@ -456,11 +457,16 @@ class TaskRunner:
         self._rate_limit_event = asyncio.Event()
         self._rate_limit_reset_time = None
 
-        _loop = asyncio.get_event_loop()
+        # Runner protocol marker events — created here (inside the event loop) so
+        # that call_soon_threadsafe() is safe to use from I/O threads.
+        self._runner_complete_event = asyncio.Event()
+        self._runner_error_event = asyncio.Event()
+
+        self._loop = asyncio.get_event_loop()
 
         def _on_rate_limit_detected(reset_at: datetime) -> None:
             self._rate_limit_reset_time = reset_at
-            _loop.call_soon_threadsafe(self._rate_limit_event.set)
+            self._loop.call_soon_threadsafe(self._rate_limit_event.set)
 
         self._rate_detector = RateLimitDetector(on_rate_limit=_on_rate_limit_detected)
 
@@ -827,12 +833,14 @@ class TaskRunner:
             self._rate_detector.feed(clean)
             if self._rate_detector.matched_runner_complete:
                 logger.info("[MARKER] ##RUNNER:COMPLETE## detected — signalling task done.")
-                self._runner_complete_event.set()
+                if self._runner_complete_event is not None and self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._runner_complete_event.set)
             elif self._rate_detector.matched_runner_error is not None:
                 msg = self._rate_detector.matched_runner_error
                 logger.info("[MARKER] ##RUNNER:ERROR## detected — %r", msg)
                 self._runner_error_message = msg
-                self._runner_error_event.set()
+                if self._runner_error_event is not None and self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._runner_error_event.set)
 
         # Token counting + checkpoint-end detection.
         if self._context_manager is not None:

@@ -201,7 +201,7 @@ def _find_state_file(task_name: Optional[str]) -> Optional[pathlib.Path]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @click.group()
-@click.version_option(version="0.2.0", prog_name="claude-runner")
+@click.version_option(version="0.3.0", prog_name="claude-runner")
 def cli() -> None:
     """
     claude-runner — autonomous Claude Code execution framework.
@@ -357,11 +357,11 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
             resume=resume_session,
         )
 
-        exit_code = asyncio.run(runner.run())
+        result = asyncio.run(runner.run())
 
     except KeyboardInterrupt:
         _warn("Interrupted by user (Ctrl+C). Task will be left in a resumable state.")
-        exit_code = 130
+        sys.exit(130)
     except Exception as exc:
         if tui_manager:
             tui_manager.stop()
@@ -370,13 +370,14 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
         if tui_manager:
             tui_manager.stop()
 
-    if exit_code == 0:
+    if result.status == "complete":
         _ok(f"Task '{pb.name}' completed successfully.")
     else:
+        msg = result.error_message or result.status
         _err_console.print(
-            f"[bold red][FAIL][/bold red] Task '{pb.name}' exited with code {exit_code}."
+            f"[bold red][FAIL][/bold red] Task '{pb.name}' failed: {msg}"
         )
-        sys.exit(exit_code)
+        sys.exit(1)
 
 
 def _render_project_book_summary(pb) -> Table:
@@ -1300,7 +1301,7 @@ def docker_update_cmd(no_cache: bool) -> None:
 # Interactive launcher (double-click / no-args mode)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_VERSION = "0.2.0"
+_VERSION = "0.3.0"
 
 _BANNER = f"""
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
@@ -1337,15 +1338,16 @@ def _wait_for_key(prompt: str = "\nPress any key to exit...") -> None:
 
 
 def _bundled_projects_dir() -> Optional[pathlib.Path]:
-    """Return the directory containing bundled project YAML files.
+    """Return the directory to scan for project YAML files.
 
-    In a frozen PyInstaller exe this is sys._MEIPASS/projects.
+    In a frozen PyInstaller exe this is the folder containing the exe itself,
+    so users can place .yaml files next to claude-runner.exe and have them
+    discovered automatically (no bundling needed).
     In development it is the repo root's projects/ folder.
     """
     if getattr(sys, "frozen", False):
-        base = pathlib.Path(getattr(sys, "_MEIPASS", pathlib.Path(sys.argv[0]).parent))
-    else:
-        base = pathlib.Path(__file__).parent.parent
+        return pathlib.Path(sys.argv[0]).parent
+    base = pathlib.Path(__file__).parent.parent
     p = base / "projects"
     return p if p.is_dir() else None
 
