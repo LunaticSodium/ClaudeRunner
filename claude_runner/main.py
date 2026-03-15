@@ -1,0 +1,1322 @@
+"""
+main.py — Click-based CLI entry point for claude-runner.
+
+Commands
+--------
+    claude-runner run <project_book.yaml> [--tui/--no-tui] [--dry-run]
+    claude-runner queue <queue.yaml>
+    claude-runner status [--task <name>]
+    claude-runner abort [--task <name>]
+    claude-runner logs [--task <name>] [--tail N]
+    claude-runner validate <project_book.yaml>
+    claude-runner configure
+    claude-runner docker update
+    claude-runner docker status
+"""
+
+from __future__ import annotations
+
+import asyncio
+import glob
+import json
+import logging
+import os
+import pathlib
+import platform
+import smtplib
+import socket
+import sys
+from typing import Optional
+
+import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lazy imports — deferred so the CLI stays snappy even if optional deps are
+# missing.  Required modules are imported at the top of each command function
+# so the error surfaces with a helpful message, not an import-time traceback.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_console = Console()
+_err_console = Console(stderr=True)
+
+logger = logging.getLogger("claude_runner.main")
+
+# Default configuration paths
+_DEFAULT_CONFIG_DIR = pathlib.Path.home() / ".claude-runner"
+_DEFAULT_SECRETS_FILE = _DEFAULT_CONFIG_DIR / "secrets.yaml"
+_DEFAULT_STATE_DIR = _DEFAULT_CONFIG_DIR / "state"
+_DEFAULT_LOG_DIR = _DEFAULT_CONFIG_DIR / "logs"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _ensure_dirs() -> None:
+    """Create ~/.claude-runner/* directories if they do not exist."""
+    for d in (_DEFAULT_CONFIG_DIR, _DEFAULT_STATE_DIR, _DEFAULT_LOG_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def _abort(message: str, exit_code: int = 1) -> None:
+    """Print a styled error and exit."""
+    _err_console.print(f"[bold red][ERROR][/bold red] {message}")
+    sys.exit(exit_code)
+
+
+def _info(message: str) -> None:
+    _console.print(f"[bold cyan][INFO][/bold cyan]  {message}")
+
+
+def _ok(message: str) -> None:
+    _console.print(f"[bold green][OK][/bold green]    {message}")
+
+
+def _warn(message: str) -> None:
+    _console.print(f"[bold yellow][WARN][/bold yellow]  {message}")
+
+
+_OAUTH_SENTINEL = "__claude_oauth__"
+
+
+def _resolve_api_key() -> Optional[str]:
+    """
+    Resolve ANTHROPIC_API_KEY through the 5-source priority chain.
+
+    Returns the literal string ``_OAUTH_SENTINEL`` when a valid Claude Code
+    OAuth session is detected (Priority 5), so callers can distinguish between
+    "key found" and "OAuth active" without raising.
+
+    Priority 1: ANTHROPIC_API_KEY in current shell environment.
+    Priority 2: ANTHROPIC_API_KEY in system-wide Windows registry.
+    Priority 3: api_key field in ~/.claude-runner/secrets.yaml.
+    Priority 4: Windows Credential Manager (keyring).
+    Priority 5: Claude Code OAuth session (~/.claude/.credentials.json).
+    """
+    # Priority 1 — current environment
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        logger.debug("API key resolved from current environment.")
+        return key
+
+    # Priority 2 — system-wide environment (Windows registry)
+    if platform.system() == "Windows":
+        try:
+            import winreg  # type: ignore[import]
+            for hive, sub in [
+                (winreg.HKEY_CURRENT_USER, r"Environment"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+            ]:
+                try:
+                    with winreg.OpenKey(hive, sub) as reg_key:
+                        value, _ = winreg.QueryValueEx(reg_key, "ANTHROPIC_API_KEY")
+                        if value.strip():
+                            logger.debug("API key resolved from Windows registry.")
+                            return value.strip()
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            pass
+
+    # Priority 3 — secrets.yaml
+    if _DEFAULT_SECRETS_FILE.exists():
+        try:
+            import yaml  # type: ignore[import]
+            with _DEFAULT_SECRETS_FILE.open("r", encoding="utf-8") as fh:
+                secrets = yaml.safe_load(fh) or {}
+            key = (secrets.get("api_key") or "").strip()
+            if key:
+                logger.debug("API key resolved from secrets.yaml.")
+                return key
+        except Exception as exc:
+            logger.warning("Failed to read secrets.yaml: %s", exc)
+
+    # Priority 4 — keyring / Windows Credential Manager
+    try:
+        import keyring  # type: ignore[import]
+        key = (keyring.get_password("claude-runner/anthropic", "api_key") or "").strip()
+        if key:
+            logger.debug("API key resolved from keyring.")
+            return key
+    except Exception:
+        pass
+
+    # Priority 5 — Claude Code OAuth session
+    from .config import _detect_oauth_session  # noqa: PLC0415
+    if _detect_oauth_session():
+        logger.debug("API key resolved via Claude Code OAuth session.")
+        return _OAUTH_SENTINEL
+
+    return None
+
+
+def _load_project_book(path: str):
+    """Load and validate a project book, aborting with a clear error on failure."""
+    try:
+        from claude_runner.project import ProjectBook  # type: ignore[import]
+        return ProjectBook.from_yaml(path)
+    except ImportError:
+        _abort(
+            "claude_runner.project module not found. "
+            "Ensure claude-runner is installed correctly: pip install -e ."
+        )
+    except Exception as exc:
+        _abort(f"Failed to load project book '{path}': {exc}")
+
+
+def _load_global_config():
+    """Load global config, returning defaults if the file does not exist."""
+    try:
+        from claude_runner.config import GlobalConfig  # type: ignore[import]
+        return GlobalConfig.load()
+    except ImportError:
+        _abort(
+            "claude_runner.config module not found. "
+            "Ensure claude-runner is installed correctly: pip install -e ."
+        )
+    except Exception as exc:
+        _abort(f"Failed to load global config: {exc}")
+
+
+def _find_state_file(task_name: Optional[str]) -> Optional[pathlib.Path]:
+    """Locate a state file for the given task name (or the most recent one)."""
+    if task_name:
+        candidate = _DEFAULT_STATE_DIR / f"{task_name}.json"
+        return candidate if candidate.exists() else None
+
+    files = sorted(
+        _DEFAULT_STATE_DIR.glob("*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return files[0] if files else None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Root command group
+# ──────────────────────────────────────────────────────────────────────────────
+
+@click.group()
+@click.version_option(version="0.1.0", prog_name="claude-runner")
+def cli() -> None:
+    """
+    claude-runner — autonomous Claude Code execution framework.
+
+    Write a project book (YAML), then run:
+
+        claude-runner run projects/my_task.yaml
+
+    \b
+    Key features:
+      - Automatic rate-limit detection and resume (no human needed)
+      - Docker sandbox with network allowlisting
+      - Desktop, email, and webhook notifications on task events
+      - Context checkpoint injection to keep long tasks coherent
+      - context_anchors: persistent per-task instructions prepended to every
+        prompt (initial, resume, and checkpoint).  Set once in the project
+        book; claude-runner injects silently.  When active, the TUI shows:
+        [context anchors: active]
+
+    See 'claude-runner COMMAND --help' for details on each command.
+    Run 'claude-runner configure' to set up your API key and notifications.
+    """
+    # Configure root-level logging; individual commands may adjust this.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)-8s %(name)s: %(message)s",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# run
+# ──────────────────────────────────────────────────────────────────────────────
+
+@cli.command("run")
+@click.argument("project_book", type=click.Path(exists=True))
+@click.option("--tui/--no-tui", default=True, help="Show the Rich terminal UI (default: on).")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Validate and show resolved config without actually running.",
+)
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    default=False,
+    help="Enable verbose (DEBUG) logging.",
+)
+def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
+    """Run a claude-runner project book.
+
+    PROJECT_BOOK is the path to a .yaml project book file.
+
+    Example:
+
+        claude-runner run projects/my_task.yaml --tui
+    """
+    if verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    _ensure_dirs()
+
+    # ── Load project book ──────────────────────────────────────────────────────
+    pb = _load_project_book(project_book)
+    config = _load_global_config()
+
+    # ── Dry run ────────────────────────────────────────────────────────────────
+    if dry_run:
+        _console.print(
+            Panel(
+                _render_project_book_summary(pb),
+                title=f"[bold cyan]DRY RUN[/bold cyan] — {pb.name}",
+                border_style="cyan",
+            )
+        )
+        _ok("Project book is valid. No task was launched (--dry-run).")
+        return
+
+    # ── Resolve API key ────────────────────────────────────────────────────────
+    api_key = _resolve_api_key()
+    if not api_key:
+        _abort(
+            "ANTHROPIC_API_KEY not found in environment, registry, secrets.yaml, "
+            "or keyring.\n\nRun:  claude-runner configure\nto set up your API key."
+        )
+
+    # ── Check for existing state (offer resume or fresh start) ────────────────
+    state_file = _find_state_file(pb.name)
+    resume_session = False
+
+    if state_file:
+        try:
+            with state_file.open("r", encoding="utf-8") as fh:
+                saved_state = json.load(fh)
+            prev_phase = saved_state.get("phase", "unknown")
+            prev_started = saved_state.get("start_time", "unknown")
+
+            _console.print(
+                Panel(
+                    f"A previous session was found for task [bold]{pb.name}[/bold].\n"
+                    f"  Phase: [yellow]{prev_phase}[/yellow]\n"
+                    f"  Started: {prev_started}\n\n"
+                    "Resume from where it left off, or start fresh?",
+                    title="[bold yellow]Previous Session Found[/bold yellow]",
+                    border_style="yellow",
+                )
+            )
+            choice = click.prompt(
+                "  [R]esume / [F]resh start / [A]bort",
+                default="R",
+            ).strip().upper()
+
+            if choice == "A":
+                _info("Aborted by user.")
+                return
+            elif choice == "F":
+                _info("Starting fresh — previous state will be overwritten.")
+                state_file.unlink(missing_ok=True)
+                resume_session = False
+            else:
+                _info("Resuming previous session.")
+                resume_session = True
+
+        except Exception as exc:
+            _warn(f"Could not read previous state file ({exc}). Starting fresh.")
+            resume_session = False
+
+    # ── Set up TUI ─────────────────────────────────────────────────────────────
+    tui_manager = None
+    if tui:
+        try:
+            from claude_runner.tui import TUIManager  # type: ignore[import]
+            timeout_hours = getattr(pb.execution, "timeout_hours", 4.0)
+            tui_manager = TUIManager(
+                task_name=pb.name,
+                project_book_path=project_book,
+                timeout_hours=float(timeout_hours),
+            )
+            tui_manager.start()
+        except ImportError:
+            _warn("TUI unavailable (rich not installed). Continuing without TUI.")
+            tui_manager = None
+
+    # ── Set up sandbox ─────────────────────────────────────────────────────────
+    try:
+        from claude_runner.sandbox import create_sandbox  # type: ignore[import]
+        sandbox = create_sandbox(pb, config, api_key)
+    except ImportError:
+        if tui_manager:
+            tui_manager.stop()
+        _abort("claude_runner.sandbox module not found. Ensure claude-runner is fully installed.")
+    except RuntimeError as exc:
+        if tui_manager:
+            tui_manager.stop()
+        _abort(str(exc))
+
+    # ── Create runner and execute ──────────────────────────────────────────────
+    try:
+        from claude_runner.runner import ClaudeRunner  # type: ignore[import]
+        runner = ClaudeRunner(
+            project_book=pb,
+            config=config,
+            sandbox=sandbox,
+            tui=tui_manager,
+            api_key=api_key,
+            resume=resume_session,
+        )
+
+        exit_code = asyncio.run(runner.run())
+
+    except KeyboardInterrupt:
+        _warn("Interrupted by user (Ctrl+C). Task will be left in a resumable state.")
+        exit_code = 130
+    except Exception as exc:
+        if tui_manager:
+            tui_manager.stop()
+        _abort(f"Runner error: {exc}")
+    finally:
+        if tui_manager:
+            tui_manager.stop()
+
+    if exit_code == 0:
+        _ok(f"Task '{pb.name}' completed successfully.")
+    else:
+        _err_console.print(
+            f"[bold red][FAIL][/bold red] Task '{pb.name}' exited with code {exit_code}."
+        )
+        sys.exit(exit_code)
+
+
+def _render_project_book_summary(pb) -> Table:
+    """Render a summary of a parsed project book for --dry-run output."""
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim", width=22)
+    t.add_column(style="white")
+
+    t.add_row("Name", str(getattr(pb, "name", "—")))
+    t.add_row("Description", str(getattr(pb, "description", "—") or "—").strip()[:80])
+
+    anchors = getattr(pb, "context_anchors", None)
+    if anchors:
+        t.add_row("Context anchors", "[cyan]active[/cyan]")
+
+    prompt = str(getattr(pb, "prompt", "") or "")
+    preview = prompt.strip().replace("\n", " ")[:80]
+    if len(prompt.strip()) > 80:
+        preview += "…"
+    t.add_row("Prompt (preview)", preview)
+
+    # Sandbox
+    sandbox_cfg = getattr(pb, "sandbox", None)
+    if sandbox_cfg:
+        t.add_row("Working dir", str(getattr(sandbox_cfg, "working_dir", "—")))
+
+    # Execution
+    exec_cfg = getattr(pb, "execution", None)
+    if exec_cfg:
+        t.add_row("Timeout", f"{getattr(exec_cfg, 'timeout_hours', '—')}h")
+        t.add_row("Max RL waits", str(getattr(exec_cfg, "max_rate_limit_waits", "—")))
+        t.add_row("Resume strategy", str(getattr(exec_cfg, "resume_strategy", "—")))
+
+    # Notify
+    notify_cfg = getattr(pb, "notify", None)
+    if notify_cfg:
+        events = getattr(notify_cfg, "on", [])
+        t.add_row("Notify on", ", ".join(events) if events else "—")
+        channels = getattr(notify_cfg, "channels", [])
+        ch_types = [str(getattr(c, "type", c)) for c in channels]
+        t.add_row("Channels", ", ".join(ch_types) if ch_types else "—")
+
+    return t
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# queue
+# ──────────────────────────────────────────────────────────────────────────────
+
+@cli.command("queue")
+@click.argument("queue_file", type=click.Path(exists=True))
+@click.option("--tui/--no-tui", default=True, help="Show TUI for each task.")
+def queue(queue_file: str, tui: bool) -> None:
+    """Run a queue of project books defined in QUEUE_FILE.
+
+    QUEUE_FILE is a YAML file that lists project books and optional dependencies.
+    Tasks are executed sequentially by default, unless concurrency is configured.
+
+    Example queue.yaml:
+
+    \b
+        tasks:
+          - project_book: projects/task1.yaml
+          - project_book: projects/task2.yaml
+            depends_on: [task1]
+        options:
+          fail_fast: true
+    """
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError:
+        _abort("pyyaml is required. Install with: pip install pyyaml")
+
+    _ensure_dirs()
+
+    with open(queue_file, "r", encoding="utf-8") as fh:
+        queue_cfg = yaml.safe_load(fh)
+
+    tasks = queue_cfg.get("tasks", [])
+    if not tasks:
+        _abort(f"No tasks found in queue file '{queue_file}'.")
+
+    fail_fast: bool = queue_cfg.get("options", {}).get("fail_fast", True)
+
+    _info(f"Queue: {len(tasks)} task(s) to run.")
+    failed: list[str] = []
+
+    for i, task_entry in enumerate(tasks, start=1):
+        pb_path = task_entry.get("project_book")
+        if not pb_path:
+            _warn(f"Queue entry {i} has no 'project_book' field — skipping.")
+            continue
+
+        pb_path = str(pathlib.Path(pb_path).expanduser())
+        if not pathlib.Path(pb_path).exists():
+            _warn(f"Project book not found: '{pb_path}' — skipping.")
+            failed.append(pb_path)
+            if fail_fast:
+                break
+            continue
+
+        _info(f"[{i}/{len(tasks)}] Running: {pb_path}")
+
+        # Delegate to the run command programmatically
+        ctx = click.Context(run)
+        try:
+            ctx.invoke(run, project_book=pb_path, tui=tui, dry_run=False, verbose=False)
+        except SystemExit as exc:
+            if exc.code != 0:
+                failed.append(pb_path)
+                _warn(f"Task failed: {pb_path}")
+                if fail_fast:
+                    _abort(f"Stopping queue after failure (fail_fast=true).")
+                    break
+
+    if failed:
+        _err_console.print(
+            f"[bold red][FAIL][/bold red] {len(failed)} task(s) failed: "
+            + ", ".join(failed)
+        )
+        sys.exit(1)
+    else:
+        _ok(f"All {len(tasks)} task(s) completed successfully.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# validate
+# ──────────────────────────────────────────────────────────────────────────────
+
+@cli.command("validate")
+@click.argument("project_book", type=click.Path(exists=True))
+def validate(project_book: str) -> None:
+    """Validate a project book without running it.
+
+    Checks schema, required fields, and warns about potentially dangerous
+    configurations (e.g. skip_permissions without Docker).
+
+    PROJECT_BOOK is the path to a .yaml project book file.
+    """
+    pb = _load_project_book(project_book)
+
+    _console.print(
+        Panel(
+            _render_project_book_summary(pb),
+            title=f"[bold green]VALID[/bold green] — {pb.name}",
+            border_style="green",
+        )
+    )
+
+    # Warn on dangerous combinations
+    exec_cfg = getattr(pb, "execution", None)
+    sandbox_cfg = getattr(pb, "sandbox", None)
+    skip_perms = getattr(exec_cfg, "skip_permissions", False) if exec_cfg else False
+    backend = getattr(sandbox_cfg, "backend", "docker") if sandbox_cfg else "docker"
+
+    if skip_perms and backend == "native":
+        _warn(
+            "skip_permissions is enabled without a Docker sandbox. "
+            "Claude Code will run with full host filesystem access. "
+            "This is only safe if you trust the task completely."
+        )
+
+    _ok(f"'{project_book}' is a valid project book.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# status
+# ──────────────────────────────────────────────────────────────────────────────
+
+@cli.command("status")
+@click.option("--task", default=None, help="Task name to inspect (defaults to most recent).")
+def status(task: Optional[str]) -> None:
+    """Check the status of a running or completed task.
+
+    If --task is omitted, shows the most recently modified state file.
+    """
+    _ensure_dirs()
+    state_file = _find_state_file(task)
+
+    if not state_file:
+        if task:
+            _abort(f"No state file found for task '{task}'.")
+        else:
+            _abort(
+                "No state files found in ~/.claude-runner/state/. "
+                "Has a task been run yet?"
+            )
+
+    try:
+        with state_file.open("r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except Exception as exc:
+        _abort(f"Could not read state file: {exc}")
+
+    t = Table(title=f"Task Status — {state_file.stem}", show_header=False, box=None)
+    t.add_column(style="dim", width=24)
+    t.add_column(style="white")
+
+    for key, value in state.items():
+        if key == "phase":
+            phase_style = {
+                "running": "bold green",
+                "waiting": "bold yellow",
+                "complete": "bold blue",
+                "failed": "bold red",
+            }.get(str(value).lower(), "white")
+            t.add_row(key, Text(str(value), style=phase_style))
+        else:
+            t.add_row(key, str(value))
+
+    _console.print(t)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# abort
+# ──────────────────────────────────────────────────────────────────────────────
+
+@cli.command("abort")
+@click.option("--task", default=None, help="Task name to abort (defaults to most recent).")
+@click.option("--force", is_flag=True, default=False, help="Skip confirmation prompt.")
+def abort(task: Optional[str], force: bool) -> None:
+    """Abort a running task.
+
+    This sends a termination signal to the Claude Code process and cleans up the
+    Docker container (if any).  The state file is preserved so the task can be
+    resumed later.
+    """
+    _ensure_dirs()
+    state_file = _find_state_file(task)
+
+    if not state_file:
+        _abort(
+            f"No state file found for task '{task or 'most recent'}'."
+        )
+
+    try:
+        with state_file.open("r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except Exception as exc:
+        _abort(f"Could not read state file: {exc}")
+
+    task_name = state.get("task_name", state_file.stem)
+    phase = state.get("phase", "unknown")
+
+    if phase in ("complete", "failed"):
+        _warn(f"Task '{task_name}' is already in state '{phase}'. Nothing to abort.")
+        return
+
+    if not force:
+        click.confirm(
+            f"Abort task '{task_name}' (currently {phase})?",
+            default=False,
+            abort=True,
+        )
+
+    # Signal the runner via the state file's PID if recorded
+    pid = state.get("pid")
+    if pid:
+        import signal as _signal
+        try:
+            os.kill(int(pid), _signal.SIGTERM)
+            _ok(f"Sent SIGTERM to PID {pid}.")
+        except ProcessLookupError:
+            _warn(f"Process PID {pid} not found (already exited?).")
+        except Exception as exc:
+            _warn(f"Could not send signal to PID {pid}: {exc}")
+    else:
+        _warn(
+            "No PID recorded in state file. "
+            "If the runner is still active, kill it manually."
+        )
+
+    # Mark state as aborted
+    state["phase"] = "aborted"
+    try:
+        with state_file.open("w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        _ok(f"State updated to 'aborted' for task '{task_name}'.")
+    except Exception as exc:
+        _warn(f"Could not update state file: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# logs
+# ──────────────────────────────────────────────────────────────────────────────
+
+@cli.command("logs")
+@click.option("--task", default=None, help="Task name (defaults to most recent).")
+@click.option("--tail", default=50, show_default=True, help="Number of lines to show.")
+@click.option("--raw", is_flag=True, default=False, help="Print raw log without formatting.")
+def logs(task: Optional[str], tail: int, raw: bool) -> None:
+    """View logs from a task's last run.
+
+    Searches ~/.claude-runner/logs/ for a log file matching the task name.
+    """
+    _ensure_dirs()
+
+    if task:
+        candidates = sorted(
+            _DEFAULT_LOG_DIR.glob(f"{task}*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    else:
+        candidates = sorted(
+            _DEFAULT_LOG_DIR.glob("*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+    if not candidates:
+        _abort(
+            f"No log files found in {_DEFAULT_LOG_DIR}"
+            + (f" for task '{task}'." if task else ".")
+        )
+
+    log_file = candidates[0]
+    _info(f"Reading: {log_file}")
+
+    try:
+        with log_file.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except Exception as exc:
+        _abort(f"Could not read log file: {exc}")
+
+    tail_lines = lines[-tail:] if tail < len(lines) else lines
+
+    if raw:
+        for line in tail_lines:
+            click.echo(line, nl=False)
+    else:
+        _console.print(
+            Panel(
+                "".join(tail_lines),
+                title=f"[bold]Logs: {log_file.name}[/bold] (last {len(tail_lines)} lines)",
+                border_style="bright_black",
+            )
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# configure
+# ──────────────────────────────────────────────────────────────────────────────
+
+@cli.command("configure")
+def configure() -> None:
+    """Interactive configuration wizard.
+
+    \b
+    Guides you through:
+      - Choosing your authentication method (API key or Claude.ai account)
+      - Setting your ANTHROPIC_API_KEY  (API key users only)
+      - Configuring email notifications (with Gmail App Password guide)
+      - Testing SMTP connectivity
+      - Saving credentials to secrets.yaml or Windows Credential Manager
+    """
+    _ensure_dirs()
+
+    _console.print(
+        Panel(
+            "[bold cyan]claude-runner configuration wizard[/bold cyan]\n\n"
+            "This wizard will help you configure authentication and optional\n"
+            "notification channels. Press Ctrl+C at any time to quit.",
+            border_style="cyan",
+        )
+    )
+
+    secrets: dict = {}
+
+    # ── Load existing secrets ──────────────────────────────────────────────────
+    if _DEFAULT_SECRETS_FILE.exists():
+        try:
+            import yaml  # type: ignore[import]
+            with _DEFAULT_SECRETS_FILE.open("r", encoding="utf-8") as fh:
+                secrets = yaml.safe_load(fh) or {}
+            _info("Existing secrets.yaml loaded.")
+        except Exception as exc:
+            _warn(f"Could not load existing secrets.yaml: {exc}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Step 1: Detect Claude Code installation and authentication
+    # ═══════════════════════════════════════════════════════════════════════════
+    _console.rule("[bold]Step 1 of 3: Claude Code Authentication[/bold]")
+
+    import shutil as _shutil  # noqa: PLC0415
+    claude_path = _shutil.which("claude")
+
+    if claude_path is None:
+        _warn(
+            "Claude Code not found on PATH.\n"
+            "  Install it first:\n\n"
+            "    winget install OpenJS.NodeJS.LTS\n"
+            "    npm install -g @anthropic-ai/claude-code\n"
+            "    claude          ← completes the one-time login\n\n"
+            "  Then re-run: claude-runner configure"
+        )
+        # Still allow the wizard to continue so email / save steps can run.
+        using_oauth = False
+        _need_api_key = True
+    else:
+        _ok(f"Claude Code found: {claude_path}")
+
+        from .config import _detect_oauth_session  # noqa: PLC0415
+        if _detect_oauth_session():
+            _ok(
+                "OAuth session active (Claude.ai account detected in "
+                "~/.claude/.credentials.json)\n"
+                "  claude-runner will authenticate using your Claude.ai session — "
+                "no API key needed."
+            )
+            using_oauth = True
+            _need_api_key = False
+        else:
+            _info("No OAuth session found — checking for an API key…")
+            using_oauth = False
+            existing_key = _resolve_api_key()
+            if existing_key and existing_key != _OAUTH_SENTINEL:
+                masked = existing_key[:8] + "…" + existing_key[-4:]
+                _ok(f"API key already configured: {masked}")
+                if not click.confirm("Update it?", default=False):
+                    _need_api_key = False
+                else:
+                    _need_api_key = True
+            else:
+                _need_api_key = True
+
+    if _need_api_key and not using_oauth:
+        _console.print(
+            "\nNo authentication detected.  Provide an Anthropic API key, or\n"
+            "log in with a Claude.ai Pro/Max account by running [cyan]claude[/cyan].\n\n"
+            "Get an API key at: [link]https://console.anthropic.com/account/keys[/link]\n"
+        )
+        new_key = click.prompt(
+            "Paste your ANTHROPIC_API_KEY",
+            hide_input=True,
+            confirmation_prompt=False,
+        ).strip()
+
+        if not new_key.startswith("sk-"):
+            _warn("Key does not start with 'sk-'. Double-check it before saving.")
+
+        secrets["api_key"] = new_key
+        _ok("API key noted (will be saved at the end of this wizard).")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Step B: Notifications (optional)
+    # ═══════════════════════════════════════════════════════════════════════════
+    _console.rule("[bold]Step 2 of 3: Notifications (optional)[/bold]")
+    _console.print(
+        "claude-runner can notify you when a task completes or fails.\n\n"
+        "  [bold]1[/bold]  ntfy.sh  [green](recommended — no account required)[/green]\n"
+        "  [bold]2[/bold]  Email (SMTP)\n"
+        "  [bold]3[/bold]  Skip for now\n"
+    )
+    notify_choice = click.prompt("Choice", default="1").strip()
+
+    if notify_choice == "1":
+        _run_ntfy_guide(secrets)
+    elif notify_choice == "2":
+        _console.print(
+            "\n[dim]Note: password fields are invisible as you type — "
+            "this is intentional. If your system auto-fills a password, "
+            "clear the field and type it manually to avoid pasting the wrong value.[/dim]\n"
+        )
+        email_address = click.prompt("Your email address").strip()
+        secrets["notify_email"] = email_address
+
+        is_gmail = email_address.lower().endswith(
+            ("@gmail.com", "@googlemail.com")
+        )
+
+        if is_gmail:
+            _run_gmail_app_password_guide(email_address, secrets)
+        else:
+            _run_generic_smtp_guide(email_address, secrets)
+    else:
+        _info("Skipping notification configuration.")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Step C: Save credentials
+    # ═══════════════════════════════════════════════════════════════════════════
+    _console.rule("[bold]Step 3 of 3: Save Credentials[/bold]")
+
+    _console.print(
+        "\nWhere should credentials be saved?\n\n"
+        "  [bold]1[/bold]  ~/.claude-runner/secrets.yaml  (plaintext, file permissions 600)\n"
+        "  [bold]2[/bold]  Windows Credential Manager / system keyring  (encrypted, recommended)\n"
+    )
+
+    storage_choice = click.prompt("Choice", default="2").strip()
+
+    if storage_choice == "1":
+        _save_to_secrets_yaml(secrets)
+    else:
+        _save_to_keyring(secrets)
+
+    # Write .gitignore template if it doesn't exist
+    gitignore_path = _DEFAULT_CONFIG_DIR / ".gitignore"
+    if not gitignore_path.exists():
+        gitignore_path.write_text("secrets.yaml\n*.key\n*.pem\n", encoding="utf-8")
+        _ok(f"Created {gitignore_path} (protects secrets from accidental git commits).")
+
+    _console.print(
+        Panel(
+            "[bold green]Configuration complete![/bold green]\n\n"
+            "You can now run:\n\n"
+            "  [bold cyan]claude-runner run projects/example_simple.yaml[/bold cyan]",
+            border_style="green",
+        )
+    )
+
+
+def _run_ntfy_guide(secrets: dict) -> None:
+    """
+    Set up ntfy.sh push notifications.
+
+    ntfy.sh is a free, open-source pub/sub notification service.
+    No account required — just pick a topic name and subscribe on your phone.
+    """
+    _console.print(
+        Panel(
+            "[bold]ntfy.sh setup[/bold]\n\n"
+            "ntfy.sh is a free push-notification service — no account needed.\n\n"
+            "  1. Install the ntfy app on your phone (iOS / Android)\n"
+            "     or open https://ntfy.sh in your browser.\n"
+            "  2. Subscribe to a topic name that only you know\n"
+            "     (treat it like a password — anyone who knows it can send you messages).\n"
+            "  3. Enter that topic name below.",
+            border_style="cyan",
+        )
+    )
+
+    topic = click.prompt("Enter your ntfy.sh topic name").strip()
+    if not topic:
+        _warn("Topic name is empty — skipping ntfy setup.")
+        return
+
+    ntfy_url = f"https://ntfy.sh/{topic}"
+
+    # Send a test notification.
+    _info(f"Sending test notification to {ntfy_url} …")
+    try:
+        import urllib.request  # noqa: PLC0415
+        import urllib.error    # noqa: PLC0415
+        req = urllib.request.Request(
+            ntfy_url,
+            data=b"claude-runner is configured and ready.",
+            headers={
+                "Title": "claude-runner: test notification",
+                "Priority": "default",
+                "Tags": "white_check_mark",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status == 200:
+                _ok(f"Test notification sent to {ntfy_url}")
+                _console.print(
+                    "[dim]Check your ntfy app — you should see a message arrive now.[/dim]"
+                )
+            else:
+                _warn(f"ntfy responded with HTTP {resp.status} — check the topic name.")
+    except urllib.error.URLError as exc:
+        _warn(f"Could not reach ntfy.sh: {exc}  (saved anyway; will work when online)")
+
+    secrets["notify_webhook_url"] = ntfy_url
+    _ok(f"ntfy.sh topic saved: {ntfy_url}")
+
+
+def _run_gmail_app_password_guide(email_address: str, secrets: dict) -> None:
+    """
+    Interactive Gmail App Password guide (spec section 4.6, steps 1-4).
+    """
+    _console.print(
+        Panel(
+            "[bold]Gmail detected.[/bold] Claude-runner uses App Passwords for Gmail.\n"
+            "This avoids OAuth complexity and works reliably with standard SMTP.",
+            border_style="cyan",
+        )
+    )
+
+    # ── Step 1 of 4: Enable 2-Step Verification ────────────────────────────────
+    _console.print(
+        "\n[bold]Step 1 of 4: Enable 2-Step Verification[/bold]\n"
+        "─────────────────────────────────────────\n"
+        "Gmail requires 2-Step Verification before App Passwords can be created.\n"
+        "If you haven't enabled it yet:\n\n"
+        "  [cyan]→ Open in browser:[/cyan] https://myaccount.google.com/security\n"
+        "  → Under [italic]'How you sign in to Google'[/italic], click [italic]'2-Step Verification'[/italic]\n"
+        "  → Follow the setup flow, then return here.\n"
+    )
+    choice = click.prompt(
+        "Press Enter when ready, or type S to skip if already enabled",
+        default="",
+    ).strip().upper()
+
+    # ── Step 2 of 4: Create an App Password ───────────────────────────────────
+    _console.print(
+        "\n[bold]Step 2 of 4: Create an App Password[/bold]\n"
+        "──────────────────────────────────────\n"
+        "  [cyan]→ Open in browser:[/cyan] https://myaccount.google.com/apppasswords\n"
+        "    (If the page is not found, 2-Step Verification may not be active yet.)\n"
+        "  → Under [italic]'App name'[/italic], type: [bold]claude-runner[/bold]\n"
+        "  → Click [italic]'Create'[/italic]\n"
+        "  → Google will show a 16-character password.\n"
+        "    [bold yellow]Copy it now — it will not be shown again.[/bold yellow]\n"
+    )
+
+    app_password = click.prompt(
+        "Paste your App Password here",
+        hide_input=True,
+        confirmation_prompt=False,
+    ).strip().replace(" ", "")  # Google sometimes formats it with spaces
+
+    # ── Step 3 of 4: Verify ───────────────────────────────────────────────────
+    _console.print(
+        f"\n[bold]Step 3 of 4: Verify[/bold]\n"
+        f"────────────────────\n"
+        f"Sending test email to [cyan]{email_address}[/cyan] …"
+    )
+
+    smtp_ok = _test_smtp(
+        host="smtp.gmail.com",
+        port=587,
+        username=email_address,
+        password=app_password,
+        to_address=email_address,
+    )
+
+    if not smtp_ok:
+        _warn(
+            "SMTP test failed. Double-check that:\n"
+            "  - The App Password was copied correctly (16 characters, no spaces)\n"
+            "  - 2-Step Verification is active\n"
+            "  - You are using the full Gmail address as the username\n\n"
+            "Credentials will be saved anyway — you can re-run 'configure' to retry."
+        )
+    else:
+        _ok(f"Connection successful. Test email sent to {email_address}.")
+
+    # Store
+    secrets.update(
+        {
+            "smtp_host": "smtp.gmail.com",
+            "smtp_port": 587,
+            "smtp_username": email_address,
+            "smtp_password": app_password,
+            "smtp_tls": True,
+        }
+    )
+
+    _console.print(
+        "\n[bold]Step 4 of 4: Save credentials[/bold]\n"
+        "───────────────────────────────\n"
+        "(Handled in Step 3 of the main wizard below.)\n"
+    )
+
+
+def _run_generic_smtp_guide(email_address: str, secrets: dict) -> None:
+    """
+    Generic SMTP configuration guide for non-Gmail providers.
+    """
+    _console.print("\nEnter your SMTP server details:\n")
+
+    smtp_host = click.prompt("SMTP host", default="smtp.example.com").strip()
+    smtp_port = click.prompt("SMTP port", default=587, type=int)
+    smtp_username = click.prompt("SMTP username", default=email_address).strip()
+    smtp_password = click.prompt(
+        "SMTP password", hide_input=True, confirmation_prompt=False
+    ).strip()
+    use_tls = click.confirm("Use STARTTLS?", default=True)
+
+    _console.print(f"\nTesting SMTP connection to {smtp_host}:{smtp_port} …")
+    smtp_ok = _test_smtp(
+        host=smtp_host,
+        port=smtp_port,
+        username=smtp_username,
+        password=smtp_password,
+        to_address=email_address,
+    )
+
+    if not smtp_ok:
+        _warn(
+            "SMTP test failed. Check your credentials and server settings. "
+            "Saving anyway — re-run 'configure' to retry."
+        )
+    else:
+        _ok(f"SMTP test successful.")
+
+    secrets.update(
+        {
+            "smtp_host": smtp_host,
+            "smtp_port": smtp_port,
+            "smtp_username": smtp_username,
+            "smtp_password": smtp_password,
+            "smtp_tls": use_tls,
+        }
+    )
+
+
+def _test_smtp(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    to_address: str,
+) -> bool:
+    """
+    Attempt to connect and authenticate to an SMTP server.
+
+    Sends a minimal test email if authentication succeeds.
+    Returns True on success, False on any failure.
+    """
+    try:
+        with smtplib.SMTP(host, port, timeout=10) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(username, password)
+
+            subject = "[claude-runner] SMTP test successful"
+            body = (
+                "This is a test message from claude-runner.\n\n"
+                "If you received this, your email notification settings are correct."
+            )
+            message = (
+                f"From: {username}\r\n"
+                f"To: {to_address}\r\n"
+                f"Subject: {subject}\r\n"
+                f"\r\n"
+                f"{body}\r\n"
+            )
+            server.sendmail(username, [to_address], message)
+        return True
+    except (smtplib.SMTPException, socket.error, OSError) as exc:
+        _warn(f"SMTP error: {exc}")
+        return False
+
+
+def _save_to_secrets_yaml(secrets: dict) -> None:
+    """Write secrets to ~/.claude-runner/secrets.yaml with mode 600."""
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError:
+        _abort("pyyaml is required. Install with: pip install pyyaml")
+
+    try:
+        with _DEFAULT_SECRETS_FILE.open("w", encoding="utf-8") as fh:
+            yaml.dump(secrets, fh, default_flow_style=False, allow_unicode=True)
+
+        # Set permissions to 600 (owner read/write only) on POSIX systems
+        if platform.system() != "Windows":
+            os.chmod(_DEFAULT_SECRETS_FILE, 0o600)
+
+        _ok(f"Secrets saved to: {_DEFAULT_SECRETS_FILE}")
+    except Exception as exc:
+        _abort(f"Could not save secrets.yaml: {exc}")
+
+
+def _save_to_keyring(secrets: dict) -> None:
+    """
+    Store each secrets entry in the system keyring (Windows Credential Manager
+    on Windows, Keychain on macOS, libsecret on Linux).
+    """
+    try:
+        import keyring  # type: ignore[import]
+    except ImportError:
+        _warn(
+            "keyring package is not installed. "
+            "Falling back to secrets.yaml.\n"
+            "Install with: pip install keyring"
+        )
+        _save_to_secrets_yaml(secrets)
+        return
+
+    try:
+        service = "claude-runner"
+        for key, value in secrets.items():
+            if value is not None:
+                keyring.set_password(service, key, str(value))
+        _ok("Credentials saved to Windows Credential Manager.")
+        _console.print(
+            "[dim]To view or delete: Start Menu → search 'Credential Manager'\n"
+            "→ Windows Credentials → look for 'claude-runner' entries.[/dim]"
+        )
+
+        # Also save non-sensitive defaults to secrets.yaml so GlobalConfig can
+        # read them without needing keyring at every startup.
+        non_sensitive = {
+            k: v for k, v in secrets.items()
+            if k not in ("api_key", "smtp_password")
+        }
+        if non_sensitive:
+            _save_to_secrets_yaml(non_sensitive)
+
+    except Exception as exc:
+        _warn(f"Keyring error ({exc}). Falling back to secrets.yaml.")
+        _save_to_secrets_yaml(secrets)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# docker subcommand group
+# ──────────────────────────────────────────────────────────────────────────────
+
+@cli.group("docker")
+def docker_group() -> None:
+    """Manage the claude-runner Docker base image."""
+
+
+@docker_group.command("status")
+def docker_status_cmd() -> None:
+    """Show Docker Desktop availability and claude-runner-base image status."""
+    try:
+        import docker as docker_sdk  # type: ignore[import]
+    except ImportError:
+        _abort("docker SDK not installed. Run: pip install docker")
+
+    # ── Docker daemon ──────────────────────────────────────────────────────────
+    try:
+        client = docker_sdk.from_env()
+        info = client.info()
+        _ok(f"Docker daemon is running. Server version: {info.get('ServerVersion', '?')}")
+    except Exception as exc:
+        _err_console.print(f"[bold red][ERROR][/bold red] Docker is not available: {exc}")
+        _err_console.print(
+            "\nTo fix this:\n"
+            "  • On Windows: Start Docker Desktop from the Start menu.\n"
+            "  • Then wait for the Docker icon in the system tray to show 'Docker Desktop is running'."
+        )
+        sys.exit(1)
+
+    # ── Base image ─────────────────────────────────────────────────────────────
+    image_name = "claude-runner-base:latest"
+    try:
+        image = client.images.get(image_name)
+        tags = image.tags or ["(untagged)"]
+        created = image.attrs.get("Created", "?")[:10]
+        size_mb = image.attrs.get("Size", 0) / (1024 * 1024)
+        _ok(
+            f"Image '{image_name}' found.\n"
+            f"  Tags:    {', '.join(tags)}\n"
+            f"  Created: {created}\n"
+            f"  Size:    {size_mb:.0f} MB"
+        )
+    except docker_sdk.errors.ImageNotFound:
+        _warn(
+            f"Image '{image_name}' not found locally.\n"
+            "  Run: claude-runner docker update"
+        )
+    except Exception as exc:
+        _warn(f"Could not inspect image: {exc}")
+
+
+@docker_group.command("update")
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    default=False,
+    help="Build without using the Docker layer cache.",
+)
+def docker_update_cmd(no_cache: bool) -> None:
+    """Rebuild the claude-runner-base Docker image with the latest pinned versions.
+
+    This does NOT auto-update to unpinned 'latest'. Update the Dockerfile
+    version pins deliberately after testing.
+    """
+    try:
+        import docker as docker_sdk  # type: ignore[import]
+    except ImportError:
+        _abort("docker SDK not installed. Run: pip install docker")
+
+    # Find the Dockerfile
+    dockerfile_candidates = [
+        pathlib.Path(__file__).parent.parent / "docker" / "Dockerfile",
+        pathlib.Path.cwd() / "docker" / "Dockerfile",
+    ]
+    dockerfile_path: Optional[pathlib.Path] = None
+    for candidate in dockerfile_candidates:
+        if candidate.exists():
+            dockerfile_path = candidate
+            break
+
+    if dockerfile_path is None:
+        _abort(
+            "Dockerfile not found. Searched:\n"
+            + "\n".join(f"  {p}" for p in dockerfile_candidates)
+        )
+
+    _info(f"Building image 'claude-runner-base:latest' from {dockerfile_path} …")
+    _info("This may take several minutes on first build (downloading Node.js + Claude Code).")
+
+    try:
+        client = docker_sdk.from_env()
+    except Exception as exc:
+        _abort(f"Cannot connect to Docker: {exc}")
+
+    try:
+        image, build_logs = client.images.build(
+            path=str(dockerfile_path.parent),
+            tag="claude-runner-base:latest",
+            nocache=no_cache,
+            rm=True,
+        )
+        # Stream build output
+        for log_entry in build_logs:
+            stream = log_entry.get("stream", "").rstrip("\n")
+            if stream:
+                _console.print(f"  [dim]{stream}[/dim]")
+
+        _ok(
+            f"Image 'claude-runner-base:latest' built successfully.\n"
+            f"  ID: {image.short_id}"
+        )
+    except docker_sdk.errors.BuildError as exc:
+        _abort(f"Docker build failed: {exc}")
+    except Exception as exc:
+        _abort(f"Unexpected error during docker build: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """Package entry point (defined in pyproject.toml [project.scripts])."""
+    cli(prog_name="claude-runner")
+
+
+if __name__ == "__main__":
+    main()
