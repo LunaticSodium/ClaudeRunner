@@ -4,9 +4,9 @@
 # and packages it as a standalone Windows .exe using PyInstaller.
 #
 # Usage:
-#   claude-runner run projects/examples.yaml
+#   claude-runner run examples.yaml
 #
-# Edit working_dir below to point to an empty directory before running.
+# Working directory: ./examples/  (auto-derived from this filename — no need to set it)
 
 name: furina-ascii
 description: >
@@ -52,7 +52,9 @@ context_anchors: |
 
 sandbox:
   backend: native
-  working_dir: C:/temp/furina-test   # change to any empty directory
+  # working_dir is intentionally omitted — the runner creates ./examples/
+  # automatically (same name as this file). Use 'claude-runner new <name>'
+  # to scaffold your own project with its own dedicated folder.
 
 execution:
   timeout_hours: 2
