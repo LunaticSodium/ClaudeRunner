@@ -30,26 +30,23 @@ VERSION = "0.1.0"
 
 # Submodules that PyInstaller may not detect automatically via static analysis
 HIDDEN_IMPORTS = [
+    # claude-runner own modules
     "claude_runner",
     "claude_runner.main",
-    "claude_runner.cli",
     "claude_runner.runner",
     "claude_runner.config",
     "claude_runner.project",
+    "claude_runner.notify",
+    "claude_runner.persistence",
+    "claude_runner.process",
+    "claude_runner.rate_limit",
+    "claude_runner.tui",
+    "claude_runner.context_manager",
     "claude_runner.sandbox",
     "claude_runner.sandbox.docker_sandbox",
     "claude_runner.sandbox.native_sandbox",
-    "claude_runner.rate_limit",
-    "claude_runner.notifications",
-    "claude_runner.notifications.desktop",
-    "claude_runner.notifications.email",
-    "claude_runner.notifications.webhook",
-    "claude_runner.context",
-    "claude_runner.status",
-    "claude_runner.logs",
     # Third-party deps that are sometimes missed
     "click",
-    "click.testing",
     "yaml",
     "pydantic",
     "pydantic.v1",
@@ -58,10 +55,11 @@ HIDDEN_IMPORTS = [
     "rich.table",
     "rich.progress",
     "rich.logging",
-    "httpx",
-    "httpx._transports.default",
-    "plyer",
-    "plyer.platforms.win.notification",
+    "apprise",
+    "keyring",
+    "keyring.backends",
+    "winpty",
+    "docker",
 ]
 
 # Data files to bundle (src_glob;dest_dir  --  Windows semicolon separator)
@@ -162,10 +160,6 @@ def _build(debug: bool) -> int:
             f"  NOTE: Icon not found at {icon_path}. "
             "Building without a custom icon."
         )
-
-    # Strip debug symbols on release builds
-    if not debug:
-        cmd.append("--strip")
 
     # Entry point
     cmd.append(str(ENTRY_POINT))
