@@ -1883,6 +1883,70 @@ def _run_interactive_menu() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# marathon
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("marathon")
+def marathon_cmd() -> None:
+    """Start the marathon persistent daemon (polls ntfy cmd channel for tasks).
+
+    \b
+    Blocks until stopped via 'claude-runner stop' or Ctrl-C.
+    Writes PID to ~/.claude-runner/daemon.pid.
+    Publishes startup/shutdown notifications to the ntfy out channel.
+    """
+    _ensure_initialized()
+    from .daemon import MarathonDaemon  # noqa: PLC0415
+    from .config import Config  # noqa: PLC0415
+
+    cfg = Config.load()
+    daemon = MarathonDaemon(config=cfg)
+    _info("Starting marathon daemon. Press Ctrl-C to stop.")
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        _info("Marathon daemon stopped by user.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# stop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("stop")
+def stop_cmd() -> None:
+    """Stop the marathon daemon and unregister the Windows autostart task.
+
+    \b
+    Sends a stop signal to the running daemon (via PID file) and removes the
+    Task Scheduler entry registered by 'claude-runner configure' or
+    'claude-runner marathon'.
+    """
+    _ensure_initialized()
+    import signal  # noqa: PLC0415
+    from .daemon import read_daemon_pid  # noqa: PLC0415
+    from .autostart import unregister  # noqa: PLC0415
+
+    pid = read_daemon_pid()
+    if pid is not None:
+        try:
+            import os  # noqa: PLC0415
+            os.kill(pid, signal.SIGTERM)
+            _info(f"Sent SIGTERM to daemon (PID {pid}).")
+        except (ProcessLookupError, PermissionError) as exc:
+            _warn(f"Could not signal daemon PID {pid}: {exc}")
+    else:
+        _info("No running daemon PID found.")
+
+    try:
+        unregister()
+        _info("Autostart task unregistered.")
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"Could not unregister autostart task: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
