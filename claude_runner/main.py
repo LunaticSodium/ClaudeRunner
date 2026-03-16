@@ -1039,13 +1039,65 @@ def abort(task: Optional[str], force: bool) -> None:
 @click.option("--task", default=None, help="YAML filename stem, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 @click.option("--tail", default=50, show_default=True, help="Number of lines to show.")
 @click.option("--raw", is_flag=True, default=False, help="Print raw log without formatting.")
-def logs(task: Optional[str], tail: int, raw: bool) -> None:
+@click.option("--trash", "show_trash", is_flag=True, default=False, help="List trash log entries from ~/.claude-runner/trash/.")
+@click.option("--last", "last_n", default=None, type=int, help="With --trash: show full content of N most recent trash entries (default 1 when flag given).")
+def logs(task: Optional[str], tail: int, raw: bool, show_trash: bool, last_n: Optional[int]) -> None:
     """View logs from a task's last run.
 
     Searches ~/.claude-runner/logs/ for a log file matching the task name.
+
+    With --trash: list pipeline trash log entries (failed inbound messages).
+    With --trash --last N: show full content of N most recent trash entries.
     """
     _ensure_initialized()
 
+    # ── Trash log mode ────────────────────────────────────────────────────────
+    if show_trash:
+        trash_dir = _DEFAULT_TRASH_DIR
+        if not trash_dir.exists():
+            click.echo("No trash entries.")
+            return
+
+        trash_files = sorted(
+            trash_dir.glob("*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        if not trash_files:
+            click.echo("No trash entries.")
+            return
+
+        if last_n is not None:
+            # --last N: show full content of N most recent entries
+            n = max(1, last_n)
+            for tf in trash_files[:n]:
+                try:
+                    content = tf.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:
+                    content = f"(could not read: {exc})"
+                _console.print(
+                    Panel(
+                        content,
+                        title=f"[bold red]Trash: {tf.name}[/bold red]",
+                        border_style="red",
+                    )
+                )
+        else:
+            # List all entries: filename, stage, first reason line
+            for tf in trash_files:
+                try:
+                    first_lines = tf.read_text(encoding="utf-8", errors="replace").splitlines()
+                    stage = next((l.replace("stage: ", "") for l in first_lines if l.startswith("stage: ")), "?")
+                    reason = next((l.replace("reason: ", "") for l in first_lines if l.startswith("reason: ")), "")
+                    reason_preview = reason[:80]
+                except Exception:
+                    stage = "?"
+                    reason_preview = "(unreadable)"
+                click.echo(f"{tf.name}  stage={stage}  {reason_preview}")
+        return
+
+    # ── Normal task log mode ──────────────────────────────────────────────────
     if task:
         candidates = sorted(
             _DEFAULT_LOG_DIR.glob(f"{task}*.log"),
