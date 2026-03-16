@@ -193,48 +193,56 @@ class TestConvert:
         assert result.suffix == ".yaml"
         assert result.parent == tmp_path / "inbox"
 
-    def test_yaml_parse_failure_writes_trash(self, tmp_path):
+    def test_yaml_parse_failure_returns_none_no_trash(self, tmp_path):
+        # A1 behaviour: invalid YAML is routed to inbox, not trashed.
         pipeline, _, mock_ntfy = make_pipeline(tmp_path)
         bad_yaml = "key: [unclosed"
         msg = make_msg(bad_yaml)
         result = pipeline._convert(bad_yaml, msg)
         assert result is None
+        # No trash file written for plain non-YAML text (inbox-eligible).
         trash_files = list((tmp_path / "trash").glob("*.log"))
-        assert len(trash_files) >= 1
+        assert len(trash_files) == 0
 
-    def test_yaml_parse_failure_notifies_out(self, tmp_path):
+    def test_yaml_parse_failure_no_trash_notification(self, tmp_path):
+        # A1 behaviour: no [TRASH] ntfy for non-YAML text.
         pipeline, _, mock_ntfy = make_pipeline(tmp_path)
         bad_yaml = "key: [unclosed"
         msg = make_msg(bad_yaml)
         pipeline._convert(bad_yaml, msg)
         calls = [str(c) for c in mock_ntfy.publish.call_args_list]
-        assert any("[TRASH]" in c for c in calls)
+        # Only the RECEIVE publish call should have happened (no [TRASH]).
+        assert not any("[TRASH]" in c for c in calls)
 
     def test_pydantic_validation_failure_writes_trash(self, tmp_path):
+        from claude_runner.pipeline import _PipelineError
         pipeline, _, mock_ntfy = make_pipeline(tmp_path)
         # Valid YAML but missing required 'prompt' field
         invalid_project = "name: test\ndescription: broken"
         msg = make_msg(invalid_project)
-        result = pipeline._convert(invalid_project, msg)
-        assert result is None
+        with pytest.raises(_PipelineError):
+            pipeline._convert(invalid_project, msg)
         trash_files = list((tmp_path / "trash").glob("*.log"))
         assert len(trash_files) >= 1
 
     def test_size_limit_enforced(self, tmp_path):
+        from claude_runner.pipeline import _PipelineError
         pipeline, _, mock_ntfy = make_pipeline(tmp_path)
         # Create YAML bigger than 4096 bytes
         oversized = "name: x\nprompt: " + ("A" * 5000) + "\n"
         msg = make_msg(oversized)
-        result = pipeline._convert(oversized, msg)
-        assert result is None
+        with pytest.raises(_PipelineError):
+            pipeline._convert(oversized, msg)
         trash_files = list((tmp_path / "trash").glob("*.log"))
         assert len(trash_files) >= 1
 
     def test_size_limit_notifies_out(self, tmp_path):
+        from claude_runner.pipeline import _PipelineError
         pipeline, _, mock_ntfy = make_pipeline(tmp_path)
         oversized = "name: x\nprompt: " + ("A" * 5000) + "\n"
         msg = make_msg(oversized)
-        pipeline._convert(oversized, msg)
+        with pytest.raises(_PipelineError):
+            pipeline._convert(oversized, msg)
         calls = [str(c) for c in mock_ntfy.publish.call_args_list]
         assert any("[TRASH]" in c for c in calls)
 

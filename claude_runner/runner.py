@@ -814,6 +814,9 @@ class TaskRunner:
         self._persistence.save(self._make_state("running"))
         logger.info("[ACTION] State updated: phase=running.")
 
+        # --- A1: drain inbox buffer after rate-limit resume --------------
+        self._drain_inbox()
+
         return None  # Success — caller continues the monitoring loop.
 
     # ------------------------------------------------------------------
@@ -1077,6 +1080,8 @@ class TaskRunner:
                 warn = f"Context checkpoint injection failed: {exc}"
                 logger.warning(warn)
                 self._fault_log.append(f"[WARN] {warn}")
+            # A1: drain inbox buffer after context checkpoint.
+            self._drain_inbox()
 
     # ------------------------------------------------------------------
     # Initial prompt builder
@@ -1555,6 +1560,8 @@ class TaskRunner:
                 "No output for %.0fs — possible undetected rate limit.  Sending probe.",
                 elapsed,
             )
+            # A1: drain inbox buffer at the silence probe point.
+            self._drain_inbox()
             try:
                 self._send_to_process("continue\n")
             except Exception as exc:
@@ -1684,6 +1691,27 @@ class TaskRunner:
                 "task": self._book.name,
             },
         )
+
+    # ------------------------------------------------------------------
+    # A1: Inbox drain helper
+    # ------------------------------------------------------------------
+
+    def _drain_inbox(self) -> None:
+        """
+        Drain the inbox buffer into the running Claude Code process (A1).
+
+        No-op when no messages are pending or the process is not running.
+        Errors are logged but never raised (must not crash the run loop).
+        """
+        if self._process is None:
+            return
+        try:
+            from . import inbox  # noqa: PLC0415
+            if inbox.is_pending():
+                logger.info("[ACTION] A1: draining inbox buffer into Claude Code process.")
+                inbox.drain(self._process)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_drain_inbox failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Process I/O
