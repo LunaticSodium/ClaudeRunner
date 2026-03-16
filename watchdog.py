@@ -16,12 +16,33 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import pathlib
 import subprocess
 import sys
 import time
 
 import requests
+
+# ── PATH augmentation ────────────────────────────────────────────────────────
+# Node.js may not be on PATH in non-interactive shells (Git Bash, task scheduler).
+# Inject known Windows install locations so 'node' and 'claude' are found.
+_EXTRA_PATHS = [
+    r"C:\Program Files\nodejs",
+    r"C:\Program Files\nodejs\node_modules\.bin",
+    pathlib.Path.home() / ".local" / "bin",  # claude.EXE location
+    r"C:\Users\zl7u25\AppData\Local\Programs\Git\usr\bin",  # git bash
+]
+for _p in _EXTRA_PATHS:
+    _ps = str(_p)
+    if _ps not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _ps + os.pathsep + os.environ.get("PATH", "")
+
+# Claude Code on Windows requires git bash for its shell operations.
+# Without this, it exits with code 1 and a message about git-bash.
+_GIT_BASH = r"C:\Users\zl7u25\AppData\Local\Programs\Git\usr\bin\bash.exe"
+if pathlib.Path(_GIT_BASH).exists():
+    os.environ.setdefault("CLAUDE_CODE_GIT_BASH_PATH", _GIT_BASH)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
