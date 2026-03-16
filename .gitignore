@@ -22,9 +22,8 @@ env/
 dist/
 build/
 
-# Track release/ but ignore stray .exe files elsewhere
+# Executables — built locally, released via GitHub releases assets
 *.exe
-!release/*.exe
 
 # Testing
 .pytest_cache/
@@ -47,6 +46,10 @@ Thumbs.db
 *.log
 logs/
 /sandbox/
+
+# Project sandbox runtime dirs (created by claude-runner during execution)
+projects/*/
+!projects/*.yaml
 
 # Secrets — never commit these
 secrets.yaml

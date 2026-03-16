@@ -69,7 +69,13 @@ class Pipeline:
     RECEIVE → PARSE → CONVERT → LAUNCH → TRASH (on any failure)
     """
 
-    CONTROL_COMMANDS: frozenset = frozenset({"run", "abort", "status", "stop"})
+    CONTROL_COMMANDS: frozenset = frozenset({"run", "abort", "status", "stop", "fetch"})
+
+    # A2: valid branch-ref patterns for the 'fetch' command.
+    import re as _re
+    _FETCH_BRANCH_PATTERN: "_re.Pattern" = _re.compile(  # type: ignore[assignment]
+        r"^(?:task/[A-Za-z0-9_.-]+|inbox/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$"
+    )
     MAX_INLINE_YAML_BYTES: int = 4096
 
     def __init__(
@@ -96,6 +102,11 @@ class Pipeline:
                 project_path = self._convert(result.body, message)
                 if project_path is not None:
                     self._launch(project_path, message)
+                else:
+                    # A1: if CONVERT produced no path (parse/validation failure),
+                    # treat the message as a free-text inbox message instead of
+                    # silently dropping it.
+                    self._route_to_inbox(message.message)
             else:
                 self._trash("PARSE", "Unknown parse result type", message.message)
         except _PipelineError:
@@ -155,10 +166,19 @@ class Pipeline:
         """
         Parse and validate inline YAML, write to inbox directory.
 
-        Returns the path to the written YAML file, or None (after calling
-        _trash()) if validation fails.
+        Returns the path to the written YAML file on success.
+
+        Returns ``None`` (without trashing) for messages that are not YAML at
+        all — the caller (``process``) will route them to the inbox buffer
+        instead (A1 behaviour).
+
+        Raises ``_PipelineError`` (after calling ``_trash``) for messages that
+        look like project books but are malformed (size limit, pydantic
+        validation failure, or I/O error).
         """
-        # Size limit — enforced before yaml.safe_load()
+        # Size limit — enforced before yaml.safe_load().
+        # A message that exceeds the size limit is not a free-text inbox
+        # message; trash it and abort.
         body_bytes = body.encode("utf-8")
         if len(body_bytes) > self.MAX_INLINE_YAML_BYTES:
             reason = (
@@ -166,25 +186,27 @@ class Pipeline:
                 f"({len(body_bytes)} bytes)."
             )
             self._trash("CONVERT", reason, original_message.message)
-            return None
+            raise _PipelineError(reason)
 
-        # YAML parse
+        # YAML parse — if the body is not YAML, return None so the caller can
+        # route it to the inbox buffer (A1).
         try:
             raw = yaml.safe_load(body)
-        except yaml.YAMLError as exc:
-            self._trash("CONVERT", f"YAML parse error: {exc}", original_message.message)
+        except yaml.YAMLError:
+            logger.debug("CONVERT: body is not valid YAML — routing to inbox.")
             return None
 
         if not isinstance(raw, dict):
-            self._trash("CONVERT", "Top-level YAML value is not a mapping.", original_message.message)
+            logger.debug("CONVERT: YAML top-level is not a mapping — routing to inbox.")
             return None
 
-        # Pydantic validation — full validation, no relaxation for remote input
+        # Pydantic validation — full validation, no relaxation for remote input.
+        # A valid YAML dict that fails ProjectBook schema is a user error; trash.
         try:
             ProjectBook.model_validate(raw)
         except ValidationError as exc:
             self._trash("CONVERT", f"ProjectBook validation failed: {exc}", original_message.message)
-            return None
+            raise _PipelineError(str(exc))
 
         # Write to inbox
         try:
@@ -196,7 +218,7 @@ class Pipeline:
             return inbox_path
         except Exception as exc:  # noqa: BLE001
             self._trash("CONVERT", f"Failed to write inbox file: {exc}", original_message.message)
-            return None
+            raise _PipelineError(str(exc))
 
     # ------------------------------------------------------------------
     # Stage 4: LAUNCH
@@ -270,6 +292,8 @@ class Pipeline:
             self._cmd_status(original_message)
         elif cmd.keyword == "stop":
             self._cmd_stop(original_message)
+        elif cmd.keyword == "fetch":
+            self._cmd_fetch(cmd.args.strip(), original_message)
 
     def _cmd_run(self, name: str, original_message: NtfyMessage) -> None:
         """Find and launch a named project book from the projects/ search path."""
@@ -325,6 +349,67 @@ class Pipeline:
             self._daemon.stop()
         except Exception as exc:  # noqa: BLE001
             logger.warning("daemon.stop() failed: %s", exc)
+
+    def _cmd_fetch(self, branch_ref: str, original_message: NtfyMessage) -> None:
+        """
+        Clone a git branch and enqueue any valid project books found (A2).
+
+        Valid branch patterns: ``task/<name>`` or ``inbox/<iso-timestamp>``.
+        Invalid pattern → trash.  Fetch errors → logged (not trashed).
+        """
+        if not branch_ref:
+            self._trash("FETCH", "fetch command requires a branch ref.", original_message.message)
+            return
+
+        if not self._FETCH_BRANCH_PATTERN.match(branch_ref):
+            reason = (
+                f"fetch: branch ref {branch_ref!r} does not match required pattern "
+                "(task/<name> or inbox/<iso-timestamp>)."
+            )
+            self._trash("FETCH", reason, original_message.message)
+            return
+
+        self._ntfy.publish(
+            "out",
+            f"Fetching branch {branch_ref!r} …",
+            title="claude-runner",
+        )
+        try:
+            from .git_inbox import fetch_branch  # noqa: PLC0415
+            fetch_branch(branch_ref, self._daemon)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("A2: fetch_branch(%r) raised: %s", branch_ref, exc)
+            self._ntfy.publish(
+                "out",
+                f"[A2] fetch {branch_ref!r} failed: {exc}",
+                title="claude-runner",
+            )
+
+    # ------------------------------------------------------------------
+    # A1: Inbox routing (non-YAML, non-command messages)
+    # ------------------------------------------------------------------
+
+    def _route_to_inbox(self, text: str) -> None:
+        """
+        Route a free-text message to the inbox buffer (Feature A1).
+
+        Called when a message does not match any pipeline keyword and is not
+        a valid YAML project book.  Instead of dropping/trashing the message,
+        it is accumulated in ``~/.claude-runner/inbox/pending.md`` for
+        injection into the running Claude Code session at the next natural
+        pause point.
+        """
+        try:
+            from . import inbox  # noqa: PLC0415
+            inbox.append_message(text)
+            logger.info("A1: message routed to inbox buffer (%d chars).", len(text))
+            self._ntfy.publish(
+                "out",
+                "Message queued in inbox buffer (will be delivered at next pause).",
+                title="claude-runner",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("A1: _route_to_inbox failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
