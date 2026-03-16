@@ -1,0 +1,32 @@
+name: self-test
+description: claude-runner self-diagnostic
+prompt: |
+  Run the full test suite and diagnose any failures:
+  1. Run: pytest tests/ -v --tb=short 2>&1 | tee .claude-runner/pytest-output.txt
+  2. If any tests fail, read the relevant source files and fix them.
+  3. Run pytest again to confirm all tests pass.
+  4. Write a structured report to .claude-runner/self-test-report.md with:
+       - Date/time of test run
+       - Number of tests: passed / failed / skipped
+       - List of any failures and what was fixed
+       - Overall status: PASS or FAIL
+  5. Output ##RUNNER:COMPLETE##
+sandbox:
+  backend: native
+  # working_dir intentionally omitted — runner uses its own directory
+execution:
+  timeout_hours: 2
+  skip_permissions: true
+acceptance_criteria:
+  checks:
+    - type: file_exists
+      path: .claude-runner/self-test-report.md
+    - type: command
+      run: pytest tests/ -v
+      expect_exit: 0
+  on_failure: notify
+notify:
+  on: [complete, error]
+  channels:
+    - type: webhook
+      url: https://ntfy.sh/claude-runner-honacoo
