@@ -60,6 +60,24 @@ execution:
   timeout_hours: 2
   skip_permissions: true
 
+acceptance_criteria:
+  checks:
+    - type: file_exists
+      path: dist/furina.exe
+
+    - type: command
+      run: python -c "import furina; print('ok')"
+      expect_exit: 0
+
+    - type: llm_judge
+      prompt: |
+        Look at furina.py. Does it contain ANSI escape codes for color
+        and an ASCII art portrait at least 40 lines tall?
+      expect: pass
+
+  on_failure: retry
+  max_retries: 2
+
 notify:
   on: [complete, error]
   channels:

@@ -302,6 +302,9 @@ class TaskRunner:
         self._runner_error_message: Optional[str] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Acceptance-criteria retry counter.
+        self._acceptance_retries: int = 0
+
         # Silence watchdog: tracks last output time and the background task.
         self._last_output_time: float = time.monotonic()
         self._silence_watchdog_task: Optional[asyncio.Task] = None
@@ -642,7 +645,10 @@ class TaskRunner:
             # --- Runner protocol markers (highest priority) ----------------
             if rc_task in finished:
                 logger.info("##RUNNER:COMPLETE## — treating as clean task completion.")
-                return await self._handle_completion()
+                result = await self._complete_or_retry()
+                if result is not None:
+                    return result
+                continue  # acceptance retry in progress — loop back
 
             if re_task in finished:
                 msg = f"Claude reported fatal error: {self._runner_error_message or '(no description)'}"
@@ -660,12 +666,18 @@ class TaskRunner:
                     logger.info(
                         "Process exited; ##RUNNER:COMPLETE## also set — treating as success."
                     )
-                    return await self._handle_completion()
+                    result = await self._complete_or_retry()
+                    if result is not None:
+                        return result
+                    continue
 
                 exit_code = done_task.result()
                 if exit_code == 0:
                     logger.info("Claude Code exited cleanly (exit code 0).")
-                    return await self._handle_completion()
+                    result = await self._complete_or_retry()
+                    if result is not None:
+                        return result
+                    continue
                 elif exit_code in (-1, _WINPTY_CONTROL_C_EXIT):
                     # -1: pywinpty couldn't read exit status.
                     # 0xC000013A (3221225786, STATUS_CONTROL_C_EXIT): ConPTY artefact
@@ -677,7 +689,10 @@ class TaskRunner:
                         "ConPTY STATUS_CONTROL_C_EXIT artefact, code=%s) — treating as clean exit.",
                         exit_code,
                     )
-                    return await self._handle_completion()
+                    result = await self._complete_or_retry()
+                    if result is not None:
+                        return result
+                    continue
                 else:
                     msg = f"Claude Code exited with non-zero exit code {exit_code}."
                     logger.error(msg)
@@ -805,6 +820,107 @@ class TaskRunner:
     # Completion handler
     # ------------------------------------------------------------------
 
+    async def _complete_or_retry(self) -> Optional[TaskResult]:
+        """
+        Run acceptance checks (if configured); complete or retry accordingly.
+
+        Returns
+        -------
+        TaskResult
+            When the task truly finishes (pass, or failure/out-of-retries).
+        None
+            When an acceptance-retry was scheduled — the caller should
+            ``continue`` the monitoring loop so the new process is awaited.
+        """
+        from .acceptance_runner import run_checks  # noqa: PLC0415
+
+        criteria = getattr(self._book, "acceptance_criteria", None)
+        if criteria is None or not criteria.checks:
+            # No acceptance gate configured — complete immediately.
+            return await self._handle_completion()
+
+        working_dir = self._working_dir()
+        logger.info(
+            "[ACCEPTANCE] Running %d check(s) in %s …",
+            len(criteria.checks),
+            working_dir,
+        )
+        check_result = run_checks(criteria, working_dir, api_key=self._api_key)
+
+        if check_result.passed:
+            logger.info("[ACCEPTANCE] All checks passed.")
+            return await self._handle_completion()
+
+        # --- Checks failed ------------------------------------------------
+        logger.warning("[ACCEPTANCE] Check(s) failed:\n%s", check_result.details)
+        self._fault_log.append(f"[ACCEPTANCE] {check_result}")
+
+        retries_allowed = criteria.max_retries if criteria.on_failure == "retry" else 0
+        if self._acceptance_retries < retries_allowed:
+            self._acceptance_retries += 1
+            logger.info(
+                "[ACCEPTANCE] Retrying task (attempt %d / %d).",
+                self._acceptance_retries,
+                retries_allowed,
+            )
+            await self._launch_acceptance_retry(check_result)
+            return None  # caller must continue the monitoring loop
+
+        # Out of retries (or on_failure != "retry").
+        msg = (
+            f"Acceptance checks failed after {self._acceptance_retries} "
+            f"retry attempt(s):\n{check_result.details}"
+        )
+        logger.error("[ACCEPTANCE] %s", msg)
+        if criteria.on_failure in ("retry", "notify"):
+            await self._dispatch("error", {"error": msg, "task": self._book.name})
+        return self._make_result("failed", error_message=msg)
+
+    async def _launch_acceptance_retry(self, check_result) -> None:
+        """
+        Stop the current (exited) process and re-launch Claude Code with a
+        correction prompt derived from the failed acceptance checks.
+        """
+        # Stop and discard the old process object.
+        if self._process is not None:
+            try:
+                if hasattr(self._process, "is_alive") and self._process.is_alive():
+                    self._process.stop()
+            except Exception:
+                pass
+            self._process = None
+
+        # Reset event and detector state for the new run.
+        if self._runner_complete_event is not None:
+            self._runner_complete_event.clear()
+        if self._runner_error_event is not None:
+            self._runner_error_event.clear()
+        if self._rate_detector is not None:
+            self._rate_detector.reset()
+
+        # Build correction prompt.
+        failed_summary = "\n".join(
+            f"  - {line}" for line in check_result.failed_checks
+        )
+        retry_prompt = (
+            "## Acceptance Check Failure — Correction Required\n\n"
+            "The following acceptance checks failed after your last completion:\n"
+            f"{failed_summary}\n\n"
+            "Please fix these issues and signal completion again with ##RUNNER:COMPLETE##."
+        )
+        logger.info(
+            "[ACCEPTANCE] Launching retry process with correction prompt (%d chars).",
+            len(retry_prompt),
+        )
+
+        self._process = await _maybe_await(
+            self._sandbox.launch_claude,
+            prompt=retry_prompt,
+            on_line=self._on_output_line,
+            on_exit=None,
+        )
+        self._context_manager.set_on_inject_checkpoint(self._send_to_process)
+
     async def _handle_completion(self) -> TaskResult:
         """Called when the Claude Code process exits with code 0."""
         end_time = datetime.now(tz=timezone.utc)
@@ -888,9 +1004,9 @@ class TaskRunner:
         clean = (clean_line.replace("\r\n", "\n").replace("\r", "\n").strip()
                  if clean_line else _strip_ansi(line).strip())
 
+        self._last_output_time = time.monotonic()  # reset on every line (tool events are heartbeats)
         if clean:
             self._output_lines.append(clean)
-            self._last_output_time = time.monotonic()
 
         # Feed rate-limit / runner-marker detector (works on the clean line).
         if self._rate_detector is not None:

@@ -447,6 +447,76 @@ class NotifyConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Acceptance criteria sub-models
+# ---------------------------------------------------------------------------
+
+
+class AcceptanceCheck(BaseModel):
+    """A single acceptance criterion evaluated after task completion.
+
+    Attributes
+    ----------
+    type:
+        ``file_exists``  — assert a path exists inside the working directory.
+        ``file_contains`` — assert a file's text matches *pattern* (regex).
+        ``command``      — run a shell command; assert its exit code.
+        ``llm_judge``    — ask the model to evaluate *prompt*; assert "pass".
+    path:
+        Relative path (from working directory) used by ``file_exists`` and
+        ``file_contains`` checks.
+    pattern:
+        Python regex searched inside the file for ``file_contains`` checks.
+    run:
+        Shell command string executed for ``command`` checks.
+    expect_exit:
+        Expected exit code for ``command`` checks (default 0).
+    prompt:
+        Instruction sent to the LLM judge.  The relevant file contents are
+        appended automatically when *path* is also set.
+    expect:
+        Expected LLM verdict for ``llm_judge`` checks: ``"pass"`` (default)
+        or ``"fail"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["file_exists", "file_contains", "command", "llm_judge"]
+    path: Optional[str] = None
+    pattern: Optional[str] = None
+    run: Optional[str] = None
+    expect_exit: Optional[int] = 0
+    prompt: Optional[str] = None
+    expect: Optional[Literal["pass", "fail"]] = "pass"
+
+
+class AcceptanceCriteria(BaseModel):
+    """Post-completion acceptance gate for a claude-runner task.
+
+    Attributes
+    ----------
+    checks:
+        Ordered list of acceptance checks.  All must pass for the gate to
+        succeed.  Execution stops at the first failure.
+    on_failure:
+        Action taken when one or more checks fail:
+        ``"retry"``  — re-run Claude Code with a correction prompt (up to
+                       *max_retries* times).
+        ``"notify"`` — dispatch an error notification but do not retry.
+        ``"fail"``   — mark the task as failed immediately (no notification
+                       beyond the standard error event).
+    max_retries:
+        Maximum number of retry attempts when *on_failure* is ``"retry"``.
+        Ignored for other *on_failure* values.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checks: list[AcceptanceCheck] = Field(default_factory=list)
+    on_failure: Literal["retry", "notify", "fail"] = "fail"
+    max_retries: int = Field(default=1, ge=0)
+
+
+# ---------------------------------------------------------------------------
 # Top-level ProjectBook
 # ---------------------------------------------------------------------------
 
@@ -501,6 +571,14 @@ class ProjectBook(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
+    acceptance_criteria: Optional[AcceptanceCriteria] = Field(
+        default=None,
+        description=(
+            "Optional post-completion acceptance gate.  When set, claude-runner "
+            "evaluates all checks after ##RUNNER:COMPLETE## is detected.  "
+            "On failure the task is retried, notified, or failed per on_failure."
+        ),
+    )
 
     @model_validator(mode="after")
     def resolve_skip_permissions(self) -> "ProjectBook":

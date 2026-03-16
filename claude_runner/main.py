@@ -829,6 +829,17 @@ notify:
 
 ## Constraints
 (Any rules Claude should follow in this project)
+
+## Execution guidelines
+For any task involving loops, retries, polling, or repeated operations:
+- Write a Python script to handle the logic
+- Run the script rather than relying on conversational repetition
+- The script becomes part of the project and can be reused
+
+This makes your work deterministic, auditable, and testable. For multi-step or iterative work, prefer writing a control script
+over performing steps manually turn by turn. Scripts are more
+reliable, can be tested via acceptance_criteria, and survive
+context resets.
 """
     (claude_dir / "CLAUDE.md").write_text(claude_md_content, encoding="utf-8")
     _ok(f"Created: {claude_dir / 'CLAUDE.md'}")
@@ -1825,6 +1836,14 @@ def _run_interactive_menu() -> None:
 
 def main() -> None:
     """Package entry point (defined in pyproject.toml [project.scripts])."""
+    # Ensure UTF-8 output on Windows regardless of system locale (e.g. GBK).
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except AttributeError:
+            pass  # Python < 3.7 or non-reconfigurable stream
+
     # Double-click / no-args mode: show interactive menu instead of help text.
     if not sys.argv[1:] and sys.stdout.isatty():
         _run_interactive_menu()

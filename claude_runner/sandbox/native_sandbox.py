@@ -245,6 +245,7 @@ class NativeSandbox:
         if self._use_sandbox_flag and getattr(self, "_has_sandbox_flag", False):
             cmd.append("--sandbox")
 
+        cmd += ["--output-format", "stream-json", "--verbose"]
         cmd += ["-p", prompt]
         return cmd
 

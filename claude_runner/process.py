@@ -21,6 +21,7 @@ Responsibilities
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import os
 import subprocess
@@ -692,16 +693,35 @@ class PipeProcess:
     # Internal reader loop
     # ------------------------------------------------------------------
 
+    _READ_CHUNK = 4096  # bytes per read() call
+
     def _reader_loop(self) -> None:
-        """Background thread: read stdout line by line and invoke callbacks."""
+        """
+        Background thread: read stdout line-by-line and parse stream-json events.
+
+        With --output-format stream-json --verbose, every event emitted by
+        Claude Code is a newline-delimited JSON object.  readline() is safe
+        here because each JSON line is guaranteed to end with \\n and is
+        flushed immediately by the CLI.  This eliminates the previous
+        blocking-read problem where read(4096) would stall on Windows pipes.
+        """
         try:
             assert self._proc is not None and self._proc.stdout is not None
             while not self._stop_event.is_set():
                 raw = self._proc.stdout.readline()
                 if not raw:
                     break  # EOF — process exited
-                decoded = raw.decode("utf-8", errors="replace").rstrip("\r\n")
-                self._deliver_line(decoded)
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line.strip():
+                    continue  # skip blank lines
+                # Attempt to parse as a stream-json event.
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    # Not JSON — deliver raw (rate-limit detector may need it).
+                    self._deliver_line(line)
+                    continue
+                self._process_stream_event(event)
         except Exception as exc:
             log.exception("Unexpected error in PipeProcess reader loop: %s", exc)
         finally:
@@ -716,6 +736,64 @@ class PipeProcess:
                     self._on_exit(code)
                 except Exception as cb_exc:
                     log.warning("on_exit callback raised: %s", cb_exc)
+
+    def _process_stream_event(self, event: dict) -> None:
+        """
+        Dispatch a parsed stream-json event to the on_line callback.
+
+        Maps each Claude Code event type to one or more _deliver_line() calls
+        so that the rest of the runner (rate-limit detector, silence watchdog,
+        completion logic) continues to work unchanged.
+        """
+        event_type = event.get("type", "")
+
+        if event_type == "system":
+            # system.init — first event; sets _first_output_event via _deliver_line.
+            session_id = event.get("session_id", "")
+            log.info("stream-json session_id=%s", session_id)
+            # Deliver a heartbeat so _first_output_event is set immediately.
+            self._deliver_line(f"[session:{session_id}]")
+
+        elif event_type == "assistant":
+            message = event.get("message", {})
+            content = message.get("content", [])
+            for block in content:
+                btype = block.get("type", "")
+                if btype == "text":
+                    text = block.get("text", "")
+                    for text_line in text.splitlines():
+                        self._deliver_line(text_line)
+                    # If text had no newlines, we still delivered it above.
+                elif btype == "tool_use":
+                    tool_name = block.get("name", "tool")
+                    self._deliver_line(f"[Tool: {tool_name}]")
+
+        elif event_type == "user":
+            # tool_result — deliver a dot heartbeat to reset the silence watchdog.
+            self._deliver_line("[·]")
+
+        elif event_type == "result":
+            subtype = event.get("subtype", "")
+            is_error = event.get("is_error", False)
+            if subtype == "success" and not is_error:
+                self._deliver_line("##RUNNER:COMPLETE##")
+            elif is_error:
+                result_text = event.get("result", "")
+                for result_line in result_text.splitlines():
+                    self._deliver_line(result_line)
+
+        elif event_type == "rate_limit_event":
+            rate_info = event.get("rate_limit_info", {})
+            status = rate_info.get("status", "allowed")
+            if status != "allowed":
+                resets_at = rate_info.get("resetsAt", "")
+                self._deliver_line(
+                    f"Rate limit reached. Resets at: {resets_at}"
+                )
+
+        else:
+            # Unknown event type — ignore silently.
+            pass
 
     def _deliver_line(self, line: str) -> None:
         self._first_output_event.set()  # unblock startup verification in start()

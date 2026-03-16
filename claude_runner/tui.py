@@ -63,7 +63,7 @@ _RED    = "\033[31m"
 _CYAN   = "\033[36m"
 _WHITE  = "\033[37m"
 
-_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_SPINNER_FRAMES = ["-", "\\", "|", "/"]
 _SPINNER_STATES = frozenset({"running", "starting", "resuming"})
 
 _ANSI_RE   = re.compile(r'\033\[[0-9;]*[A-Za-z]')
