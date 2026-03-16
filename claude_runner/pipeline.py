@@ -69,7 +69,13 @@ class Pipeline:
     RECEIVE → PARSE → CONVERT → LAUNCH → TRASH (on any failure)
     """
 
-    CONTROL_COMMANDS: frozenset = frozenset({"run", "abort", "status", "stop"})
+    CONTROL_COMMANDS: frozenset = frozenset({"run", "abort", "status", "stop", "fetch"})
+
+    # A2: valid branch-ref patterns for the 'fetch' command.
+    import re as _re
+    _FETCH_BRANCH_PATTERN: "_re.Pattern" = _re.compile(  # type: ignore[assignment]
+        r"^(?:task/[A-Za-z0-9_.-]+|inbox/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$"
+    )
     MAX_INLINE_YAML_BYTES: int = 4096
 
     def __init__(
@@ -286,6 +292,8 @@ class Pipeline:
             self._cmd_status(original_message)
         elif cmd.keyword == "stop":
             self._cmd_stop(original_message)
+        elif cmd.keyword == "fetch":
+            self._cmd_fetch(cmd.args.strip(), original_message)
 
     def _cmd_run(self, name: str, original_message: NtfyMessage) -> None:
         """Find and launch a named project book from the projects/ search path."""
@@ -341,6 +349,41 @@ class Pipeline:
             self._daemon.stop()
         except Exception as exc:  # noqa: BLE001
             logger.warning("daemon.stop() failed: %s", exc)
+
+    def _cmd_fetch(self, branch_ref: str, original_message: NtfyMessage) -> None:
+        """
+        Clone a git branch and enqueue any valid project books found (A2).
+
+        Valid branch patterns: ``task/<name>`` or ``inbox/<iso-timestamp>``.
+        Invalid pattern → trash.  Fetch errors → logged (not trashed).
+        """
+        if not branch_ref:
+            self._trash("FETCH", "fetch command requires a branch ref.", original_message.message)
+            return
+
+        if not self._FETCH_BRANCH_PATTERN.match(branch_ref):
+            reason = (
+                f"fetch: branch ref {branch_ref!r} does not match required pattern "
+                "(task/<name> or inbox/<iso-timestamp>)."
+            )
+            self._trash("FETCH", reason, original_message.message)
+            return
+
+        self._ntfy.publish(
+            "out",
+            f"Fetching branch {branch_ref!r} …",
+            title="claude-runner",
+        )
+        try:
+            from .git_inbox import fetch_branch  # noqa: PLC0415
+            fetch_branch(branch_ref, self._daemon)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("A2: fetch_branch(%r) raised: %s", branch_ref, exc)
+            self._ntfy.publish(
+                "out",
+                f"[A2] fetch {branch_ref!r} failed: {exc}",
+                title="claude-runner",
+            )
 
     # ------------------------------------------------------------------
     # A1: Inbox routing (non-YAML, non-command messages)
