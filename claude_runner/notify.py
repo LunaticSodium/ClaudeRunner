@@ -47,6 +47,34 @@ EMAIL_EXCLUDED_EVENTS: frozenset[str] = frozenset(
 
 EMAIL_GUARD_MINUTES: int = 300  # 5 hours — not configurable
 
+# A4: completion message constants
+_COMPLETION_SUMMARY_MAX_BYTES: int = 3 * 1024  # 3 KB
+_NTFY_MAX_CHARS: int = 4000
+_TRUNCATION_MARKER: str = "…[truncated]"
+
+# Heuristic: lines that look like tool invocations (Claude Code tool use).
+# We scan backwards past these to find the last natural-language block.
+import re as _re
+_TOOL_LINE_PATTERN: _re.Pattern = _re.compile(
+    r"^(?:"
+    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●○◉►▶→]"   # spinner / bullet characters
+    r"|[✓✗✔✘⚠]"                    # status icons
+    r"|Tool:"
+    r"|Using:"
+    r"|Read\("
+    r"|Write\("
+    r"|Edit\("
+    r"|Bash\("
+    r"|Glob\("
+    r"|Grep\("
+    r"|\s*\d+\s*tool"               # "N tool calls"
+    r"|\s*Running\s"
+    r"|\s*\[tool_"
+    r"|##RUNNER:"
+    r")",
+    _re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # NotificationManager
@@ -472,6 +500,41 @@ class NotificationManager:
         # Already an apprise URL or unknown schema — pass through unchanged.
         return webhook_url
 
+    # ------------------------------------------------------------------
+    # A4: Completion ntfy message builder
+    # ------------------------------------------------------------------
+
+    def build_completion_ntfy_message(
+        self,
+        task_name: str,
+        duration_str: str,
+        rate_limit_cycles: int,
+        output_lines: list,
+    ) -> str:
+        """
+        Build the ntfy message body for the 'complete' event (A4).
+
+        Scans *output_lines* backwards for the last natural-language block
+        produced by Claude Code (lines after the last tool invocation line,
+        before ##RUNNER:COMPLETE##).
+
+        Returns a string of at most 4000 chars.  Truncates with '…[truncated]'
+        if needed.  Structured event fields are always appended.
+        """
+        prefix = (
+            f"Task: {task_name} | Duration: {duration_str} | RL cycles: {rate_limit_cycles}\n\n"
+        )
+        summary = extract_completion_summary(output_lines)
+        if summary:
+            body = prefix + summary
+        else:
+            body = prefix
+
+        if len(body) > _NTFY_MAX_CHARS:
+            body = body[: _NTFY_MAX_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+        return body
+
     def _format_runtime(self) -> str:
         """
         Placeholder runtime string.  In production the runner passes a
@@ -479,3 +542,52 @@ class NotificationManager:
         used as a fallback when the caller does not supply one.
         """
         return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# A4: Module-level helper — extract last NL block from output buffer
+# ---------------------------------------------------------------------------
+
+
+def extract_completion_summary(output_lines: list) -> str:
+    """
+    Scan *output_lines* backwards for the last natural-language block.
+
+    Heuristic:
+      1. Skip any trailing ##RUNNER:COMPLETE## / ##RUNNER:ERROR## lines.
+      2. Find the index of the last "tool invocation" line.
+      3. Everything after that index (up to 3 KB) is the NL summary.
+
+    Returns an empty string if no NL block is found.
+    """
+    if not output_lines:
+        return ""
+
+    lines = list(output_lines)
+
+    # Strip trailing marker lines.
+    while lines and "##RUNNER:" in lines[-1]:
+        lines.pop()
+
+    if not lines:
+        return ""
+
+    # Find the last tool line.
+    last_tool_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if _TOOL_LINE_PATTERN.match(lines[i].strip()):
+            last_tool_idx = i
+            break
+
+    # NL block = lines after the last tool line.
+    nl_lines = lines[last_tool_idx + 1 :]
+    if not nl_lines:
+        return ""
+
+    # Join and enforce 3 KB limit.
+    text = "\n".join(nl_lines)
+    encoded = text.encode("utf-8")
+    if len(encoded) > _COMPLETION_SUMMARY_MAX_BYTES:
+        text = encoded[:_COMPLETION_SUMMARY_MAX_BYTES].decode("utf-8", errors="ignore")
+
+    return text.strip()

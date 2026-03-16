@@ -929,6 +929,25 @@ class TaskRunner:
         # --- Collect change summary --------------------------------------
         change_summary = self._collect_output_diff()
 
+        # --- A4: build ntfy completion message with output passthrough ---
+        duration_td = end_time - self._start_time
+        total_s = int(duration_td.total_seconds())
+        h, rem = divmod(total_s, 3600)
+        m, s = divmod(rem, 60)
+        duration_str = f"{h:02d}:{m:02d}:{s:02d}"
+        ntfy_completion_message: str | None = None
+        if self._notifier is not None:
+            try:
+                from .notify import extract_completion_summary  # noqa: PLC0415
+                ntfy_completion_message = self._notifier.build_completion_ntfy_message(
+                    task_name=self._book.name,
+                    duration_str=duration_str,
+                    rate_limit_cycles=self._rate_limit_cycles,
+                    output_lines=list(self._output_lines),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("A4 completion message build failed: %s", exc)
+
         # --- Dispatch complete notification (all channels + diff) --------
         logger.info("[ACTION] Dispatching 'complete' notification.")
         await self._dispatch(
@@ -938,6 +957,7 @@ class TaskRunner:
                 "change_summary": change_summary,
                 "duration": str(end_time - self._start_time),
                 "rate_limit_cycles": self._rate_limit_cycles,
+                "_ntfy_message_override": ntfy_completion_message,
             },
         )
 
@@ -1596,9 +1616,13 @@ class TaskRunner:
             return
         try:
             change_summary: str = data.pop("change_summary", "") if isinstance(data, dict) else ""
+            ntfy_override: str | None = data.pop("_ntfy_message_override", None) if isinstance(data, dict) else None
             # Build a human-readable message from the remaining data fields.
             message_parts = [f"{k}={v}" for k, v in (data.items() if isinstance(data, dict) else [])]
             message = f"[claude-runner] {event}: " + ", ".join(message_parts) if message_parts else f"[claude-runner] {event}"
+            # A4: use the richer passthrough message for the 'complete' event when available.
+            if ntfy_override is not None:
+                message = ntfy_override
             self._notifier.dispatch(event, message, change_summary)
         except Exception as exc:
             warn = f"Notification dispatch failed for event={event!r}: {exc}"
