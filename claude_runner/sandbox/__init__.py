@@ -28,6 +28,10 @@ def resolve_working_dir(
     Resolution order (first match wins):
 
     1. ``project_book.sandbox.working_dir`` — explicitly set in the YAML.
+       - Absolute paths are used as-is.
+       - Relative paths (e.g. ``../src``, ``./work``) are resolved relative
+         to the directory containing the project book YAML file, so the
+         project book is portable across machines.
     2. Sibling folder derived from the YAML filename stem — the convention
        for the one-YAML-one-folder layout (e.g. ``pj1.yaml`` → ``./pj1/``).
     3. ``~/claude-runner/workspace`` — last-resort fallback with a warning.
@@ -39,6 +43,10 @@ def resolve_working_dir(
 
     if explicit is not None:
         wd = Path(explicit)
+        if not wd.is_absolute() and book_path is not None:
+            # Relative path — resolve from the YAML file's directory so the
+            # project book works regardless of where the repo is checked out.
+            wd = (Path(book_path).parent / wd).resolve()
     elif book_path is not None:
         bp = Path(book_path)
         wd = bp.parent / bp.stem

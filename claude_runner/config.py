@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,27 @@ logger = logging.getLogger(__name__)
 # Sentinel for "not provided in config file" — distinct from None / falsy
 # ---------------------------------------------------------------------------
 _MISSING = object()
+
+
+# ---------------------------------------------------------------------------
+# Marathon sub-config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MarathonConfig:
+    """Configuration for marathon (persistent daemon) mode.
+
+    Attributes
+    ----------
+    enabled:
+        Whether marathon mode is active.  Defaults to False (opt-in).
+    poll_interval_minutes:
+        How often the daemon polls the ntfy cmd channel.  Default 5 minutes.
+    """
+
+    enabled: bool = False
+    poll_interval_minutes: int = 5
 
 # Default base directory for all claude-runner user data.
 _DEFAULT_HOME = Path.home() / ".claude-runner"
@@ -136,6 +158,9 @@ class Config:
         {"continue", "restate", "summarize"}
     )
 
+    # Marathon mode sub-config (always present; opt-in via marathon.enabled).
+    marathon: MarathonConfig = None  # type: ignore[assignment]  # set in __init__
+
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
@@ -147,6 +172,7 @@ class Config:
         self.log_dir = Config.log_dir
         self.state_dir = Config.state_dir
         self.tui = Config.tui
+        self.marathon = MarathonConfig()
         self.resume_strategy = Config.resume_strategy
         self.max_rate_limit_waits = Config.max_rate_limit_waits
         self.docker_base_image = Config.docker_base_image

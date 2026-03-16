@@ -150,10 +150,10 @@ class TestRateLimitDetectorCallback:
         assert len(received) == 1
         dt = received[0]
         assert isinstance(dt, datetime)
-        # Fallback is approximately 1 hour from now.
+        # Fallback is approximately 5 hours from now (Anthropic's rolling window).
         now = datetime.now(tz=timezone.utc)
         delta = (dt - now).total_seconds()
-        assert 3500 < delta < 3700  # within a generous 100s window around 1 h
+        assert 17900 < delta < 18100  # within a generous 100s window around 5 h
 
     def test_callback_exception_does_not_propagate(self):
         """Exceptions in the callback are caught and don't crash the detector."""

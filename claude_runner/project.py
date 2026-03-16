@@ -185,6 +185,8 @@ class SandboxConfig(BaseModel):
             raise ValueError(
                 f"sandbox.working_dir exists but is not a directory: {v!r}."
             )
+        if not v.exists():
+            v.mkdir(parents=True, exist_ok=True)
         return v
 
 

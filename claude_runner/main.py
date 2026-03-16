@@ -1039,13 +1039,65 @@ def abort(task: Optional[str], force: bool) -> None:
 @click.option("--task", default=None, help="YAML filename stem, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 @click.option("--tail", default=50, show_default=True, help="Number of lines to show.")
 @click.option("--raw", is_flag=True, default=False, help="Print raw log without formatting.")
-def logs(task: Optional[str], tail: int, raw: bool) -> None:
+@click.option("--trash", "show_trash", is_flag=True, default=False, help="List trash log entries from ~/.claude-runner/trash/.")
+@click.option("--last", "last_n", default=None, type=int, help="With --trash: show full content of N most recent trash entries (default 1 when flag given).")
+def logs(task: Optional[str], tail: int, raw: bool, show_trash: bool, last_n: Optional[int]) -> None:
     """View logs from a task's last run.
 
     Searches ~/.claude-runner/logs/ for a log file matching the task name.
+
+    With --trash: list pipeline trash log entries (failed inbound messages).
+    With --trash --last N: show full content of N most recent trash entries.
     """
     _ensure_initialized()
 
+    # ── Trash log mode ────────────────────────────────────────────────────────
+    if show_trash:
+        trash_dir = _DEFAULT_TRASH_DIR
+        if not trash_dir.exists():
+            click.echo("No trash entries.")
+            return
+
+        trash_files = sorted(
+            trash_dir.glob("*.log"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        if not trash_files:
+            click.echo("No trash entries.")
+            return
+
+        if last_n is not None:
+            # --last N: show full content of N most recent entries
+            n = max(1, last_n)
+            for tf in trash_files[:n]:
+                try:
+                    content = tf.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:
+                    content = f"(could not read: {exc})"
+                _console.print(
+                    Panel(
+                        content,
+                        title=f"[bold red]Trash: {tf.name}[/bold red]",
+                        border_style="red",
+                    )
+                )
+        else:
+            # List all entries: filename, stage, first reason line
+            for tf in trash_files:
+                try:
+                    first_lines = tf.read_text(encoding="utf-8", errors="replace").splitlines()
+                    stage = next((l.replace("stage: ", "") for l in first_lines if l.startswith("stage: ")), "?")
+                    reason = next((l.replace("reason: ", "") for l in first_lines if l.startswith("reason: ")), "")
+                    reason_preview = reason[:80]
+                except Exception:
+                    stage = "?"
+                    reason_preview = "(unreadable)"
+                click.echo(f"{tf.name}  stage={stage}  {reason_preview}")
+        return
+
+    # ── Normal task log mode ──────────────────────────────────────────────────
     if task:
         candidates = sorted(
             _DEFAULT_LOG_DIR.glob(f"{task}*.log"),
@@ -1828,6 +1880,70 @@ def _run_interactive_menu() -> None:
         print(f"\n[ERROR] {exc}")
 
     _wait_for_key()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# marathon
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("marathon")
+def marathon_cmd() -> None:
+    """Start the marathon persistent daemon (polls ntfy cmd channel for tasks).
+
+    \b
+    Blocks until stopped via 'claude-runner stop' or Ctrl-C.
+    Writes PID to ~/.claude-runner/daemon.pid.
+    Publishes startup/shutdown notifications to the ntfy out channel.
+    """
+    _ensure_initialized()
+    from .daemon import MarathonDaemon  # noqa: PLC0415
+    from .config import Config  # noqa: PLC0415
+
+    cfg = Config.load()
+    daemon = MarathonDaemon(config=cfg)
+    _info("Starting marathon daemon. Press Ctrl-C to stop.")
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        _info("Marathon daemon stopped by user.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# stop
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("stop")
+def stop_cmd() -> None:
+    """Stop the marathon daemon and unregister the Windows autostart task.
+
+    \b
+    Sends a stop signal to the running daemon (via PID file) and removes the
+    Task Scheduler entry registered by 'claude-runner configure' or
+    'claude-runner marathon'.
+    """
+    _ensure_initialized()
+    import signal  # noqa: PLC0415
+    from .daemon import read_daemon_pid  # noqa: PLC0415
+    from .autostart import unregister  # noqa: PLC0415
+
+    pid = read_daemon_pid()
+    if pid is not None:
+        try:
+            import os  # noqa: PLC0415
+            os.kill(pid, signal.SIGTERM)
+            _info(f"Sent SIGTERM to daemon (PID {pid}).")
+        except (ProcessLookupError, PermissionError) as exc:
+            _warn(f"Could not signal daemon PID {pid}: {exc}")
+    else:
+        _info("No running daemon PID found.")
+
+    try:
+        unregister()
+        _info("Autostart task unregistered.")
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"Could not unregister autostart task: {exc}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

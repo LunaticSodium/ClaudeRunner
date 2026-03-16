@@ -87,6 +87,8 @@ def _make_runner(milestones=None, git_cfg=None, working_dir=None):
     runner._fs_snapshot_start = {}
     runner._milestones_fired = set()
     runner._checkpoint_task = None
+    runner._book_path = None
+    runner._project_id = "test-task"
 
     # Compile milestone patterns just as _initialise() would
     runner._milestone_patterns = []
