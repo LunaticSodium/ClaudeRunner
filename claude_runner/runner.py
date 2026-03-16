@@ -814,6 +814,9 @@ class TaskRunner:
         self._persistence.save(self._make_state("running"))
         logger.info("[ACTION] State updated: phase=running.")
 
+        # --- A1: drain inbox buffer after rate-limit resume --------------
+        self._drain_inbox()
+
         return None  # Success — caller continues the monitoring loop.
 
     # ------------------------------------------------------------------
@@ -929,6 +932,25 @@ class TaskRunner:
         # --- Collect change summary --------------------------------------
         change_summary = self._collect_output_diff()
 
+        # --- A4: build ntfy completion message with output passthrough ---
+        duration_td = end_time - self._start_time
+        total_s = int(duration_td.total_seconds())
+        h, rem = divmod(total_s, 3600)
+        m, s = divmod(rem, 60)
+        duration_str = f"{h:02d}:{m:02d}:{s:02d}"
+        ntfy_completion_message: str | None = None
+        if self._notifier is not None:
+            try:
+                from .notify import extract_completion_summary  # noqa: PLC0415
+                ntfy_completion_message = self._notifier.build_completion_ntfy_message(
+                    task_name=self._book.name,
+                    duration_str=duration_str,
+                    rate_limit_cycles=self._rate_limit_cycles,
+                    output_lines=list(self._output_lines),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("A4 completion message build failed: %s", exc)
+
         # --- Dispatch complete notification (all channels + diff) --------
         logger.info("[ACTION] Dispatching 'complete' notification.")
         await self._dispatch(
@@ -938,6 +960,7 @@ class TaskRunner:
                 "change_summary": change_summary,
                 "duration": str(end_time - self._start_time),
                 "rate_limit_cycles": self._rate_limit_cycles,
+                "_ntfy_message_override": ntfy_completion_message,
             },
         )
 
@@ -1057,6 +1080,8 @@ class TaskRunner:
                 warn = f"Context checkpoint injection failed: {exc}"
                 logger.warning(warn)
                 self._fault_log.append(f"[WARN] {warn}")
+            # A1: drain inbox buffer after context checkpoint.
+            self._drain_inbox()
 
     # ------------------------------------------------------------------
     # Initial prompt builder
@@ -1535,6 +1560,8 @@ class TaskRunner:
                 "No output for %.0fs — possible undetected rate limit.  Sending probe.",
                 elapsed,
             )
+            # A1: drain inbox buffer at the silence probe point.
+            self._drain_inbox()
             try:
                 self._send_to_process("continue\n")
             except Exception as exc:
@@ -1596,9 +1623,13 @@ class TaskRunner:
             return
         try:
             change_summary: str = data.pop("change_summary", "") if isinstance(data, dict) else ""
+            ntfy_override: str | None = data.pop("_ntfy_message_override", None) if isinstance(data, dict) else None
             # Build a human-readable message from the remaining data fields.
             message_parts = [f"{k}={v}" for k, v in (data.items() if isinstance(data, dict) else [])]
             message = f"[claude-runner] {event}: " + ", ".join(message_parts) if message_parts else f"[claude-runner] {event}"
+            # A4: use the richer passthrough message for the 'complete' event when available.
+            if ntfy_override is not None:
+                message = ntfy_override
             self._notifier.dispatch(event, message, change_summary)
         except Exception as exc:
             warn = f"Notification dispatch failed for event={event!r}: {exc}"
@@ -1660,6 +1691,27 @@ class TaskRunner:
                 "task": self._book.name,
             },
         )
+
+    # ------------------------------------------------------------------
+    # A1: Inbox drain helper
+    # ------------------------------------------------------------------
+
+    def _drain_inbox(self) -> None:
+        """
+        Drain the inbox buffer into the running Claude Code process (A1).
+
+        No-op when no messages are pending or the process is not running.
+        Errors are logged but never raised (must not crash the run loop).
+        """
+        if self._process is None:
+            return
+        try:
+            from . import inbox  # noqa: PLC0415
+            if inbox.is_pending():
+                logger.info("[ACTION] A1: draining inbox buffer into Claude Code process.")
+                inbox.drain(self._process)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_drain_inbox failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Process I/O
