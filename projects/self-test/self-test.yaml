@@ -13,7 +13,7 @@ prompt: |
   5. Output ##RUNNER:COMPLETE##
 sandbox:
   backend: native
-  working_dir: ..  # resolved relative to this file's directory (projects/) → runner root
+  # working_dir intentionally omitted — runner uses its own directory
 execution:
   timeout_hours: 2
   skip_permissions: true
