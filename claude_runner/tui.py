@@ -1,79 +1,86 @@
 """
-tui.py — Rich-based terminal UI for claude-runner.
+tui.py — Fixed-height ANSI overwrite renderer for claude-runner.
 
-Purely informational: no user input is required or accepted.
+Rendering strategy
+------------------
+On start(), TUI_HEIGHT blank lines are printed to stdout to reserve vertical
+space.  Every render call moves the cursor up TUI_HEIGHT lines and overwrites
+all of them with the current frame.  No Rich Live, Layout, or Panel components
+are used; Rich Console is kept only for non-live output (e.g. main.py banners).
 
-Layout:
-    ┌─────────────────────────────────────────────────────┐
-    │  claude-runner  │  task: <name>                      │
-    │  project: <path>                                     │
-    ├──────────────┬──────────────────────────────────────┤
-    │  STATUS      │  CONTEXT                              │
-    │  State: ...  │  Tokens: ~12,450 / 150k               │
-    │  Elapsed: .. │  Checkpoints: 0                       │
-    │  Timeout: .. │  Rate limit waits: 0                  │
-    ├──────────────┴──────────────────────────────────────┤
-    │  CLAUDE OUTPUT (last 20 lines)                       │
-    │  ...                                                 │
-    ├─────────────────────────────────────────────────────┤
-    │  NOTIFICATIONS                                       │
-    │  [12:34:01] Task started                             │
-    ├─────────────────────────────────────────────────────┤
-    │  RESOURCES                                           │
-    │  Docker: running  │  Disk: 142 MB used               │
-    └─────────────────────────────────────────────────────┘
+Frame is always exactly TUI_HEIGHT = 28 lines:
 
-When in rate-limit-wait mode, the CLAUDE OUTPUT panel is replaced by a
-prominent countdown panel.
+  Line  1   ══ claude-runner ══  (centered header)
+  Line  2   blank
+  Line  3   task name + project path
+  Line  4   blank
+  Line  5   STATUS header + state indicator / spinner
+  Line  6   Elapsed / Est.left / Timeout [/ context anchors]
+  Line  7   CONTEXT header + token usage + progress bar
+  Line  8   Checkpoints
+  Line  9   Rate limit waits
+  Line 10   blank
+  Line 11   CLAUDE OUTPUT (last 12 lines) header
+  Lines 12-23  Claude output  (OUTPUT_LINES = 12)
+  Line 24   blank
+  Line 25   NOTIFICATIONS header
+  Lines 26-27  Last 2 notifications
+  Line 28   RESOURCES line
 """
 
 from __future__ import annotations
 
+import os
+import re
+import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Deque, Optional
 
-from rich.columns import Columns
-from rich.console import Console, Group
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.spinner import Spinner
-from rich.style import Style
-from rich.table import Table
-from rich.text import Text
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Constants
+# Layout constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-OUTPUT_BUFFER_SIZE = 20       # Lines retained in the output buffer
-NOTIFICATION_BUFFER_SIZE = 50 # Notification entries retained
+TUI_HEIGHT        = 28   # total lines the TUI occupies
+OUTPUT_LINES      = 12   # lines reserved for Claude output (lines 12-23)
+NOTIFICATION_LINES = 3   # lines reserved for notifications: 1 header + 2 entries
 
-_STATE_STYLES: dict[str, str] = {
-    "running":  "bold green",
-    "waiting":  "bold yellow",
-    "resuming": "bold cyan",
-    "done":     "bold blue",
-    "complete": "bold blue",
-    "failed":   "bold red",
-    "error":    "bold red",
-    "starting": "bold white",
-}
-
+OUTPUT_BUFFER_SIZE        = 200  # lines retained in output deque
+NOTIFICATION_BUFFER_SIZE  = 50   # notifications retained
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Helper: human-readable duration
+# ANSI primitives
 # ──────────────────────────────────────────────────────────────────────────────
+
+_RST    = "\033[0m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
+_GREEN  = "\033[32m"
+_YELLOW = "\033[33m"
+_RED    = "\033[31m"
+_CYAN   = "\033[36m"
+_WHITE  = "\033[37m"
+
+_SPINNER_FRAMES = ["-", "\\", "|", "/"]
+_SPINNER_STATES = frozenset({"running", "starting", "resuming"})
+
+_ANSI_RE   = re.compile(r'\033\[[0-9;]*[A-Za-z]')
+_RICH_TAG  = re.compile(r'\[/?[^\]]+\]')
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 def _fmt_duration(seconds: float) -> str:
-    """Return a human-readable duration string, e.g. '1h 23m 45s'."""
+    """Return human-readable duration, e.g. '1h 23m 45s'."""
     if seconds < 0:
         return "—"
-    td = timedelta(seconds=int(seconds))
-    h, remainder = divmod(td.seconds + td.days * 86400, 3600)
-    m, s = divmod(remainder, 60)
+    total = int(seconds)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
     if h:
         return f"{h}h {m:02d}m {s:02d}s"
     if m:
@@ -81,41 +88,56 @@ def _fmt_duration(seconds: float) -> str:
     return f"{s}s"
 
 
-def _fmt_tokens(estimated: int, threshold: int) -> str:
-    """Format a token count as '~12,450 / 150k'."""
-    def _abbrev(n: int) -> str:
-        if n >= 1_000_000:
-            return f"{n / 1_000_000:.1f}M"
-        if n >= 1_000:
-            return f"{n // 1_000}k"
-        return str(n)
+def _term_width() -> int:
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return 120
 
-    pct = estimated / threshold if threshold else 0.0
-    color = "red" if pct >= 0.90 else "yellow" if pct >= 0.70 else "green"
-    return f"[{color}]~{estimated:,}[/] / {_abbrev(threshold)}"
+
+def _strip(text: str) -> str:
+    """Strip ANSI escape sequences from *text*."""
+    return _ANSI_RE.sub("", text)
+
+
+def _fit(text: str, max_w: int) -> str:
+    """
+    Ensure *text* occupies at most *max_w* visible columns.
+
+    If the visible length exceeds *max_w*, ANSI codes are dropped and the
+    plain text is truncated with '...'.
+    """
+    if len(_strip(text)) <= max_w:
+        return text
+    plain = _strip(text)
+    return plain[: max_w - 3] + "..."
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TUIManager
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TUIManager:
     """
-    Rich-based live terminal UI for claude-runner.
+    Fixed-height ANSI-overwrite terminal UI for claude-runner.
 
-    All public methods are thread-safe via a simple state-mutation approach —
-    Rich's Live refreshes on a timer, reading the latest state each cycle.
+    Thread safety
+    -------------
+    Every public state-mutation method acquires ``_lock`` before modifying
+    state and calling ``_render()``.  ``_render()`` must never be called
+    from outside ``TuiManager``.
 
     Usage::
 
-        tui = TUIManager(task_name="My task", project_book_path="task.yaml",
-                         timeout_hours=4.0)
+        tui = TUIManager(task_name="My task",
+                         project_book_path="task.yaml",
+                         timeout_hours=2.0)
         tui.start()
         try:
             tui.update_state("running")
             tui.add_output_line("Hello from Claude")
             tui.add_notification("Task started")
-            ...
         finally:
             tui.stop()
     """
@@ -127,383 +149,353 @@ class TUIManager:
         timeout_hours: float,
         refresh_per_second: float = 4.0,
     ) -> None:
-        self._task_name = task_name
-        self._project_book_path = project_book_path
-        self._timeout_hours = timeout_hours
-        self._refresh_per_second = refresh_per_second
+        self._task_name          = task_name
+        self._project_book_path  = project_book_path
+        self._timeout_hours      = timeout_hours
+        self._refresh_interval   = 1.0 / max(1.0, refresh_per_second)
 
-        # Mutable state updated by public methods
-        self._state: str = "starting"
-        self._start_time: float = time.monotonic()
-        self._output_lines: Deque[str] = deque(maxlen=OUTPUT_BUFFER_SIZE)
-        self._notifications: Deque[str] = deque(maxlen=NOTIFICATION_BUFFER_SIZE)
-
-        # Context window
-        self._token_estimated: int = 0
-        self._token_threshold: int = 150_000
-        self._checkpoints: int = 0
-        self._rate_limit_waits: int = 0
-
-        # Rate limit countdown
-        self._rate_limit_remaining: float = 0.0
-        self._rate_limit_end: Optional[float] = None  # monotonic
-
-        # context_anchors indicator
+        # Mutable display state
+        self._state: str                  = "starting"
+        self._start_time: float           = time.monotonic()
+        self._output_lines: Deque[str]    = deque(maxlen=OUTPUT_BUFFER_SIZE)
+        self._notifications: Deque[str]   = deque(maxlen=NOTIFICATION_BUFFER_SIZE)
+        self._token_estimated: int        = 0
+        self._token_threshold: int        = 150_000
+        self._checkpoints: int            = 0
+        self._rate_limit_waits: int       = 0
+        self._rate_limit_end: Optional[float] = None  # monotonic end timestamp
         self._context_anchors_active: bool = False
+        self._docker_status: str          = "unknown"
+        self._disk_usage_mb: float        = 0.0
 
-        # Resources
-        self._docker_status: str = "unknown"
-        self._disk_usage_mb: float = 0.0
-
-        # Rich internals
-        self._console = Console()
-        self._live: Optional[Live] = None
+        # Internals
+        self._lock          = threading.Lock()
+        self._spinner_idx   = 0
+        self._active        = False
+        self._stop_evt      = threading.Event()
+        self._refresh_thread: Optional[threading.Thread] = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Start the Rich Live display."""
+        """Reserve TUI_HEIGHT lines and begin the refresh loop."""
         self._start_time = time.monotonic()
-        layout = self._build_layout()
-        self._live = Live(
-            layout,
-            console=self._console,
-            refresh_per_second=self._refresh_per_second,
-            screen=False,
+        self._active = True
+        self._stop_evt.clear()
+        # Print blank lines to occupy the vertical space we will overwrite.
+        sys.stdout.write("\n" * TUI_HEIGHT)
+        sys.stdout.flush()
+        with self._lock:
+            self._render()
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_loop,
+            name="tui-refresh",
+            daemon=True,
         )
-        self._live.start(refresh=True)
+        self._refresh_thread.start()
 
     def stop(self) -> None:
-        """Stop the Live display cleanly."""
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
+        """Stop the refresh loop and leave the final frame visible."""
+        self._active = False
+        self._stop_evt.set()
+        if self._refresh_thread is not None:
+            self._refresh_thread.join(timeout=1.0)
+            self._refresh_thread = None
+        # Render final state (active flag is False so _refresh_loop won't race).
+        with self._lock:
+            self._do_render()
+        # One blank line so subsequent terminal output starts cleanly below.
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
-    # ── State mutations ────────────────────────────────────────────────────────
+    # ── Public state mutations ─────────────────────────────────────────────────
 
     def update_state(self, state: str) -> None:
-        """Update current state (running / waiting / resuming / done / failed)."""
-        self._state = state.lower()
-        self._refresh()
+        """Update current state label (running / waiting / resuming / done / failed)."""
+        with self._lock:
+            self._state = state.lower()
+            self._render()
 
     def add_output_line(self, clean_line: str) -> None:
-        """Add a line to the Claude output panel (keeps last 20 lines)."""
-        self._output_lines.append(clean_line)
-        self._refresh()
+        """Append a line to the Claude output panel (keeps last OUTPUT_BUFFER_SIZE)."""
+        with self._lock:
+            self._output_lines.append(clean_line)
+            self._render()
 
     def add_notification(self, message: str) -> None:
-        """Add a notification log entry with timestamp."""
+        """Append a timestamped notification entry."""
         ts = datetime.now().strftime("%H:%M:%S")
-        self._notifications.append(f"[dim][{ts}][/dim] {message}")
-        self._refresh()
+        with self._lock:
+            self._notifications.append(f"[{ts}] {message}")
+            self._render()
 
-    def update_tokens(
-        self, estimated: int, threshold: int, checkpoints: int
-    ) -> None:
-        """Update the context window indicator."""
-        self._token_estimated = estimated
-        self._token_threshold = threshold
-        self._checkpoints = checkpoints
-        self._refresh()
+    def update_tokens(self, estimated: int, threshold: int, checkpoints: int) -> None:
+        """Update the context-window token indicator."""
+        with self._lock:
+            self._token_estimated = estimated
+            self._token_threshold = threshold
+            self._checkpoints     = checkpoints
+            self._render()
 
     def update_rate_limit_countdown(self, remaining_seconds: float) -> None:
         """
-        Show rate limit countdown.
+        Show rate-limit countdown in the output panel.
 
-        Pass 0 or a negative value to hide the countdown panel and restore the
-        normal Claude output panel.
+        Pass ``0`` or a negative value to restore normal output display.
         """
-        if remaining_seconds > 0:
-            self._rate_limit_remaining = remaining_seconds
-            self._rate_limit_end = time.monotonic() + remaining_seconds
-        else:
-            self._rate_limit_remaining = 0.0
-            self._rate_limit_end = None
-        self._refresh()
+        with self._lock:
+            if remaining_seconds > 0:
+                self._rate_limit_end = time.monotonic() + remaining_seconds
+            else:
+                self._rate_limit_end = None
+            self._render()
 
     def update_resources(self, docker_status: str, disk_usage_mb: float) -> None:
-        """Update resource indicators."""
-        self._docker_status = docker_status
-        self._disk_usage_mb = disk_usage_mb
-        self._refresh()
+        """Update resource indicators (Docker status, disk usage)."""
+        with self._lock:
+            self._docker_status  = docker_status
+            self._disk_usage_mb  = disk_usage_mb
+            self._render()
 
     def update_rate_limit_waits(self, count: int) -> None:
-        """Update the rate limit wait counter shown in the context panel."""
-        self._rate_limit_waits = count
-        self._refresh()
+        """Update the rate-limit wait counter shown in the context panel."""
+        with self._lock:
+            self._rate_limit_waits = count
+            self._render()
 
     def set_context_anchors_active(self, active: bool) -> None:
-        """Show or hide the [context anchors: active] indicator in the status panel."""
-        self._context_anchors_active = active
-        self._refresh()
+        """Show or hide the [context anchors: active] indicator."""
+        with self._lock:
+            self._context_anchors_active = active
+            self._render()
 
     def print_message(self, message: str, style: str = "") -> None:
         """
-        Print a message outside the live display.
+        Log *message* as a notification.
 
-        Useful for startup / shutdown banners that should persist in the scroll
-        buffer after the Live display is stopped.
+        Rich markup and ANSI codes are stripped before display so the
+        fixed-width renderer is not confused by embedded markup.
         """
-        if self._live is not None:
-            # Temporarily pause the live display so the print is not overwritten
-            with self._live:
-                self._console.print(message, style=style)
-        else:
-            self._console.print(message, style=style)
+        clean = _ANSI_RE.sub("", _RICH_TAG.sub("", message)).strip()
+        if clean:
+            self.add_notification(clean)
 
     # ── Internal rendering ─────────────────────────────────────────────────────
 
-    def _refresh(self) -> None:
-        """Rebuild the layout and push it to the Live display."""
-        if self._live is not None:
-            self._live.update(self._build_layout())
+    def _refresh_loop(self) -> None:
+        """Background daemon thread: re-render on a timer for spinner animation."""
+        while not self._stop_evt.wait(timeout=self._refresh_interval):
+            with self._lock:
+                if self._active:
+                    self._render()
 
-    def _build_layout(self) -> Panel:
+    def _render(self) -> None:
         """
-        Build the complete renderable for the current state.
+        Trigger a render if the TUI is active.  Must be called with _lock held.
+        Delegates to _do_render() so stop() can render without the active guard.
+        """
+        if self._active:
+            self._do_render()
 
-        Returns a single Panel that wraps the entire UI so it renders inside a
-        clean outer border with the tool name in the title.
+    def _do_render(self) -> None:
         """
+        Build the frame and overwrite the fixed block.
+        Must be called with _lock held.
+        """
+        frame = self._build_frame()
+
+        # Safety: enforce exactly TUI_HEIGHT lines.
+        while len(frame) < TUI_HEIGHT:
+            frame.append("")
+        frame = frame[:TUI_HEIGHT]
+
+        # Advance spinner after the frame snapshot so index is stable per render.
+        if self._state in _SPINNER_STATES:
+            self._spinner_idx = (self._spinner_idx + 1) % len(_SPINNER_FRAMES)
+
+        out: list[str] = [f"\033[{TUI_HEIGHT}A"]
+        for line in frame:
+            out.append(f"\033[2K{line}\n")
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    # ── Frame builder ─────────────────────────────────────────────────────────
+
+    def _build_frame(self) -> list[str]:
+        """
+        Build exactly TUI_HEIGHT lines for the current state.
+
+        Must be called with _lock held.  Reads all state directly from self.
+        """
+        w     = _term_width()
+        max_w = w - 2  # leave a small right margin
+
         elapsed = time.monotonic() - self._start_time
 
-        # Recalculate live countdown from end timestamp (avoids drift from
-        # only updating on explicit calls)
+        # Rate-limit countdown
         if self._rate_limit_end is not None:
-            remaining = self._rate_limit_end - time.monotonic()
-            if remaining < 0:
-                remaining = 0.0
-                self._rate_limit_end = None
+            rl_rem = max(0.0, self._rate_limit_end - time.monotonic())
         else:
-            remaining = 0.0
+            rl_rem = 0.0
+        in_rl = rl_rem > 0
 
-        in_rate_limit = remaining > 0
+        L: list[str] = []
 
-        rows: list = [
-            self._render_header(),
-            self._render_status_context_row(elapsed),
-            self._render_output_or_countdown(in_rate_limit, remaining),
-            self._render_notifications(),
-            self._render_resources(),
+        # ── Line 1: header ────────────────────────────────────────────────────
+        title = "  claude-runner  "
+        fill  = max(0, w - len(title) - 2)
+        lpad, rpad = fill // 2, fill - fill // 2
+        L.append(f"{_BOLD}{_CYAN}{'═' * lpad}{title}{'═' * rpad}{_RST}")
+
+        # ── Line 2: blank ─────────────────────────────────────────────────────
+        L.append("")
+
+        # ── Line 3: task + project path ───────────────────────────────────────
+        L.append(_fit(
+            f"  task: {_BOLD}{self._task_name}{_RST}   "
+            f"project: {_DIM}{self._project_book_path}{_RST}",
+            max_w,
+        ))
+
+        # ── Line 4: blank ─────────────────────────────────────────────────────
+        L.append("")
+
+        # ── Line 5: STATUS header + state ────────────────────────────────────
+        spf = _SPINNER_FRAMES[self._spinner_idx]
+        icon = {
+            "complete": "✓", "failed": "✗", "error": "✗", "waiting": "⏸",
+        }.get(self._state, spf if self._state in _SPINNER_STATES else "·")
+        col = {
+            "running":  _GREEN,  "resuming": _CYAN,  "starting": _WHITE,
+            "complete": _GREEN,  "waiting":  _YELLOW, "failed":   _RED,
+            "error":    _RED,
+        }.get(self._state, _WHITE)
+        L.append(_fit(
+            f"  {_BOLD}STATUS{_RST}   "
+            f"State: {col}{icon} {self._state.upper()}{_RST}",
+            max_w,
+        ))
+
+        # ── Line 6: timing row ────────────────────────────────────────────────
+        timeout_s = self._timeout_hours * 3600
+        eta = (
+            _fmt_duration(timeout_s - elapsed)
+            if elapsed < timeout_s
+            else f"{_RED}exceeded{_RST}"
+        )
+        anchors = (
+            f"   {_CYAN}[context anchors: active]{_RST}"
+            if self._context_anchors_active else ""
+        )
+        L.append(_fit(
+            f"  {_DIM}Elapsed:{_RST} {_fmt_duration(elapsed)}   "
+            f"{_DIM}Est.left:{_RST} {eta}   "
+            f"{_DIM}Timeout:{_RST} {self._timeout_hours:.1f}h"
+            f"{anchors}",
+            max_w,
+        ))
+
+        # ── Line 7: CONTEXT header + tokens + progress bar ───────────────────
+        pct    = min(1.0, self._token_estimated / self._token_threshold) if self._token_threshold else 0.0
+        filled = int(pct * 20)
+        bc     = _RED if pct >= 0.85 else _YELLOW if pct >= 0.60 else _GREEN
+        bar    = f"{bc}{'█' * filled}{_DIM}{'░' * (20 - filled)}{_RST}"
+        thr    = self._token_threshold
+        thr_s  = (
+            f"{thr // 1_000_000:.1f}M" if thr >= 1_000_000
+            else f"{thr // 1_000}k"    if thr >= 1_000
+            else str(thr)
+        )
+        L.append(_fit(
+            f"  {_BOLD}CONTEXT{_RST}   "
+            f"{_DIM}Tokens:{_RST} {bc}~{self._token_estimated:,}{_RST} / {thr_s}   "
+            f"{bar}",
+            max_w,
+        ))
+
+        # ── Line 8: Checkpoints ───────────────────────────────────────────────
+        L.append(f"  {_DIM}Checkpoints:{_RST}       {_CYAN}{self._checkpoints}{_RST}")
+
+        # ── Line 9: Rate limit waits ──────────────────────────────────────────
+        rlc = _YELLOW if self._rate_limit_waits else _DIM
+        L.append(f"  {_DIM}Rate limit waits:{_RST}  {rlc}{self._rate_limit_waits}{_RST}")
+
+        # ── Line 10: blank ────────────────────────────────────────────────────
+        L.append("")
+
+        # ── Line 11: CLAUDE OUTPUT header ─────────────────────────────────────
+        L.append(f"  {_BOLD}── CLAUDE OUTPUT (last {OUTPUT_LINES} lines){_RST}")
+
+        # ── Lines 12–23: output content or countdown (OUTPUT_LINES = 12) ──────
+        if in_rl:
+            L.extend(self._countdown_block(rl_rem, OUTPUT_LINES, max_w))
+        else:
+            L.extend(self._output_block(OUTPUT_LINES, max_w))
+
+        # ── Line 24: blank ────────────────────────────────────────────────────
+        L.append("")
+
+        # ── Line 25: NOTIFICATIONS header ─────────────────────────────────────
+        L.append(f"  {_BOLD}── NOTIFICATIONS{_RST}")
+
+        # ── Lines 26–27: last 2 notifications ─────────────────────────────────
+        notif_entries = NOTIFICATION_LINES - 1  # = 2
+        notifs = list(self._notifications)[-notif_entries:]
+        for entry in notifs:
+            L.append("  " + _fit(entry, max_w - 2))
+        for _ in range(notif_entries - len(notifs)):
+            L.append("")
+
+        # ── Line 28: RESOURCES ────────────────────────────────────────────────
+        dc = {
+            "running": _GREEN, "stopped": _RED,
+            "starting": _YELLOW, "native": _CYAN,
+        }.get(self._docker_status.lower(), _DIM)
+        disk_s = (
+            f"{self._disk_usage_mb / 1024:.2f} GB"
+            if self._disk_usage_mb >= 1024
+            else f"{self._disk_usage_mb:.1f} MB"
+        )
+        L.append(_fit(
+            f"  {_DIM}Docker:{_RST} {dc}{self._docker_status}{_RST}   "
+            f"{_DIM}Disk (workdir):{_RST} {disk_s} used",
+            max_w,
+        ))
+
+        return L  # caller enforces exactly TUI_HEIGHT
+
+    # ── Panel helpers ─────────────────────────────────────────────────────────
+
+    def _output_block(self, count: int, max_w: int) -> list[str]:
+        """
+        Return exactly *count* lines of Claude output.
+
+        The most-recent output lines appear at the bottom; blank lines fill
+        the top when the buffer is not yet full.
+        """
+        buf    = list(self._output_lines)[-count:]
+        result = [f"  {_fit(line, max_w - 2)}" for line in buf]
+        # Prepend blanks so newest output sits at the bottom of the panel.
+        blanks = [""] * (count - len(result))
+        return blanks + result
+
+    def _countdown_block(self, remaining: float, count: int, max_w: int) -> list[str]:
+        """Return exactly *count* lines showing the rate-limit countdown."""
+        m, s = divmod(int(remaining), 60)
+        h, m = divmod(m, 60)
+        clock = f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+        banner: list[str] = [
+            "",
+            f"  {_YELLOW}{_BOLD}  ⏸  RATE LIMIT — waiting for reset{_RST}",
+            "",
+            f"       {_BOLD}{_YELLOW}{clock}{_RST}",
+            "",
+            f"  {_DIM}  claude-runner will resume automatically{_RST}",
         ]
-
-        return Panel(
-            Group(*rows),
-            title="[bold cyan]claude-runner[/bold cyan]",
-            border_style="bright_black",
-            padding=(0, 1),
-        )
-
-    # ── Section renderers ──────────────────────────────────────────────────────
-
-    def _render_header(self) -> Panel:
-        """Header bar: task name and project book path."""
-        # Truncate long paths so the header stays on one line
-        max_path_len = 60
-        path = self._project_book_path
-        if len(path) > max_path_len:
-            path = "…" + path[-(max_path_len - 1):]
-
-        t = Table.grid(padding=(0, 2))
-        t.add_column(style="bold white")
-        t.add_column(style="dim")
-        t.add_row(
-            f"task: [bold cyan]{self._task_name}[/bold cyan]",
-            f"project: [italic]{path}[/italic]",
-        )
-        return Panel(t, style="on grey7", padding=(0, 1), expand=True)
-
-    def _render_status_context_row(self, elapsed: float) -> Columns:
-        """Two-column row: STATUS panel on the left, CONTEXT panel on the right."""
-        return Columns(
-            [
-                self._render_status_panel(elapsed),
-                self._render_context_panel(),
-            ],
-            equal=True,
-            expand=True,
-        )
-
-    def _render_status_panel(self, elapsed: float) -> Panel:
-        """Status panel: state, elapsed, estimated remaining."""
-        state_style = _STATE_STYLES.get(self._state, "white")
-        state_label = self._state.upper()
-
-        # Spinner for active states
-        if self._state in ("running", "resuming", "starting"):
-            spinner = Spinner("dots", style=state_style)
-            state_text: object = Text.assemble(
-                ("  ", ""),  # placeholder for spinner position
-                (f" {state_label}", state_style),
-            )
-            # We compose a simple grid: spinner | label
-            grid = Table.grid()
-            grid.add_column(width=2)
-            grid.add_column()
-            grid.add_row(spinner, Text(f" {state_label}", style=state_style))
-            state_cell: object = grid
-        else:
-            state_cell = Text(state_label, style=state_style)
-
-        timeout_total = self._timeout_hours * 3600
-        if elapsed < timeout_total:
-            remaining_est = timeout_total - elapsed
-            eta_str = _fmt_duration(remaining_est)
-        else:
-            eta_str = "[red]exceeded[/red]"
-
-        t = Table.grid(padding=(0, 1))
-        t.add_column(style="dim", width=12)
-        t.add_column()
-        t.add_row("State", state_cell)
-        t.add_row("Elapsed", Text(_fmt_duration(elapsed), style="white"))
-        t.add_row("Est. left", Text(eta_str))
-        t.add_row("Timeout", Text(f"{self._timeout_hours:.1f}h", style="dim"))
-        if self._context_anchors_active:
-            t.add_row("", Text("[context anchors: active]", style="dim cyan"))
-
-        return Panel(t, title="[bold]STATUS[/bold]", border_style="bright_black")
-
-    def _render_context_panel(self) -> Panel:
-        """Context panel: token usage, checkpoints, rate limit waits."""
-        token_str = _fmt_tokens(self._token_estimated, self._token_threshold)
-
-        # Progress bar for token consumption
-        pct = min(1.0, self._token_estimated / self._token_threshold) if self._token_threshold else 0.0
-        bar_width = 20
-        filled = int(pct * bar_width)
-        bar_color = "red" if pct >= 0.90 else "yellow" if pct >= 0.70 else "green"
-        bar = f"[{bar_color}]{'█' * filled}[/][dim]{'░' * (bar_width - filled)}[/]"
-
-        t = Table.grid(padding=(0, 1))
-        t.add_column(style="dim", width=18)
-        t.add_column()
-        t.add_row("Tokens", Text.from_markup(token_str))
-        t.add_row("", Text.from_markup(bar))
-        t.add_row("Checkpoints", Text(str(self._checkpoints), style="cyan"))
-        t.add_row(
-            "Rate limit waits",
-            Text(str(self._rate_limit_waits), style="yellow" if self._rate_limit_waits else "dim"),
-        )
-
-        return Panel(t, title="[bold]CONTEXT[/bold]", border_style="bright_black")
-
-    def _render_output_or_countdown(
-        self, in_rate_limit: bool, remaining: float
-    ) -> Panel:
-        """
-        Render either the Claude output panel or the rate limit countdown panel,
-        depending on whether we are currently in a rate limit wait.
-        """
-        if in_rate_limit:
-            return self._render_countdown_panel(remaining)
-        return self._render_output_panel()
-
-    def _render_output_panel(self) -> Panel:
-        """CLAUDE OUTPUT panel: last N lines of Claude Code's output."""
-        if not self._output_lines:
-            content: object = Text("(no output yet)", style="dim italic")
-        else:
-            lines_text = Text()
-            for i, line in enumerate(self._output_lines):
-                if i:
-                    lines_text.append("\n")
-                # Dim older lines slightly
-                age_pct = i / max(len(self._output_lines) - 1, 1)
-                if age_pct < 0.3:
-                    lines_text.append(line, style="dim")
-                else:
-                    lines_text.append(line, style="white")
-            content = lines_text
-
-        return Panel(
-            content,
-            title=f"[bold]CLAUDE OUTPUT[/bold] [dim](last {OUTPUT_BUFFER_SIZE} lines)[/dim]",
-            border_style="bright_black",
-            expand=True,
-        )
-
-    def _render_countdown_panel(self, remaining: float) -> Panel:
-        """Rate limit countdown panel — replaces output panel during waits."""
-        mins, secs = divmod(int(remaining), 60)
-        hours, mins = divmod(mins, 60)
-
-        if hours:
-            countdown = f"{hours}:{mins:02d}:{secs:02d}"
-        else:
-            countdown = f"{mins:02d}:{secs:02d}"
-
-        # Big, prominent countdown
-        grid = Table.grid(expand=True)
-        grid.add_column(justify="center")
-        grid.add_row(Spinner("clock", style="yellow"))
-        grid.add_row(Text("RATE LIMIT — waiting for reset", style="bold yellow", justify="center"))
-        grid.add_row(Text(""))
-        grid.add_row(Text(countdown, style="bold yellow", justify="center"))
-        grid.add_row(Text(""))
-        grid.add_row(Text("claude-runner will resume automatically", style="dim italic", justify="center"))
-
-        return Panel(
-            grid,
-            title="[bold yellow]RATE LIMIT WAIT[/bold yellow]",
-            border_style="yellow",
-            expand=True,
-        )
-
-    def _render_notifications(self) -> Panel:
-        """NOTIFICATIONS panel: timestamped log of events."""
-        if not self._notifications:
-            content: object = Text("(no notifications yet)", style="dim italic")
-        else:
-            lines_text = Text()
-            for i, entry in enumerate(self._notifications):
-                if i:
-                    lines_text.append("\n")
-                lines_text.append_text(Text.from_markup(entry))
-            content = lines_text
-
-        return Panel(
-            content,
-            title="[bold]NOTIFICATIONS[/bold]",
-            border_style="bright_black",
-            expand=True,
-        )
-
-    def _render_resources(self) -> Panel:
-        """RESOURCES panel: Docker container status, disk usage."""
-        docker_style = {
-            "running": "bold green",
-            "stopped": "bold red",
-            "starting": "yellow",
-            "unknown": "dim",
-            "n/a": "dim",
-            "native": "cyan",
-        }.get(self._docker_status.lower(), "white")
-
-        disk_str: str
-        if self._disk_usage_mb < 1024:
-            disk_str = f"{self._disk_usage_mb:.1f} MB"
-        else:
-            disk_str = f"{self._disk_usage_mb / 1024:.2f} GB"
-
-        grid = Table.grid(padding=(0, 3))
-        grid.add_column(style="dim")
-        grid.add_column()
-        grid.add_column(style="dim")
-        grid.add_column()
-        grid.add_row(
-            "Docker",
-            Text(self._docker_status, style=docker_style),
-            "Disk (workdir)",
-            Text(f"{disk_str} used", style="white"),
-        )
-
-        return Panel(
-            grid,
-            title="[bold]RESOURCES[/bold]",
-            border_style="bright_black",
-            expand=True,
-        )
+        while len(banner) < count:
+            banner.append("")
+        return banner[:count]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -511,7 +503,7 @@ class TUIManager:
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
+    import time as _time
 
     tui = TUIManager(
         task_name="Example task",
@@ -520,20 +512,19 @@ if __name__ == "__main__":
     )
     tui.start()
 
-    import time as _time
-
     tui.update_state("running")
-    tui.update_resources("running", 142.3)
+    tui.update_resources("native", 142.3)
     tui.add_notification("Task started")
 
-    for i in range(5):
+    for i in range(6):
         _time.sleep(0.5)
-        tui.add_output_line(f"[dim cyan]>[/dim cyan] Processing step {i + 1}...")
-        tui.update_tokens(estimated=i * 3000, threshold=150_000, checkpoints=0)
+        tui.add_output_line(f"> Processing step {i + 1}...")
+        tui.update_tokens(estimated=i * 8_000, threshold=150_000, checkpoints=i // 3)
 
     tui.add_notification("Rate limit hit — waiting 30 seconds")
     tui.update_state("waiting")
     tui.update_rate_limit_countdown(30)
+    tui.update_rate_limit_waits(1)
 
     _time.sleep(5)
     tui.update_rate_limit_countdown(0)
@@ -545,7 +536,7 @@ if __name__ == "__main__":
     tui.add_output_line("Continuing from where we left off...")
 
     _time.sleep(2)
-    tui.update_state("done")
+    tui.update_state("complete")
     tui.add_notification("Task complete")
 
     _time.sleep(2)

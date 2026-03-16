@@ -151,7 +151,14 @@ class SandboxConfig(BaseModel):
             "'native' (runs on host, no container), or 'auto' (docker if available)."
         ),
     )
-    working_dir: Path
+    working_dir: Optional[Path] = Field(
+        default=None,
+        description=(
+            "Host-side working directory for the task.  When omitted, claude-runner "
+            "automatically uses a sibling folder named after the YAML file "
+            "(e.g. my-task.yaml → ./my-task/).  The folder is created if it does not exist."
+        ),
+    )
     readonly_mounts: list[ReadonlyMount] = Field(default_factory=list)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
     env: dict[str, str] = Field(
@@ -165,27 +172,19 @@ class SandboxConfig(BaseModel):
 
     @field_validator("working_dir", mode="before")
     @classmethod
-    def coerce_working_dir(cls, v: Any) -> Path:
-        return Path(v)
+    def coerce_working_dir(cls, v: Any) -> Optional[Path]:
+        return Path(v) if v is not None else None
 
     @field_validator("working_dir")
     @classmethod
-    def working_dir_must_exist(cls, v: Path) -> Path:
-        """Ensure working_dir exists, creating it (with parents) if necessary.
-
-        A missing directory is not an error — the sandbox would create it
-        anyway.  We create it here so downstream code can rely on it existing
-        immediately after the project book is loaded.
-        """
+    def working_dir_must_be_dir(cls, v: Optional[Path]) -> Optional[Path]:
+        """If working_dir is set, validate it is (or can become) a directory."""
+        if v is None:
+            return None
         if v.exists() and not v.is_dir():
             raise ValueError(
                 f"sandbox.working_dir exists but is not a directory: {v!r}."
             )
-        if not v.exists():
-            logger.info(
-                "sandbox.working_dir %r does not exist — creating it now.", v
-            )
-            v.mkdir(parents=True, exist_ok=True)
         return v
 
 
@@ -448,6 +447,76 @@ class NotifyConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Acceptance criteria sub-models
+# ---------------------------------------------------------------------------
+
+
+class AcceptanceCheck(BaseModel):
+    """A single acceptance criterion evaluated after task completion.
+
+    Attributes
+    ----------
+    type:
+        ``file_exists``  — assert a path exists inside the working directory.
+        ``file_contains`` — assert a file's text matches *pattern* (regex).
+        ``command``      — run a shell command; assert its exit code.
+        ``llm_judge``    — ask the model to evaluate *prompt*; assert "pass".
+    path:
+        Relative path (from working directory) used by ``file_exists`` and
+        ``file_contains`` checks.
+    pattern:
+        Python regex searched inside the file for ``file_contains`` checks.
+    run:
+        Shell command string executed for ``command`` checks.
+    expect_exit:
+        Expected exit code for ``command`` checks (default 0).
+    prompt:
+        Instruction sent to the LLM judge.  The relevant file contents are
+        appended automatically when *path* is also set.
+    expect:
+        Expected LLM verdict for ``llm_judge`` checks: ``"pass"`` (default)
+        or ``"fail"``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["file_exists", "file_contains", "command", "llm_judge"]
+    path: Optional[str] = None
+    pattern: Optional[str] = None
+    run: Optional[str] = None
+    expect_exit: Optional[int] = 0
+    prompt: Optional[str] = None
+    expect: Optional[Literal["pass", "fail"]] = "pass"
+
+
+class AcceptanceCriteria(BaseModel):
+    """Post-completion acceptance gate for a claude-runner task.
+
+    Attributes
+    ----------
+    checks:
+        Ordered list of acceptance checks.  All must pass for the gate to
+        succeed.  Execution stops at the first failure.
+    on_failure:
+        Action taken when one or more checks fail:
+        ``"retry"``  — re-run Claude Code with a correction prompt (up to
+                       *max_retries* times).
+        ``"notify"`` — dispatch an error notification but do not retry.
+        ``"fail"``   — mark the task as failed immediately (no notification
+                       beyond the standard error event).
+    max_retries:
+        Maximum number of retry attempts when *on_failure* is ``"retry"``.
+        Ignored for other *on_failure* values.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    checks: list[AcceptanceCheck] = Field(default_factory=list)
+    on_failure: Literal["retry", "notify", "fail"] = "fail"
+    max_retries: int = Field(default=1, ge=0)
+
+
+# ---------------------------------------------------------------------------
 # Top-level ProjectBook
 # ---------------------------------------------------------------------------
 
@@ -502,6 +571,14 @@ class ProjectBook(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
+    acceptance_criteria: Optional[AcceptanceCriteria] = Field(
+        default=None,
+        description=(
+            "Optional post-completion acceptance gate.  When set, claude-runner "
+            "evaluates all checks after ##RUNNER:COMPLETE## is detected.  "
+            "On failure the task is retried, notified, or failed per on_failure."
+        ),
+    )
 
     @model_validator(mode="after")
     def resolve_skip_permissions(self) -> "ProjectBook":
@@ -580,10 +657,26 @@ def load_project_book(path: Path) -> ProjectBook:
     logger.debug("Loading project book from %s", path)
 
     with path.open("r", encoding="utf-8") as fh:
-        raw: Any = yaml.load(fh, Loader=_Yaml12Loader)  # noqa: S506
+        content = fh.read()
 
-    if raw is None:
+    # Handle multi-document YAML (files with --- separators, e.g. examples.yaml).
+    # Load all documents and take the first; warn when more are present so the
+    # user knows to copy a single document to its own file to run the others.
+    all_docs: list[Any] = [
+        d for d in yaml.load_all(content, Loader=_Yaml12Loader) if d is not None  # noqa: S506
+    ]
+    if not all_docs:
         raw = {}
+    elif len(all_docs) > 1:
+        logger.warning(
+            "%s contains %d YAML documents — loading the first one only. "
+            "Copy the document you want to run into its own .yaml file.",
+            path.name,
+            len(all_docs),
+        )
+        raw = all_docs[0]
+    else:
+        raw = all_docs[0]
 
     if not isinstance(raw, dict):
         raise yaml.YAMLError(

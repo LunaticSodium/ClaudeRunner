@@ -23,6 +23,7 @@ import logging
 import os
 import pathlib
 import platform
+import shutil
 import smtplib
 import socket
 import sys
@@ -50,16 +51,169 @@ _DEFAULT_CONFIG_DIR = pathlib.Path.home() / ".claude-runner"
 _DEFAULT_SECRETS_FILE = _DEFAULT_CONFIG_DIR / "secrets.yaml"
 _DEFAULT_STATE_DIR = _DEFAULT_CONFIG_DIR / "state"
 _DEFAULT_LOG_DIR = _DEFAULT_CONFIG_DIR / "logs"
+_DEFAULT_TRASH_DIR = _DEFAULT_CONFIG_DIR / "trash"
+_DEFAULT_PROJECTS_DIR = _DEFAULT_CONFIG_DIR / "projects"
+_INITIALIZED_MARKER = _DEFAULT_CONFIG_DIR / ".initialized"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _ensure_dirs() -> None:
-    """Create ~/.claude-runner/* directories if they do not exist."""
-    for d in (_DEFAULT_CONFIG_DIR, _DEFAULT_STATE_DIR, _DEFAULT_LOG_DIR):
+def _check_docker_quick() -> bool:
+    """Check Docker availability without the full SDK (instant, no timeout)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            GENERIC_READ = 0x80000000
+            OPEN_EXISTING = 3
+            INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+            h = ctypes.windll.kernel32.CreateFileW(
+                r"\\.\pipe\docker_engine", GENERIC_READ, 0, None, OPEN_EXISTING, 0, None
+            )
+            if h != INVALID_HANDLE_VALUE:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        except Exception:
+            return False
+    return pathlib.Path("/var/run/docker.sock").exists()
+
+
+def _find_example_template() -> Optional[pathlib.Path]:
+    """Return the path to the bundled examples.yaml template."""
+    if getattr(sys, "frozen", False):
+        p = pathlib.Path(getattr(sys, "_MEIPASS", "")) / "examples.yaml"
+    else:
+        p = pathlib.Path(__file__).parent.parent / "projects" / "examples.yaml"
+    return p if p.exists() else None
+
+
+def _copy_example_with_header(src: pathlib.Path, dest: pathlib.Path) -> None:
+    """Copy the first YAML document from *src* to *dest*, prepending a usage header.
+
+    If *src* is a multi-document file (sections separated by ``---``), only the
+    first document is written so the result is a valid single-document project book.
+    """
+    header = (
+        "# claude-runner example project book\n"
+        "# Copy this file, rename it, and edit the 'prompt' field to\n"
+        "# describe your task. Then run:\n"
+        "#   claude-runner run your-project.yaml\n"
+        "#\n"
+    )
+    content = src.read_text(encoding="utf-8")
+    # Split on a '---' document separator that starts at the beginning of a line.
+    # Take only the first section so the output is a valid single-document file.
+    import re as _re  # noqa: PLC0415
+    parts = _re.split(r"(?m)^---[ \t]*$", content)
+    first_doc = parts[0].strip()
+    dest.write_text(header + first_doc + "\n", encoding="utf-8")
+
+
+def _project_search_dirs() -> list[pathlib.Path]:
+    """Return ordered directories to search for bare project book filenames."""
+    dirs: list[pathlib.Path] = [pathlib.Path.cwd()]
+    exe_dir = pathlib.Path(sys.argv[0]).parent
+    if exe_dir != pathlib.Path.cwd():
+        dirs.append(exe_dir)
+    dirs.append(_DEFAULT_PROJECTS_DIR)
+    return dirs
+
+
+def _resolve_project_book_path(name: str) -> str:
+    """Resolve a bare project book filename by searching known locations.
+
+    If *name* contains a path separator or is absolute it is returned unchanged.
+    Otherwise searches: CWD → exe directory → ~/.claude-runner/projects/.
+    """
+    p = pathlib.Path(name)
+    if p.is_absolute() or len(p.parts) > 1:
+        return name
+    for search_dir in _project_search_dirs():
+        candidate = search_dir / p
+        if candidate.exists():
+            return str(candidate)
+    return name  # unchanged; _load_project_book will surface a clear error
+
+
+def _ensure_initialized() -> None:
+    """Idempotent setup: create config dirs, run preflight checks, handle first run.
+
+    Called at the start of every CLI command. Never aborts — only warns.
+    """
+    # ── Create directories ─────────────────────────────────────────────────────
+    for d in (
+        _DEFAULT_CONFIG_DIR,
+        _DEFAULT_LOG_DIR,
+        _DEFAULT_STATE_DIR,
+        _DEFAULT_TRASH_DIR,
+        _DEFAULT_PROJECTS_DIR,
+    ):
         d.mkdir(parents=True, exist_ok=True)
+
+    # ── First-run detection ────────────────────────────────────────────────────
+    first_run = not _INITIALIZED_MARKER.exists()
+
+    # ── Preflight checks (warn only, never abort) ──────────────────────────────
+
+    # 1. Docker Desktop
+    if not _check_docker_quick():
+        _err_console.print(
+            "[bold yellow][WARN][/bold yellow]  Docker Desktop is not running. "
+            "Required for [cyan]sandbox: {backend: docker}[/cyan] tasks. "
+            "Start it or use [cyan]sandbox: {backend: native}[/cyan]."
+        )
+
+    # 2. Claude Code CLI
+    if shutil.which("claude") is None:
+        _err_console.print(
+            "[bold yellow][WARN][/bold yellow]  Claude Code not found on PATH. "
+            "Run: [cyan]npm install -g @anthropic-ai/claude-code[/cyan]"
+        )
+
+    # 3. API key (env var, secrets file, keyring, or OAuth session)
+    api_key_present = bool(_resolve_api_key())
+    if not api_key_present:
+        _err_console.print(
+            "[bold yellow][WARN][/bold yellow]  No API key configured. "
+            "Run: [cyan]claude-runner configure[/cyan]"
+        )
+
+    # ── First-run actions ──────────────────────────────────────────────────────
+    if not first_run:
+        return
+
+    # Copy example project book next to the exe (frozen builds only)
+    example_dest: Optional[pathlib.Path] = None
+    if getattr(sys, "frozen", False):
+        exe_dir = pathlib.Path(sys.argv[0]).parent
+        if not list(exe_dir.glob("*.yaml")):
+            template = _find_example_template()
+            if template is not None:
+                example_dest = exe_dir / "claude-runner-example.yaml"
+                try:
+                    _copy_example_with_header(template, example_dest)
+                except Exception as exc:
+                    logger.debug("Could not copy example template: %s", exc)
+                    example_dest = None
+
+    if example_dest is not None:
+        _console.print(
+            "\n[bold green]First run detected.[/bold green] "
+            "An example project book has been copied to:\n"
+            f"  [cyan]{example_dest}[/cyan]\n"
+            "Edit it to describe your first task, then run:\n"
+            "  [cyan]claude-runner run claude-runner-example.yaml[/cyan]\n"
+        )
+    else:
+        _console.print(
+            "\n[bold green]First run detected.[/bold green] "
+            "Run [cyan]claude-runner configure[/cyan] to set up "
+            "notifications and verify your environment.\n"
+        )
+
+    _INITIALIZED_MARKER.touch()
 
 
 def _abort(message: str, exit_code: int = 1) -> None:
@@ -201,7 +355,7 @@ def _find_state_file(task_name: Optional[str]) -> Optional[pathlib.Path]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @click.group()
-@click.version_option(version="0.2.0", prog_name="claude-runner")
+@click.version_option(version="0.3.0", prog_name="claude-runner")
 def cli() -> None:
     """
     claude-runner — autonomous Claude Code execution framework.
@@ -224,9 +378,14 @@ def cli() -> None:
     See 'claude-runner COMMAND --help' for details on each command.
     Run 'claude-runner configure' to set up your API key and notifications.
     """
-    # Configure root-level logging; individual commands may adjust this.
+    # Default to DEBUG until a successful run has been recorded.
+    _default_log_level = (
+        logging.WARNING
+        if (_INITIALIZED_MARKER.parent / ".first_success").exists()
+        else logging.DEBUG
+    )
     logging.basicConfig(
-        level=logging.WARNING,
+        level=_default_log_level,
         format="%(levelname)-8s %(name)s: %(message)s",
     )
 
@@ -236,7 +395,7 @@ def cli() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @cli.command("run")
-@click.argument("project_book", type=click.Path(exists=True))
+@click.argument("project_book", type=click.Path())
 @click.option("--tui/--no-tui", default=True, help="Show the Rich terminal UI (default: on).")
 @click.option(
     "--dry-run",
@@ -250,19 +409,30 @@ def cli() -> None:
     default=False,
     help="Enable verbose (DEBUG) logging.",
 )
-def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
+@click.option(
+    "--show-claude",
+    is_flag=True,
+    default=False,
+    help="Open Claude Code in a visible console window. Implies --verbose. For diagnosing process communication issues only.",
+)
+def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude: bool) -> None:
     """Run a claude-runner project book.
 
-    PROJECT_BOOK is the path to a .yaml project book file.
+    PROJECT_BOOK is the path to a .yaml project book file.  A bare filename
+    (no path separator) is searched in: current directory → exe directory →
+    ~/.claude-runner/projects/.
 
     Example:
 
-        claude-runner run projects/my_task.yaml --tui
+        claude-runner run my_task.yaml --tui
     """
-    if verbose:
+    if verbose or show_claude:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    _ensure_dirs()
+    _ensure_initialized()
+
+    # Resolve bare filename to a full path before loading.
+    project_book = _resolve_project_book_path(project_book)
 
     # ── Load project book ──────────────────────────────────────────────────────
     pb = _load_project_book(project_book)
@@ -355,13 +525,54 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
             tui=tui_manager,
             api_key=api_key,
             resume=resume_session,
+            project_book_path=project_book,
+            show_claude=show_claude,
         )
 
-        exit_code = asyncio.run(runner.run())
+        # ── Register cleanup handlers ──────────────────────────────────────
+        # Ensure the child Claude Code process is terminated when the parent
+        # exits for any reason (normal exit, exception, terminal window close).
+
+        import atexit as _atexit  # noqa: PLC0415
+        import signal as _signal  # noqa: PLC0415
+
+        def _emergency_cleanup() -> None:
+            """Best-effort child-process termination on unexpected exit."""
+            # runner._process is assigned only after launch_claude() succeeds.
+            # If startup failed mid-flight, the live handle is on the sandbox.
+            proc = getattr(runner, "_process", None)
+            if proc is None:
+                sandbox = getattr(runner, "_sandbox", None)
+                proc = getattr(sandbox, "_process", None)
+            if proc is None:
+                return
+            try:
+                if hasattr(proc, "stop"):
+                    proc.stop(timeout=3.0)
+                elif hasattr(proc, "terminate"):
+                    proc.terminate()
+            except Exception:
+                pass
+
+        _atexit.register(_emergency_cleanup)
+
+        if sys.platform == "win32":
+            # SIGBREAK fires when the user closes the console window or presses
+            # Ctrl+Break.  Register a handler so the child is not orphaned.
+            def _sigbreak_handler(signum, frame) -> None:  # noqa: ANN001
+                _emergency_cleanup()
+                sys.exit(130)
+
+            try:
+                _signal.signal(_signal.SIGBREAK, _sigbreak_handler)
+            except (OSError, ValueError):
+                pass  # SIGBREAK may be unavailable in some hosted environments.
+
+        result = asyncio.run(runner.run())
 
     except KeyboardInterrupt:
         _warn("Interrupted by user (Ctrl+C). Task will be left in a resumable state.")
-        exit_code = 130
+        sys.exit(130)
     except Exception as exc:
         if tui_manager:
             tui_manager.stop()
@@ -370,13 +581,21 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool) -> None:
         if tui_manager:
             tui_manager.stop()
 
-    if exit_code == 0:
+    if result.status == "complete":
         _ok(f"Task '{pb.name}' completed successfully.")
+        # First success: write marker so subsequent runs use quiet logging.
+        _first_success = _INITIALIZED_MARKER.parent / ".first_success"
+        if not _first_success.exists():
+            try:
+                _first_success.touch()
+            except OSError:
+                pass
     else:
+        msg = result.error_message or result.status
         _err_console.print(
-            f"[bold red][FAIL][/bold red] Task '{pb.name}' exited with code {exit_code}."
+            f"[bold red][FAIL][/bold red] Task '{pb.name}' failed: {msg}"
         )
-        sys.exit(exit_code)
+        sys.exit(1)
 
 
 def _render_project_book_summary(pb) -> Table:
@@ -450,7 +669,7 @@ def queue(queue_file: str, tui: bool) -> None:
     except ImportError:
         _abort("pyyaml is required. Install with: pip install pyyaml")
 
-    _ensure_dirs()
+    _ensure_initialized()
 
     with open(queue_file, "r", encoding="utf-8") as fh:
         queue_cfg = yaml.safe_load(fh)
@@ -506,6 +725,158 @@ def queue(queue_file: str, tui: bool) -> None:
 # validate
 # ──────────────────────────────────────────────────────────────────────────────
 
+@cli.command("new")
+@click.argument("name")
+@click.option("--no-git", is_flag=True, default=False, help="Skip 'git init' in the project folder.")
+def new(name: str, no_git: bool) -> None:
+    """Scaffold a new project: create <name>.yaml and the <name>/ working folder.
+
+    The YAML and folder are created in the current directory (or next to the
+    exe when double-clicked).  Running 'claude-runner run <name>.yaml' will
+    automatically use <name>/ as the working directory.
+
+    Example:
+
+        claude-runner new my-coding-task
+    """
+    _ensure_initialized()
+
+    # Resolve the target directory (next to exe when frozen, cwd otherwise).
+    if getattr(sys, "frozen", False):
+        target_dir = pathlib.Path(sys.argv[0]).parent
+    else:
+        target_dir = pathlib.Path.cwd()
+
+    yaml_path = target_dir / f"{name}.yaml"
+    work_dir = target_dir / name
+
+    if yaml_path.exists():
+        _abort(f"'{yaml_path}' already exists. Choose a different name or edit it directly.")
+    if work_dir.exists() and list(work_dir.iterdir()):
+        _warn(f"Folder '{work_dir}' already exists and is not empty — leaving it as-is.")
+    else:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        _ok(f"Created folder: {work_dir}")
+
+    # Write project YAML template.
+    yaml_content = f"""\
+# {name} — claude-runner project book
+#
+# Working directory: ./{name}/  (auto-derived from this filename)
+# Run with: claude-runner run {name}.yaml
+
+name: {name}
+description: >
+  Describe your project here.
+
+prompt: |
+  Describe your task here. Be specific about:
+  - What you want Claude to build or change
+  - The files or directories involved
+  - Any constraints or preferences
+
+  When done, commit your changes with a descriptive message.
+
+sandbox:
+  backend: native   # change to 'docker' for stronger isolation
+
+execution:
+  timeout_hours: 4
+  max_rate_limit_waits: 5
+  resume_strategy: continue
+  skip_permissions: true
+
+notify:
+  on: [complete, error]
+  channels:
+    - type: desktop
+"""
+    yaml_path.write_text(yaml_content, encoding="utf-8")
+    _ok(f"Created project book: {yaml_path}")
+
+    # Create .claude/ directory with settings and CLAUDE.md template.
+    claude_dir = work_dir / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+
+    settings_content = """\
+{
+  "permissions": {
+    "allow": [
+      "Bash(*)",
+      "Read(*)",
+      "Write(*)",
+      "Edit(*)",
+      "MultiEdit(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "LS(*)",
+      "TodoRead(*)",
+      "TodoWrite(*)"
+    ],
+    "deny": []
+  }
+}
+"""
+    (claude_dir / "settings.json").write_text(settings_content, encoding="utf-8")
+    _ok(f"Created: {claude_dir / 'settings.json'}")
+
+    claude_md_content = f"""\
+# Project: {name}
+# Created by claude-runner
+
+## Context
+(Describe your project here — this file is read by Claude Code at session start)
+
+## Constraints
+(Any rules Claude should follow in this project)
+
+## Execution guidelines
+For any task involving loops, retries, polling, or repeated operations:
+- Write a Python script to handle the logic
+- Run the script rather than relying on conversational repetition
+- The script becomes part of the project and can be reused
+
+This makes your work deterministic, auditable, and testable. For multi-step or iterative work, prefer writing a control script
+over performing steps manually turn by turn. Scripts are more
+reliable, can be tested via acceptance_criteria, and survive
+context resets.
+"""
+    (claude_dir / "CLAUDE.md").write_text(claude_md_content, encoding="utf-8")
+    _ok(f"Created: {claude_dir / 'CLAUDE.md'}")
+
+    # Initialise git repo.
+    if not no_git:
+        git_dir = work_dir / ".git"
+        if git_dir.exists():
+            _info(f"Git repo already exists in {work_dir} — skipping git init.")
+        else:
+            try:
+                import subprocess as _sp  # noqa: PLC0415
+                _sp.run(["git", "init", str(work_dir)], check=True, capture_output=True)
+                # Basic .gitignore
+                (work_dir / ".gitignore").write_text(
+                    "# claude-runner internals\n.claude-runner/\n", encoding="utf-8"
+                )
+                # Initial commit with .gitignore and .claude/ scaffold.
+                _sp.run(
+                    ["git", "add", ".gitignore", ".claude/settings.json", ".claude/CLAUDE.md"],
+                    cwd=str(work_dir), check=True, capture_output=True,
+                )
+                _sp.run(
+                    ["git", "commit", "-m", f"Initial scaffold for {name}"],
+                    cwd=str(work_dir), check=True, capture_output=True,
+                )
+                _ok(f"Initialised git repo in: {work_dir}")
+            except Exception as exc:
+                _warn(f"git init failed ({exc}). You can run it manually: git init {name}/")
+
+    _console.print(
+        f"\n[bold green]Project '{name}' ready.[/bold green]\n"
+        f"  Edit [cyan]{yaml_path.name}[/cyan] to describe your task, then run:\n"
+        f"  [cyan]claude-runner run {name}.yaml[/cyan]\n"
+    )
+
+
 @cli.command("validate")
 @click.argument("project_book", type=click.Path(exists=True))
 def validate(project_book: str) -> None:
@@ -516,6 +887,7 @@ def validate(project_book: str) -> None:
 
     PROJECT_BOOK is the path to a .yaml project book file.
     """
+    _ensure_initialized()
     pb = _load_project_book(project_book)
 
     _console.print(
@@ -547,13 +919,13 @@ def validate(project_book: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @cli.command("status")
-@click.option("--task", default=None, help="Task name to inspect (defaults to most recent).")
+@click.option("--task", default=None, help="YAML filename stem to inspect, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 def status(task: Optional[str]) -> None:
     """Check the status of a running or completed task.
 
     If --task is omitted, shows the most recently modified state file.
     """
-    _ensure_dirs()
+    _ensure_initialized()
     state_file = _find_state_file(task)
 
     if not state_file:
@@ -595,7 +967,7 @@ def status(task: Optional[str]) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @cli.command("abort")
-@click.option("--task", default=None, help="Task name to abort (defaults to most recent).")
+@click.option("--task", default=None, help="YAML filename stem to abort, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 @click.option("--force", is_flag=True, default=False, help="Skip confirmation prompt.")
 def abort(task: Optional[str], force: bool) -> None:
     """Abort a running task.
@@ -604,7 +976,7 @@ def abort(task: Optional[str], force: bool) -> None:
     Docker container (if any).  The state file is preserved so the task can be
     resumed later.
     """
-    _ensure_dirs()
+    _ensure_initialized()
     state_file = _find_state_file(task)
 
     if not state_file:
@@ -664,7 +1036,7 @@ def abort(task: Optional[str], force: bool) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @cli.command("logs")
-@click.option("--task", default=None, help="Task name (defaults to most recent).")
+@click.option("--task", default=None, help="YAML filename stem, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 @click.option("--tail", default=50, show_default=True, help="Number of lines to show.")
 @click.option("--raw", is_flag=True, default=False, help="Print raw log without formatting.")
 def logs(task: Optional[str], tail: int, raw: bool) -> None:
@@ -672,7 +1044,7 @@ def logs(task: Optional[str], tail: int, raw: bool) -> None:
 
     Searches ~/.claude-runner/logs/ for a log file matching the task name.
     """
-    _ensure_dirs()
+    _ensure_initialized()
 
     if task:
         candidates = sorted(
@@ -733,7 +1105,7 @@ def configure() -> None:
       - Testing SMTP connectivity
       - Saving credentials to secrets.yaml or Windows Credential Manager
     """
-    _ensure_dirs()
+    _ensure_initialized()
 
     _console.print(
         Panel(
@@ -1189,6 +1561,7 @@ def docker_group() -> None:
 @docker_group.command("status")
 def docker_status_cmd() -> None:
     """Show Docker Desktop availability and claude-runner-base image status."""
+    _ensure_initialized()
     try:
         import docker as docker_sdk  # type: ignore[import]
     except ImportError:
@@ -1243,6 +1616,7 @@ def docker_update_cmd(no_cache: bool) -> None:
     This does NOT auto-update to unpinned 'latest'. Update the Dockerfile
     version pins deliberately after testing.
     """
+    _ensure_initialized()
     try:
         import docker as docker_sdk  # type: ignore[import]
     except ImportError:
@@ -1300,7 +1674,7 @@ def docker_update_cmd(no_cache: bool) -> None:
 # Interactive launcher (double-click / no-args mode)
 # ──────────────────────────────────────────────────────────────────────────────
 
-_VERSION = "0.2.0"
+_VERSION = "0.3.0"
 
 _BANNER = f"""
 \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557
@@ -1337,15 +1711,16 @@ def _wait_for_key(prompt: str = "\nPress any key to exit...") -> None:
 
 
 def _bundled_projects_dir() -> Optional[pathlib.Path]:
-    """Return the directory containing bundled project YAML files.
+    """Return the directory to scan for project YAML files.
 
-    In a frozen PyInstaller exe this is sys._MEIPASS/projects.
+    In a frozen PyInstaller exe this is the folder containing the exe itself,
+    so users can place .yaml files next to claude-runner.exe and have them
+    discovered automatically (no bundling needed).
     In development it is the repo root's projects/ folder.
     """
     if getattr(sys, "frozen", False):
-        base = pathlib.Path(getattr(sys, "_MEIPASS", pathlib.Path(sys.argv[0]).parent))
-    else:
-        base = pathlib.Path(__file__).parent.parent
+        return pathlib.Path(sys.argv[0]).parent
+    base = pathlib.Path(__file__).parent.parent
     p = base / "projects"
     return p if p.is_dir() else None
 
@@ -1461,6 +1836,14 @@ def _run_interactive_menu() -> None:
 
 def main() -> None:
     """Package entry point (defined in pyproject.toml [project.scripts])."""
+    # Ensure UTF-8 output on Windows regardless of system locale (e.g. GBK).
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except AttributeError:
+            pass  # Python < 3.7 or non-reconfigurable stream
+
     # Double-click / no-args mode: show interactive menu instead of help text.
     if not sys.argv[1:] and sys.stdout.isatty():
         _run_interactive_menu()

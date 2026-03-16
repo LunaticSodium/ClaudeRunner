@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 CHARS_PER_TOKEN: int = 4  # approximation for English / code
 
+# Maximum number of non-header lines returned by read_progress_log() (truncated view).
+# Excess older lines are compressed into a summary block.
+PROGRESS_LOG_MAX_LINES: int = 50
+
 # Default path relative to the working directory inside the sandbox.
 # Matches the spec path: /workspace/.claude-runner/progress.log
 _DEFAULT_PROGRESS_LOG_SUBPATH = ".claude-runner/progress.log"
@@ -409,37 +413,95 @@ class ContextManager:
     # Progress log I/O
     # ------------------------------------------------------------------
 
-    def read_progress_log(self) -> str:
+    def read_progress_log_full(self) -> str:
         """
-        Read the contents of the progress.log file.
+        Read the full, untruncated contents of progress.log.
 
-        Returns the file's text content, or an empty string if the file does not
-        exist, is empty, or cannot be read.
+        Used by completion/report paths that need the complete history.
+        All other callers should use read_progress_log() for the truncated view.
 
         Returns
         -------
         str
-            Progress log text, or "" if unavailable.
+            Full progress log text, or "" if unavailable.
         """
         if self.progress_log_path is None:
-            logger.debug("read_progress_log: progress_log_path not set — returning empty string.")
+            logger.debug("read_progress_log_full: progress_log_path not set — returning empty string.")
             return ""
 
         try:
             text = self.progress_log_path.read_text(encoding="utf-8", errors="replace")
         except FileNotFoundError:
-            logger.debug("read_progress_log: %s not found — returning empty string.", self.progress_log_path)
+            logger.debug("read_progress_log_full: %s not found — returning empty string.", self.progress_log_path)
             return ""
         except OSError as exc:
-            logger.warning("read_progress_log: could not read %s: %s", self.progress_log_path, exc)
+            logger.warning("read_progress_log_full: could not read %s: %s", self.progress_log_path, exc)
             return ""
 
         stripped = text.strip()
         if not stripped:
-            logger.debug("read_progress_log: %s is empty.", self.progress_log_path)
+            logger.debug("read_progress_log_full: %s is empty.", self.progress_log_path)
             return ""
 
         return stripped
+
+    def read_progress_log(self) -> str:
+        """
+        Read a truncated view of progress.log suitable for context injection.
+
+        Always includes header lines (starting with ``#``).  When non-header
+        lines exceed PROGRESS_LOG_MAX_LINES the oldest excess entries are
+        condensed into a summary block; the most recent PROGRESS_LOG_MAX_LINES
+        entries are returned unchanged.
+
+        Use read_progress_log_full() when the complete history is required
+        (e.g. for completion reports).
+
+        Returns
+        -------
+        str
+            Possibly-truncated progress log text, or "" if unavailable.
+        """
+        full = self.read_progress_log_full()
+        if not full:
+            return full
+
+        lines = full.splitlines()
+        header_lines = [ln for ln in lines if ln.startswith("#")]
+        non_header_lines = [ln for ln in lines if not ln.startswith("#")]
+
+        if len(non_header_lines) <= PROGRESS_LOG_MAX_LINES:
+            return full
+
+        # Partition: oldest excess + most recent MAX_LINES.
+        excess = non_header_lines[:-PROGRESS_LOG_MAX_LINES]
+        recent = non_header_lines[-PROGRESS_LOG_MAX_LINES:]
+
+        # Extract notable entries from the excess (DONE / DECISION), up to 10.
+        notable = [
+            ln.strip()
+            for ln in excess
+            if "[DONE]" in ln or "[DECISION]" in ln
+        ]
+        shown = notable[:10]
+        remaining = len(notable) - len(shown)
+
+        summary: list[str] = [f"[SUMMARIZED] {len(excess)} earlier entries condensed:"]
+        for entry in shown:
+            summary.append(f"  - {entry}")
+        if remaining > 0:
+            summary.append(f"  ... and {remaining} more entries")
+
+        result_lines = header_lines + summary + recent
+        logger.debug(
+            "read_progress_log: truncated %d → %d lines (kept %d header, %d summary, %d recent).",
+            len(lines),
+            len(result_lines),
+            len(header_lines),
+            len(summary),
+            len(recent),
+        )
+        return "\n".join(result_lines)
 
     # ------------------------------------------------------------------
     # Properties and state management

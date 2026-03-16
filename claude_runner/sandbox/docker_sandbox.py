@@ -176,7 +176,7 @@ class DockerSandbox:
     #: Docker socket on Windows.
     DOCKER_SOCKET = "npipe:////./pipe/docker_engine"
 
-    def __init__(self, project_book, config, api_key: str) -> None:
+    def __init__(self, project_book, config, api_key: str, book_path=None) -> None:
         if not _DOCKER_AVAILABLE:
             raise SandboxError(
                 "The 'docker' Python package is not installed. "
@@ -186,6 +186,7 @@ class DockerSandbox:
         self._project_book = project_book
         self._config = config
         self._api_key = api_key
+        self._book_path = Path(book_path) if book_path is not None else None
 
         # Derived configuration -----------------------------------------
         sandbox_cfg = getattr(config, "sandbox", None) or {}
@@ -398,18 +399,8 @@ class DockerSandbox:
 
     def get_working_dir_path(self) -> Path:
         """Returns the host-side working directory path for this task."""
-        sandbox_cfg = getattr(self._project_book, "sandbox", None) or {}
-        wd = getattr(sandbox_cfg, "working_dir", None) or _cfg_get(
-            getattr(self._config, "sandbox", {}), "working_dir", None
-        )
-        if not wd:
-            wd = "/tmp/claude-runner/workspace"
-            logger.warning(
-                "No sandbox.working_dir configured — falling back to %s. "
-                "Set sandbox.working_dir in your project book to avoid this.",
-                wd,
-            )
-        return Path(wd)
+        from . import resolve_working_dir  # noqa: PLC0415
+        return resolve_working_dir(self._project_book, book_path=self._book_path)
 
     @staticmethod
     def check_available() -> bool:

@@ -86,7 +86,23 @@ To view or delete stored credentials later:
 
 **From the pre-built executable (recommended for most users)**
 
-Download `claude-runner.exe` from the [Releases](https://github.com/LunaticSodium/ClaudeRunner/releases) page and place it somewhere on your `PATH` (e.g., `C:\Users\<you>\bin\`). No Python installation is required on the target machine.
+Download `claude-runner.exe` from the [Releases](https://github.com/LunaticSodium/ClaudeRunner/releases) page.
+
+**Recommended folder layout** — place the exe and your project books together in one folder:
+
+```
+claude-runner\
+  claude-runner.exe
+  my-project.yaml        ← your project book lives here
+  projects\              ← optional subfolder for multiple projects
+    work-task.yaml
+    side-project.yaml
+```
+
+Running `claude-runner run my-project.yaml` from any directory will find the
+file next to the exe automatically (no need for a full path).  On first launch
+the exe copies an annotated example project book to the same folder as a
+starting point.
 
 **From source**
 
@@ -113,14 +129,15 @@ The resulting config file is plain YAML and can be edited by hand at any time (s
 
 ### 3. Run the hello-world example
 
-The bundled `projects/hello_world.yaml` is the recommended first task.
-Open it, set `sandbox.working_dir` to an empty git-initialised directory, then:
+On first launch `claude-runner.exe` copies `claude-runner-example.yaml` next to
+itself.  Open it, set `sandbox.working_dir` to an empty git-initialised
+directory, then:
 
 ```cmd
 mkdir C:\Projects\hello-claude
 cd C:\Projects\hello-claude
 git init
-claude-runner run projects/hello_world.yaml
+claude-runner run claude-runner-example.yaml
 ```
 
 Claude will create `hello.py`, run it, write a `README.md`, and commit the result.
@@ -129,7 +146,7 @@ See [TUTORIAL.md](TUTORIAL.md) for a full step-by-step walkthrough.
 ### 4. Write your own project book
 
 ```yaml
-# projects/my-task.yaml
+# my-task.yaml  (place next to claude-runner.exe)
 name: my-task
 description: Refactor the authentication module to use JWTs.
 

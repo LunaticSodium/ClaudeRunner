@@ -81,8 +81,23 @@ _SILENCE_TIMEOUT_S: float = 300.0  # 5 minutes
 # Directory name created inside the working directory for claude-runner artefacts.
 _RUNNER_DIR = ".claude-runner"
 
+# Windows ConPTY artefact: pywinpty sometimes reports STATUS_CONTROL_C_EXIT
+# (0xC000013A) as the exit code when the PTY session closes normally.
+# This is indistinguishable from a real Ctrl+C kill, so we treat it like -1.
+_WINPTY_CONTROL_C_EXIT: int = 0xC000013A  # 3221225786
+
 # Progress log filename (relative to _RUNNER_DIR inside working directory).
 _PROGRESS_LOG_NAME = "progress.log"
+
+# Patterns that match Claude Code's NPS / satisfaction-rating prompts.
+# When any of these fires, runner sends "4\n" (neutral mid-scale answer) and
+# continues without raising an error or triggering a rate-limit wait cycle.
+_RATING_DISMISS_PATTERNS: list[re.Pattern] = [
+    re.compile(r"how would you rate", re.IGNORECASE),
+    re.compile(r"please rate your experience", re.IGNORECASE),
+    re.compile(r"satisfaction survey", re.IGNORECASE),
+    re.compile(r"\brate\b.{0,30}\b(1-10|stars|experience)\b", re.IGNORECASE),
+]
 
 # Progress log header written at task start.
 _PROGRESS_LOG_HEADER_TEMPLATE = (
@@ -240,6 +255,8 @@ class TaskRunner:
         sandbox=None,
         tui=None,
         resume: bool = False,
+        project_book_path: Optional[str] = None,
+        show_claude: bool = False,
     ) -> None:
         self._book = project_book
         self._config = config
@@ -247,6 +264,16 @@ class TaskRunner:
         self._tui_callback = tui_callback
         self._tui = tui
         self._resume = resume
+        self._show_claude = show_claude
+        self._book_path: Optional[Path] = Path(project_book_path) if project_book_path else None
+        # Unique filesystem identifier derived from the YAML filename stem.
+        # Keying off the filename (not book.name) prevents collisions when two
+        # project books share the same name: field but live in the same folder.
+        self._project_id: str = (
+            _safe_name(self._book_path.stem)
+            if self._book_path is not None
+            else _safe_name(self._book.name)
+        )
         self._secrets_config = self._load_secrets_config()
 
         # Resolved lazily once run() begins.
@@ -269,10 +296,14 @@ class TaskRunner:
         self._rate_limit_reset_time: Optional[datetime] = None
 
         # asyncio.Events for runner protocol markers (##RUNNER:COMPLETE## / ##RUNNER:ERROR##).
-        # Initialised in _initialise() once an event loop is available.
-        self._runner_complete_event: asyncio.Event = asyncio.Event()
-        self._runner_error_event: asyncio.Event = asyncio.Event()
+        # Initialised in _initialise() once an event loop is available (NOT here).
+        self._runner_complete_event: Optional[asyncio.Event] = None
+        self._runner_error_event: Optional[asyncio.Event] = None
         self._runner_error_message: Optional[str] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Acceptance-criteria retry counter.
+        self._acceptance_retries: int = 0
 
         # Silence watchdog: tracks last output time and the background task.
         self._last_output_time: float = time.monotonic()
@@ -289,6 +320,10 @@ class TaskRunner:
 
         # Set by _state_checkpoint_loop to allow cancellation.
         self._checkpoint_task: Optional[asyncio.Task] = None
+
+        # CLAUDE.md content read from <working_dir>/.claude/CLAUDE.md at task start.
+        # None means no file was found or it was empty.
+        self._claude_md_content: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Secrets config loader
@@ -397,14 +432,26 @@ class TaskRunner:
         # --- Sandbox -------------------------------------------------------
         if self._sandbox is None:
             logger.info("[ACTION] Creating sandbox (backend=%r)", getattr(self._config, "sandbox_backend", "auto"))
-            self._sandbox = create_sandbox(self._book, self._config, self._api_key)
+            self._sandbox = create_sandbox(
+                self._book, self._config, self._api_key, book_path=self._book_path,
+                show_claude=self._show_claude,
+            )
         else:
             logger.info("[ACTION] Using pre-provided sandbox.")
         await _maybe_await(self._sandbox.setup)
         logger.info("[ACTION] Sandbox ready.")
 
+        # --- Seed project book into working dir ----------------------------
+        # Copy the YAML file into the working directory so Claude Code running
+        # inside the sandbox can read the project book directly (e.g. for
+        # self-reference or documentation purposes).
+        self._seed_project_folder()
+
         # --- Progress log --------------------------------------------------
         self._init_progress_log()
+
+        # --- CLAUDE.md injection -------------------------------------------
+        self._claude_md_content = self._read_claude_md()
 
         # --- Filesystem snapshot (git fallback) ----------------------------
         self._fs_snapshot_start = self._take_fs_snapshot()
@@ -456,11 +503,16 @@ class TaskRunner:
         self._rate_limit_event = asyncio.Event()
         self._rate_limit_reset_time = None
 
-        _loop = asyncio.get_event_loop()
+        # Runner protocol marker events — created here (inside the event loop) so
+        # that call_soon_threadsafe() is safe to use from I/O threads.
+        self._runner_complete_event = asyncio.Event()
+        self._runner_error_event = asyncio.Event()
+
+        self._loop = asyncio.get_event_loop()
 
         def _on_rate_limit_detected(reset_at: datetime) -> None:
             self._rate_limit_reset_time = reset_at
-            _loop.call_soon_threadsafe(self._rate_limit_event.set)
+            self._loop.call_soon_threadsafe(self._rate_limit_event.set)
 
         self._rate_detector = RateLimitDetector(on_rate_limit=_on_rate_limit_detected)
 
@@ -474,7 +526,7 @@ class TaskRunner:
 
         # --- Persistence ---------------------------------------------------
         state_dir = Path.home() / ".claude-runner" / "state"
-        self._persistence = PersistenceManager(state_dir=state_dir, task_name=self._book.name)
+        self._persistence = PersistenceManager(state_dir=state_dir, task_name=self._project_id)
         self._persistence.save(self._make_state("running", rate_limit_wait_count=0))
         logger.info("[ACTION] State file created (phase=running).")
 
@@ -593,7 +645,10 @@ class TaskRunner:
             # --- Runner protocol markers (highest priority) ----------------
             if rc_task in finished:
                 logger.info("##RUNNER:COMPLETE## — treating as clean task completion.")
-                return await self._handle_completion()
+                result = await self._complete_or_retry()
+                if result is not None:
+                    return result
+                continue  # acceptance retry in progress — loop back
 
             if re_task in finished:
                 msg = f"Claude reported fatal error: {self._runner_error_message or '(no description)'}"
@@ -603,11 +658,41 @@ class TaskRunner:
                 return self._make_result("failed", error_message=msg)
 
             if done_task in finished:
-                # Process has exited.
+                # Process has exited.  Yield once so any pending
+                # call_soon_threadsafe callbacks (e.g. ##RUNNER:COMPLETE## set
+                # by the on_line thread) are processed before we judge success.
+                await asyncio.sleep(0)
+                if self._runner_complete_event.is_set():
+                    logger.info(
+                        "Process exited; ##RUNNER:COMPLETE## also set — treating as success."
+                    )
+                    result = await self._complete_or_retry()
+                    if result is not None:
+                        return result
+                    continue
+
                 exit_code = done_task.result()
                 if exit_code == 0:
                     logger.info("Claude Code exited cleanly (exit code 0).")
-                    return await self._handle_completion()
+                    result = await self._complete_or_retry()
+                    if result is not None:
+                        return result
+                    continue
+                elif exit_code in (-1, _WINPTY_CONTROL_C_EXIT):
+                    # -1: pywinpty couldn't read exit status.
+                    # 0xC000013A (3221225786, STATUS_CONTROL_C_EXIT): ConPTY artefact
+                    # on Windows — the PTY host closes the session with a synthetic
+                    # Ctrl+C signal; the child's actual exit code is not recoverable.
+                    # Both are treated as clean exits when no error markers were detected.
+                    logger.info(
+                        "Claude Code exited (pywinpty exit status unavailable / "
+                        "ConPTY STATUS_CONTROL_C_EXIT artefact, code=%s) — treating as clean exit.",
+                        exit_code,
+                    )
+                    result = await self._complete_or_retry()
+                    if result is not None:
+                        return result
+                    continue
                 else:
                     msg = f"Claude Code exited with non-zero exit code {exit_code}."
                     logger.error(msg)
@@ -735,6 +820,107 @@ class TaskRunner:
     # Completion handler
     # ------------------------------------------------------------------
 
+    async def _complete_or_retry(self) -> Optional[TaskResult]:
+        """
+        Run acceptance checks (if configured); complete or retry accordingly.
+
+        Returns
+        -------
+        TaskResult
+            When the task truly finishes (pass, or failure/out-of-retries).
+        None
+            When an acceptance-retry was scheduled — the caller should
+            ``continue`` the monitoring loop so the new process is awaited.
+        """
+        from .acceptance_runner import run_checks  # noqa: PLC0415
+
+        criteria = getattr(self._book, "acceptance_criteria", None)
+        if criteria is None or not criteria.checks:
+            # No acceptance gate configured — complete immediately.
+            return await self._handle_completion()
+
+        working_dir = self._working_dir()
+        logger.info(
+            "[ACCEPTANCE] Running %d check(s) in %s …",
+            len(criteria.checks),
+            working_dir,
+        )
+        check_result = run_checks(criteria, working_dir, api_key=self._api_key)
+
+        if check_result.passed:
+            logger.info("[ACCEPTANCE] All checks passed.")
+            return await self._handle_completion()
+
+        # --- Checks failed ------------------------------------------------
+        logger.warning("[ACCEPTANCE] Check(s) failed:\n%s", check_result.details)
+        self._fault_log.append(f"[ACCEPTANCE] {check_result}")
+
+        retries_allowed = criteria.max_retries if criteria.on_failure == "retry" else 0
+        if self._acceptance_retries < retries_allowed:
+            self._acceptance_retries += 1
+            logger.info(
+                "[ACCEPTANCE] Retrying task (attempt %d / %d).",
+                self._acceptance_retries,
+                retries_allowed,
+            )
+            await self._launch_acceptance_retry(check_result)
+            return None  # caller must continue the monitoring loop
+
+        # Out of retries (or on_failure != "retry").
+        msg = (
+            f"Acceptance checks failed after {self._acceptance_retries} "
+            f"retry attempt(s):\n{check_result.details}"
+        )
+        logger.error("[ACCEPTANCE] %s", msg)
+        if criteria.on_failure in ("retry", "notify"):
+            await self._dispatch("error", {"error": msg, "task": self._book.name})
+        return self._make_result("failed", error_message=msg)
+
+    async def _launch_acceptance_retry(self, check_result) -> None:
+        """
+        Stop the current (exited) process and re-launch Claude Code with a
+        correction prompt derived from the failed acceptance checks.
+        """
+        # Stop and discard the old process object.
+        if self._process is not None:
+            try:
+                if hasattr(self._process, "is_alive") and self._process.is_alive():
+                    self._process.stop()
+            except Exception:
+                pass
+            self._process = None
+
+        # Reset event and detector state for the new run.
+        if self._runner_complete_event is not None:
+            self._runner_complete_event.clear()
+        if self._runner_error_event is not None:
+            self._runner_error_event.clear()
+        if self._rate_detector is not None:
+            self._rate_detector.reset()
+
+        # Build correction prompt.
+        failed_summary = "\n".join(
+            f"  - {line}" for line in check_result.failed_checks
+        )
+        retry_prompt = (
+            "## Acceptance Check Failure — Correction Required\n\n"
+            "The following acceptance checks failed after your last completion:\n"
+            f"{failed_summary}\n\n"
+            "Please fix these issues and signal completion again with ##RUNNER:COMPLETE##."
+        )
+        logger.info(
+            "[ACCEPTANCE] Launching retry process with correction prompt (%d chars).",
+            len(retry_prompt),
+        )
+
+        self._process = await _maybe_await(
+            self._sandbox.launch_claude,
+            prompt=retry_prompt,
+            on_line=self._on_output_line,
+            on_exit=None,
+        )
+        self._context_manager.set_on_inject_checkpoint(self._send_to_process)
+
     async def _handle_completion(self) -> TaskResult:
         """Called when the Claude Code process exits with code 0."""
         end_time = datetime.now(tz=timezone.utc)
@@ -763,7 +949,7 @@ class TaskRunner:
             change_summary = change_summary + "\n\n--- git workflow ---\n" + git_summary if change_summary else git_summary
 
         # --- Read final progress log -------------------------------------
-        progress_log_text = self._context_manager.read_progress_log()
+        progress_log_text = self._context_manager.read_progress_log_full()
 
         # --- Copy progress.log to host log_dir ---------------------------
         self._save_progress_log_to_host(progress_log_text)
@@ -818,21 +1004,33 @@ class TaskRunner:
         clean = (clean_line.replace("\r\n", "\n").replace("\r", "\n").strip()
                  if clean_line else _strip_ansi(line).strip())
 
+        self._last_output_time = time.monotonic()  # reset on every line (tool events are heartbeats)
         if clean:
             self._output_lines.append(clean)
-            self._last_output_time = time.monotonic()
 
         # Feed rate-limit / runner-marker detector (works on the clean line).
         if self._rate_detector is not None:
             self._rate_detector.feed(clean)
             if self._rate_detector.matched_runner_complete:
                 logger.info("[MARKER] ##RUNNER:COMPLETE## detected — signalling task done.")
-                self._runner_complete_event.set()
+                if self._runner_complete_event is not None and self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._runner_complete_event.set)
             elif self._rate_detector.matched_runner_error is not None:
                 msg = self._rate_detector.matched_runner_error
                 logger.info("[MARKER] ##RUNNER:ERROR## detected — %r", msg)
                 self._runner_error_message = msg
-                self._runner_error_event.set()
+                if self._runner_error_event is not None and self._loop is not None:
+                    self._loop.call_soon_threadsafe(self._runner_error_event.set)
+
+        # NPS / satisfaction-rating prompt dismissal.
+        # Claude Code occasionally interrupts a session with a rating prompt.
+        # We auto-respond with "4" (neutral mid-scale) so the task continues.
+        if clean:
+            for _pat in _RATING_DISMISS_PATTERNS:
+                if _pat.search(clean):
+                    logger.info("[ACTION] Rating prompt detected — auto-dismissing.")
+                    self._send_to_process("4\n")
+                    break
 
         # Token counting + checkpoint-end detection.
         if self._context_manager is not None:
@@ -937,7 +1135,7 @@ class TaskRunner:
 
         branch_prefix = getattr(git_cfg, "branch_prefix", "claude-task/")
         auto_push = getattr(git_cfg, "auto_push", False)
-        slug = _safe_name(self._book.name)
+        slug = self._project_id
         timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         branch_name = f"{branch_prefix}{slug}-{timestamp}"
 
@@ -1047,8 +1245,17 @@ class TaskRunner:
                 "A task prompt is required."
             )
 
+        # Prepend CLAUDE.md project context if available.
+        if self._claude_md_content:
+            claude_md_block = (
+                "--- Project context from CLAUDE.md ---\n"
+                + self._claude_md_content
+                + "\n--- End of project context ---"
+            )
+            task_prompt = claude_md_block + "\n\n" + task_prompt
+
         # Apply RUNNER_PROTOCOL + context_anchors via ContextManager so the
-        # ordering is always: runner protocol → anchors → progress log → task.
+        # ordering is always: runner protocol → anchors → CLAUDE.md → task.
         decorated = (
             self._context_manager.build_initial_prompt(task_prompt)
             if self._context_manager
@@ -1144,6 +1351,36 @@ class TaskRunner:
             logger.warning(warn)
             self._fault_log.append(f"[WARN] {warn}")
 
+    def _read_claude_md(self) -> Optional[str]:
+        """
+        Read <working_dir>/.claude/CLAUDE.md if it exists and is non-empty.
+
+        Called once during _initialise() after progress.log is created.
+        The returned content is stored in self._claude_md_content and injected
+        at the top of the initial prompt by _build_initial_prompt().
+
+        Returns None if the file does not exist, is empty, or cannot be read
+        (backwards compatible — missing CLAUDE.md is silently ignored).
+        """
+        try:
+            wd = self._working_dir()
+        except Exception:
+            return None
+        claude_md = wd / ".claude" / "CLAUDE.md"
+        if not claude_md.exists():
+            return None
+        try:
+            content = claude_md.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logger.warning("Could not read %s: %s", claude_md, exc)
+            return None
+        if not content:
+            return None
+        logger.info(
+            "[ACTION] Injected CLAUDE.md into initial prompt (%d chars).", len(content)
+        )
+        return content
+
     def _save_progress_log_to_host(self, contents: str) -> None:
         """
         Copy progress.log contents to the host log directory.
@@ -1153,7 +1390,7 @@ class TaskRunner:
         log_dir = self._host_log_dir()
         if log_dir is None:
             return
-        dest = log_dir / f"{_safe_name(self._book.name)}_progress.log"
+        dest = log_dir / f"{self._project_id}_progress.log"
         try:
             dest.write_text(contents or "(empty)", encoding="utf-8")
             logger.info("[ACTION] progress.log saved to host: %s.", dest)
@@ -1180,7 +1417,7 @@ class TaskRunner:
 
         log_dir.mkdir(parents=True, exist_ok=True)
         report_name = (
-            f"{_safe_name(self._book.name)}_"
+            f"{self._project_id}_"
             f"{result.start_time.strftime('%Y%m%d_%H%M%S')}_report.txt"
         )
         report_path = log_dir / report_name
@@ -1451,12 +1688,35 @@ class TaskRunner:
 
     def _working_dir(self) -> Path:
         """Return the task's working directory as a Path."""
-        sandbox_cfg = getattr(self._book, "sandbox", None)
-        wd = getattr(sandbox_cfg, "working_dir", None)
-        if wd:
-            return Path(wd)
-        # Fallback: current working directory (native sandbox without explicit config).
-        return Path.cwd()
+        from .sandbox import resolve_working_dir  # noqa: PLC0415
+        return resolve_working_dir(self._book, book_path=self._book_path)
+
+    def _seed_project_folder(self) -> None:
+        """Copy the project book YAML into the working directory.
+
+        This lets Claude Code (running inside the sandbox with the working
+        directory as its root) read the project book directly — e.g. to
+        understand the task spec or refer back to constraints.
+
+        The file is always overwritten so it stays in sync with the source.
+        Skipped silently when no book_path is known (programmatic use).
+        """
+        if self._book_path is None:
+            return
+        wd = self._working_dir()
+        dest = wd / self._book_path.name
+        # Never overwrite if source and destination resolve to the same file.
+        try:
+            if dest.resolve() == self._book_path.resolve():
+                return
+        except OSError:
+            pass
+        try:
+            import shutil as _shutil  # noqa: PLC0415
+            _shutil.copy2(str(self._book_path), str(dest))
+            logger.info("[ACTION] Project book seeded into working dir: %s", dest)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not copy project book to working dir: %s", exc)
 
     def _progress_log_path(self) -> Path:
         """Return the absolute path to progress.log inside the working directory."""
@@ -1522,8 +1782,8 @@ class TaskRunner:
         )
         progress_path = self._progress_log_path()
         defaults = dict(
-            task_name=self._book.name,
-            project_book_path=str(getattr(self, "_book_path", self._book.name)),
+            task_name=self._project_id,
+            project_book_path=str(self._book_path) if self._book_path is not None else self._book.name,
             start_time=start_iso,
             current_phase=phase,
             rate_limit_wait_count=self._rate_limit_cycles,
@@ -1555,7 +1815,7 @@ class TaskRunner:
         """Build a TaskResult from current runner state."""
         end_time = datetime.now(tz=timezone.utc)
         progress_log = (
-            self._context_manager.read_progress_log()
+            self._context_manager.read_progress_log_full()
             if self._context_manager is not None
             else ""
         )
