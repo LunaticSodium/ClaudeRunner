@@ -189,15 +189,17 @@ class ModelSchedule(BaseModel):
 
 
 class CccsConfig(BaseModel):
-    """Configuration for the optional CCCS (Claude Code C# Standards) preset.
+    """Protocol selector: activates the *cccs* protocol on the feature machine.
 
-    When present on a :class:`ProjectBook`, the runner loads the named preset
-    from ``claude_runner/presets/<preset>.cccs.toml``, validates the project
-    YAML against its schema, and injects a rendered CLAUDE.md fragment before
-    the first ``claude -p`` call.
+    When present (and ``enabled`` is True) on a :class:`ProjectBook`, the runner
+    loads the named preset from ``claude_runner/presets/<preset>.cccs.toml``,
+    validates the project YAML against its schema, and injects a rendered
+    CLAUDE.md fragment before the first ``claude -p`` call.
 
-    Set ``enabled: false`` to temporarily disable injection without removing
-    the config block.
+    Omitting this field (or setting ``enabled: false``) selects the *universal*
+    protocol — no pre-session standards injection.
+
+    Independent of the runway axis: works with both ``dash`` and ``marathon``.
     """
 
     enabled: bool = Field(
@@ -743,28 +745,32 @@ class ProjectBook(BaseModel):
     marathon_mode: bool = Field(
         default=False,
         description=(
-            "When True, disables all phase-aware model-switching logic: "
-            "CLAUDE.md phase contract injection, ModelWatchdog, and all related "
-            "event handling are skipped.  Use for very long unattended runs where "
-            "model consistency is more important than cost optimisation."
+            "Runway selector.  False = 'dash' runway: phase-aware model switching active, "
+            "ModelWatchdog polls git log and switches models on PHASE-N: triggers.  "
+            "True = 'marathon' runway: single model for the entire session, no watchdog, "
+            "no mid-session switches — designed for long unattended runs that must survive "
+            "server restarts and API outages without intervention.  "
+            "Independent of the protocol axis (cccs / universal)."
         ),
     )
     model_schedule: ModelSchedule | None = Field(
         default=None,
         description=(
-            "Phase-aware model-switching schedule.  When set (and marathon_mode is False), "
-            "the runner injects the phase contract into CLAUDE.md and starts a background "
-            "ModelWatchdog that switches models based on git commit phase markers and context "
-            "utilisation triggers.  Ignored when marathon_mode is True."
+            "Phase-aware model-switching schedule (dash runway only).  When set and "
+            "marathon_mode is False, the runner injects the phase contract into CLAUDE.md "
+            "and starts a background ModelWatchdog that switches models based on git commit "
+            "phase markers and context utilisation triggers.  Ignored on marathon runway."
         ),
     )
     cccs: CccsConfig | None = Field(
         default=None,
         description=(
-            "Optional CCCS (Claude Code C# Standards) preset.  When set, the runner "
-            "loads the named .cccs.toml preset, validates the project YAML against its "
-            "schema, and injects a rendered CLAUDE.md fragment before the first claude "
-            "invocation.  Set enabled: false to temporarily skip injection."
+            "Protocol selector.  None = 'universal' protocol: no pre-session standards "
+            "injection.  When set = 'cccs' protocol: loads the named .cccs.toml preset, "
+            "validates the project YAML against its schema, and injects a rendered CLAUDE.md "
+            "fragment before the first claude invocation.  "
+            "Independent of the runway axis (dash / marathon).  "
+            "Set enabled: false to temporarily revert to universal without removing the block."
         ),
     )
     sandbox: SandboxConfig | None = Field(

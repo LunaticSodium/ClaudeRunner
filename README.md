@@ -68,17 +68,18 @@ To view or delete stored credentials later:
 
 1. [Quick Start](#quick-start)
 2. [Project Book Format](#project-book-format)
-3. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
-4. [CLI Reference](#cli-reference)
-5. [Sandbox Modes](#sandbox-modes)
-6. [Rate Limit Handling](#rate-limit-handling)
-7. [Notifications](#notifications)
-8. [Context Length Management](#context-length-management)
-9. [Phase-Aware Model Switching](#phase-aware-model-switching)
-10. [Configuration](#configuration)
-11. [Requirements](#requirements)
-12. [Development](#development)
-13. [License](#license)
+3. [Feature Machine](#feature-machine)
+4. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
+5. [CLI Reference](#cli-reference)
+6. [Sandbox Modes](#sandbox-modes)
+7. [Rate Limit Handling](#rate-limit-handling)
+8. [Notifications](#notifications)
+9. [Context Length Management](#context-length-management)
+10. [Phase-Aware Model Switching](#phase-aware-model-switching)
+11. [Configuration](#configuration)
+12. [Requirements](#requirements)
+13. [Development](#development)
+14. [License](#license)
 
 ---
 
@@ -261,6 +262,62 @@ notifications:
     desktop: true
     email: false
     webhook: false
+```
+
+---
+
+## Feature Machine
+
+claude-runner is built as a **feature machine**: a bare runner core with
+independent, mountable capabilities.  Every project book composes exactly the
+features it needs; nothing is inherited from a global "mode".
+
+Two feature axes are available today:
+
+### Protocol axis — *what Claude is told before the session*
+
+| Name | YAML | Behaviour |
+|---|---|---|
+| **universal** | *(omit `cccs`)* | No pre-session standards injection.  Claude operates on the task prompt alone. |
+| **cccs** | `cccs: {preset: cccs-v1.0}` | Injects citation-backed C# coding standards into `CLAUDE.md` before launch.  See [CCCS — C# Standards Preset](#cccs--c-standards-preset). |
+
+### Runway axis — *how the runner behaves during the session*
+
+| Name | YAML | Behaviour |
+|---|---|---|
+| **dash** | *(omit `marathon_mode` or set `false`)* | Phase-aware model switching active.  A background watchdog reads `PHASE-N:` commits and switches models on trigger.  Best for shorter, supervised runs. |
+| **marathon** | `marathon_mode: true` | Single model for the entire session.  No watchdog, no mid-session switches.  Designed for long unattended runs where the runner must survive server restarts and API outages and resume without intervention. |
+
+### The four combinations
+
+```
+              dash (phase switching)    marathon (single model)
+              ─────────────────────    ───────────────────────
+universal  │  bare runner,            bare runner,
+           │  cost-optimised          maximum stability
+           │
+cccs       │  standards-enforced,     standards-enforced,
+           │  cost-optimised          maximum stability
+```
+
+The two axes are fully independent — any combination is valid and there is no
+conflict between them.
+
+### Example
+
+```yaml
+# CCCS protocol + marathon runway
+cccs:
+  preset: cccs-v1.0
+  profile: scisim
+
+marathon_mode: true
+```
+
+```yaml
+# Universal protocol + dash runway  (bare runner, phase switching)
+# — omit both cccs and marathon_mode, or be explicit:
+marathon_mode: false
 ```
 
 ---
@@ -609,12 +666,14 @@ use OR logic — the rule fires when any one matches.
 | `token_pct_gte` | float 0–1 | Context utilisation ≥ this fraction |
 | `token_pct_lte` | float 0–1 | Context utilisation ≤ this fraction |
 
-### `marathon_mode`
+### `marathon_mode` (marathon runway)
 
-Set `marathon_mode: true` to disable the entire model-switching subsystem for
-a task — no CLAUDE.md injection, no ModelWatchdog, no model changes.  Use for
-very long unattended runs where model consistency matters more than cost
-optimisation, or when the task's git workflow doesn't use `PHASE-N:` commits.
+Set `marathon_mode: true` to select the **marathon** runway — disables the
+entire model-switching subsystem: no ModelWatchdog, no model changes.  The
+runner uses a single model for the full session and is designed to survive
+server restarts, API outages, and long unattended runs without intervention.
+
+Omit (or set `false`) to use the **dash** runway with phase-aware switching.
 
 ### Notification
 
