@@ -433,6 +433,20 @@ class DockerSandbox:
 
         logger.info("Container %s started.", self._container.short_id)
 
+        # Ensure bash login shells source ~/.bashrc so that PATH additions made
+        # by tools like dotnet-install.sh, nvm, cargo, etc. are visible to all
+        # subsequent bash invocations (both the outer claude launch and Claude
+        # Code's internal Bash tool calls, which use 'bash -l' or 'bash -lc').
+        # Debian's ~/.profile only sources ~/.bashrc for *interactive* login
+        # shells; creating ~/.bash_profile unconditionally bridges the gap.
+        _setup_exec = self._client.api.exec_create(
+            self._container.id,
+            cmd=["bash", "-c", "echo '. \"$HOME/.bashrc\" 2>/dev/null || true' > ~/.bash_profile"],
+            user="1000:1000",
+        )["Id"]
+        self._client.api.exec_start(_setup_exec, detach=False)
+        logger.debug("Container: ~/.bash_profile set up to source ~/.bashrc")
+
     def launch_claude(
         self,
         prompt: str,

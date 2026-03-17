@@ -57,4 +57,11 @@ USER claude
 # Verify Claude Code is accessible as the non-root user.
 RUN claude --version
 
+# Ensure bash login shells source ~/.bashrc so that PATH additions made at
+# runtime by tools like dotnet-install.sh, nvm, cargo, etc. are visible to
+# all subsequent bash invocations.  Debian's ~/.profile only sources ~/.bashrc
+# for *interactive* login shells; this bridges the gap for non-interactive
+# login shells (bash -lc) used by Claude Code's Bash tool.
+RUN echo '. "$HOME/.bashrc" 2>/dev/null || true' > /home/claude/.bash_profile
+
 CMD ["bash"]
