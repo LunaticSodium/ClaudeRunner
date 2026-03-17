@@ -59,7 +59,7 @@ def resolve_working_dir(
             # project book works regardless of where the repo is checked out.
             wd = (Path(book_path).parent / wd).resolve()
     elif book_path is not None:
-        bp = Path(book_path)
+        bp = Path(book_path).resolve()
         wd = bp.parent / bp.stem
         logger.info(
             "sandbox.working_dir not set — using sibling folder: %s", wd

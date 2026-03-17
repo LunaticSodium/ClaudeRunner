@@ -14,8 +14,9 @@ Docker socket (Windows):  npipe:////./pipe/docker_engine
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
-import shlex
 import threading
 import time
 import uuid
@@ -55,7 +56,7 @@ class SandboxError(RuntimeError):
 
 class _DockerClaudeProcess:
     """
-    Wraps a docker-exec socket so that callers get the same interface as the
+    Wraps a docker-exec stream so that callers get the same interface as the
     native ClaudeProcess.
 
     Streams stdout/stderr line-by-line to `on_line` and calls `on_exit` once
@@ -65,13 +66,13 @@ class _DockerClaudeProcess:
     def __init__(
         self,
         exec_id: str,
-        socket,
+        stream,
         container,
         on_line: Callable[[str], None],
         on_exit: Callable[[int], None],
     ) -> None:
         self._exec_id = exec_id
-        self._socket = socket
+        self._stream = stream
         self._container = container
         self._on_line = on_line
         self._on_exit = on_exit
@@ -91,43 +92,108 @@ class _DockerClaudeProcess:
         self._thread.join(timeout=timeout)
         return self._return_code if self._return_code is not None else -1
 
+    async def wait_async(self) -> int:
+        """Async-compatible wait — runs the blocking join in a thread executor."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._thread.join)
+        return self._return_code if self._return_code is not None else -1
+
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
     def send_input(self, text: str) -> None:
-        """Write text to the exec session's stdin."""
-        try:
-            self._socket._sock.sendall(text.encode())
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("send_input error: %s", exc)
+        """Write text to the exec session's stdin (no-op in stream mode)."""
+        logger.debug("send_input: not supported in stream mode (ignored)")
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     def _pump(self) -> None:
-        """Read output from the docker exec socket and dispatch lines."""
+        """Read stream-json output from the docker exec stream and dispatch lines.
+
+        Claude Code is invoked with --output-format stream-json --verbose so
+        every event is a newline-delimited JSON object that is flushed
+        immediately.  We parse each event and synthesise human-readable lines
+        that the rest of the runner (rate-limit detector, silence watchdog,
+        completion logic) understands — mirroring the PipeProcess behaviour in
+        the native sandbox.
+        """
         buf = b""
         try:
-            for chunk in self._socket:
+            for chunk in self._stream:
+                if not chunk:
+                    continue
                 buf += chunk
                 while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    decoded = line.decode(errors="replace").rstrip("\r")
+                    line_bytes, buf = buf.split(b"\n", 1)
+                    raw = line_bytes.decode(errors="replace").rstrip("\r")
+                    if not raw.strip():
+                        continue
+                    # Try stream-json parse; fall back to raw delivery.
                     try:
-                        self._on_line(decoded)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("on_line callback raised")
+                        event = json.loads(raw)
+                        self._deliver_stream_event(event)
+                    except json.JSONDecodeError:
+                        self._deliver_line(raw)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Docker exec socket closed: %s", exc)
+            logger.debug("Docker exec stream ended: %s", exc)
         finally:
-            # Flush remaining buffer
             if buf:
-                try:
-                    self._on_line(buf.decode(errors="replace").rstrip("\r\n"))
-                except Exception:  # noqa: BLE001
-                    pass
+                raw = buf.decode(errors="replace").rstrip("\r\n")
+                if raw.strip():
+                    try:
+                        event = json.loads(raw)
+                        self._deliver_stream_event(event)
+                    except json.JSONDecodeError:
+                        self._deliver_line(raw)
             self._collect_exit_code()
+
+    def _deliver_line(self, line: str) -> None:
+        """Call the on_line callback with a single line."""
+        try:
+            self._on_line(line)
+        except Exception:  # noqa: BLE001
+            logger.exception("on_line callback raised")
+
+    def _deliver_stream_event(self, event: dict) -> None:
+        """Parse a stream-json event and deliver appropriate synthetic lines."""
+        event_type = event.get("type", "")
+
+        if event_type == "system":
+            session_id = event.get("session_id", "")
+            logger.info("stream-json session_id=%s", session_id)
+            self._deliver_line(f"[session:{session_id}]")
+
+        elif event_type == "assistant":
+            message = event.get("message", {})
+            content = message.get("content", [])
+            for block in content:
+                btype = block.get("type", "")
+                if btype == "text":
+                    for text_line in block.get("text", "").splitlines():
+                        self._deliver_line(text_line)
+                elif btype == "tool_use":
+                    self._deliver_line(f"[Tool: {block.get('name', 'tool')}]")
+
+        elif event_type == "user":
+            # tool_result — heartbeat to reset the silence watchdog.
+            self._deliver_line("[·]")
+
+        elif event_type == "rate_limit_event":
+            # Deliver a synthetic rate-limit line so the runner's
+            # RateLimitDetector can detect and handle it.
+            self._deliver_line("Claude AI API rate limit reached")
+
+        elif event_type == "result":
+            subtype = event.get("subtype", "")
+            is_error = event.get("is_error", False)
+            if subtype == "success" and not is_error:
+                self._deliver_line("##RUNNER:COMPLETE##")
+            elif is_error or subtype == "error":
+                err = event.get("error", "unknown error")
+                self._deliver_line(f"##RUNNER:ERROR:{err}##")
+        # All other event types (e.g. "debug") are silently dropped.
 
     def _collect_exit_code(self) -> None:
         # Poll until docker reports the exec as finished (up to 30 s).
@@ -144,10 +210,11 @@ class _DockerClaudeProcess:
         else:
             self._return_code = -1
 
-        try:
-            self._on_exit(self._return_code)
-        except Exception:  # noqa: BLE001
-            logger.exception("on_exit callback raised")
+        if self._on_exit is not None:
+            try:
+                self._on_exit(self._return_code)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_exit callback raised")
 
 
 # ---------------------------------------------------------------------------
@@ -235,15 +302,33 @@ class DockerSandbox:
         # refresh but cannot persist the result; the task may fail after expiry.
         _using_oauth = (self._api_key == _OAUTH_SENTINEL)
         if _using_oauth:
-            claude_creds = Path.home() / ".claude"
-            if claude_creds.exists():
-                volumes[str(claude_creds)] = {"bind": "/home/claude/.claude", "mode": "ro"}
-                logger.info("OAuth mode: mounted %s → /home/claude/.claude (read-only)", claude_creds)
+            # Mount ~/.claude.json read-only for authentication.
+            claude_json = Path.home() / ".claude.json"
+            if claude_json.exists():
+                volumes[str(claude_json)] = {"bind": "/home/claude/.claude.json", "mode": "ro"}
+                logger.info("OAuth mode: mounted %s → /home/claude/.claude.json (read-only)", claude_json)
             else:
                 logger.warning(
-                    "OAuth mode active but ~/.claude not found on host — "
+                    "OAuth mode active but ~/.claude.json not found on host — "
                     "Claude Code inside the container may fail to authenticate."
                 )
+
+            # Mount ~/.claude/ read-only for auth session tokens and settings.
+            # Claude Code reads OAuth session tokens from ~/.claude/sessions/.
+            claude_dir = Path.home() / ".claude"
+            if claude_dir.exists():
+                volumes[str(claude_dir)] = {"bind": "/home/claude/.claude", "mode": "ro"}
+                logger.info("OAuth mode: mounted %s → /home/claude/.claude (read-only)", claude_dir)
+
+            # Overlay ~/.claude/projects/ with a fresh writable directory so
+            # Claude Code can write sub-agent task files and project state.
+            # Docker processes bind mounts in order; the projects/ overlay takes
+            # precedence over the read-only ~/.claude mount for that subdirectory.
+            working_dir_path = self.get_working_dir_path()
+            claude_projects_rw = working_dir_path / ".claude-rw" / "projects"
+            claude_projects_rw.mkdir(parents=True, exist_ok=True)
+            volumes[str(claude_projects_rw)] = {"bind": "/home/claude/.claude/projects", "mode": "rw"}
+            logger.info("OAuth mode: writable overlay → /home/claude/.claude/projects")
 
         # SECURITY: Do not inherit host environment.  Inject only explicit vars.
         # - TERM: needed for Claude Code's PTY detection.
@@ -334,38 +419,50 @@ class DockerSandbox:
         if self._container is None:
             raise SandboxError("setup() must be called before launch_claude().")
 
-        # Escape prompt for shell safety.
-        safe_prompt = shlex.quote(prompt)
-        cmd = f"claude --dangerously-skip-permissions -p {safe_prompt}"
+        # Pass the prompt via an environment variable so the command string
+        # does not embed the raw prompt text (avoids bash echo of protocol
+        # markers like ##RUNNER:COMPLETE## when tty mode is enabled).
+        #
+        # Use --output-format stream-json --verbose so Claude Code emits
+        # newline-delimited JSON events that the pump can parse in real-time.
+        # This mirrors the native PipeProcess approach and gives us streaming
+        # visibility into tool calls, token counts, and completion events
+        # without needing a TTY.
+        cmd = (
+            "claude --dangerously-skip-permissions "
+            "--output-format stream-json --verbose "
+            '-p "$CLAUDE_TASK_PROMPT"'
+        )
 
         logger.info("Launching Claude inside container %s", self._container.short_id)
-        logger.debug("Command: %s", cmd)
+        logger.debug("Command: claude ... --output-format stream-json --verbose -p $CLAUDE_TASK_PROMPT")
 
-        exec_env: dict = {}
+        exec_env: dict = {"CLAUDE_TASK_PROMPT": prompt}
         if self._api_key != _OAUTH_SENTINEL:
             exec_env["ANTHROPIC_API_KEY"] = self._api_key
 
         exec_id = self._client.api.exec_create(
             self._container.id,
             cmd=["bash", "-lc", cmd],
-            stdin=True,
+            stdin=False,
             stdout=True,
             stderr=True,
-            tty=True,
+            tty=False,
             environment=exec_env,
             workdir="/workspace",
         )["Id"]
 
-        socket = self._client.api.exec_start(
+        stream = self._client.api.exec_start(
             exec_id,
             detach=False,
-            tty=True,
-            socket=True,
+            tty=False,
+            stream=True,
+            demux=False,
         )
 
         return _DockerClaudeProcess(
             exec_id=exec_id,
-            socket=socket,
+            stream=stream,
             container=self._container,
             on_line=on_line,
             on_exit=on_exit,
