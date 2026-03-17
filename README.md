@@ -1,292 +1,149 @@
-# claude-runner  ·  v1.0
+# claude-runner · v1.0.0
 
-## Download
+`claude-runner` is a Windows CLI tool that orchestrates
+[Claude Code](https://docs.anthropic.com/claude/docs/claude-code) as a fully
+autonomous subprocess.  You describe a project in a YAML **project book**,
+point the runner at it, and it drives Claude Code end-to-end: spinning up an
+isolated sandbox, feeding Claude its instructions, monitoring for rate-limit
+pauses, managing context length, routing notifications, and optionally
+switching models as the task progresses through phases.
 
-**For most users: download the latest `claude-runner.exe` from
-[Releases](https://github.com/LunaticSodium/ClaudeRunner/releases)
-and skip to [Configuration](#configuration).
-No Python or git required.**
-
-*(Releases not yet published — install from source for now, see [Quick Start](#quick-start).)*
+The result is an unattended, long-running automation loop suitable for
+overnight coding sessions, multi-hour pipelines, and any task too large to
+supervise manually.
 
 ---
 
-`claude-runner` is a Windows CLI tool that orchestrates [Claude Code](https://docs.anthropic.com/claude/docs/claude-code) as a fully autonomous subprocess. You describe a project in a YAML "project book", point the runner at it, and it drives Claude Code end-to-end: spinning up an isolated sandbox, feeding Claude its instructions, monitoring for rate-limit pauses, resuming automatically, routing desktop/email/webhook notifications, and trimming context when the conversation approaches the model's token ceiling. The result is an unattended, long-running automation loop suitable for overnight coding sessions, CI-like pipelines, or any task too large to supervise manually.
+## Table of Contents
+
+1. [Install](#install)
+2. [Prerequisites](#prerequisites)
+3. [Quick Start](#quick-start)
+4. [Feature Machine](#feature-machine)
+5. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
+6. [Phase-Aware Model Switching](#phase-aware-model-switching)
+7. [Project Book Reference](#project-book-reference)
+8. [CLI Reference](#cli-reference)
+9. [Sandbox Modes](#sandbox-modes)
+10. [Notifications](#notifications)
+11. [Acceptance Criteria](#acceptance-criteria)
+12. [Configuration](#configuration)
+13. [Development](#development)
+14. [License](#license)
+
+---
+
+## Install
+
+```cmd
+git clone https://github.com/LunaticSodium/ClaudeRunner.git
+cd ClaudeRunner/claude-runner
+pip install -e ".[dev]"
+```
 
 ---
 
 ## Prerequisites
 
-Install the following before running claude-runner.
-
-### Docker Desktop
-
-Download and install from https://www.docker.com/products/docker-desktop/
-
-After installation, enable auto-start so it is always available:
-> Right-click the Docker icon in the system tray → **Settings → General** →
-> check **"Start Docker Desktop when you log in"**
-
-Docker must be running before launching claude-runner.
-
 ### Node.js + Claude Code
-
-Install Node.js LTS:
 
 ```cmd
 winget install OpenJS.NodeJS.LTS
 ```
 
-Reopen your terminal, then install and authenticate Claude Code:
+Reopen your terminal, then:
 
 ```cmd
 npm install -g @anthropic-ai/claude-code
 claude
 ```
 
-The final command opens a one-time login flow. Complete it once and Claude Code
-will remain authenticated. If you have a **Claude.ai Pro or Max** subscription
-you can log in with your account here — no API key required. Otherwise you will
-be prompted for an Anthropic API key during the login flow.
+The final command opens a one-time login flow.  If you have a **Claude.ai Pro
+or Max** subscription, log in with your account — no API key required.
+Otherwise an Anthropic API key is prompted during login.
 
-### Anthropic API Key *(API key users only)*
+### Docker Desktop *(docker sandbox only)*
 
-If you authenticated Claude Code with an API key rather than a Claude.ai
-account, you will need an Anthropic API key from
-https://console.anthropic.com/
+Download from https://www.docker.com/products/docker-desktop/
 
-`claude-runner configure` will guide you through storing it securely in
-Windows Credential Manager during first-time setup.
-
-To view or delete stored credentials later:
-> Start Menu → search **Credential Manager** → **Windows Credentials**
-> → look for **claude-runner** entries.
-
----
-
-## Table of Contents
-
-1. [Quick Start](#quick-start)
-2. [Project Book Format](#project-book-format)
-3. [Feature Machine](#feature-machine)
-4. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
-5. [CLI Reference](#cli-reference)
-6. [Sandbox Modes](#sandbox-modes)
-7. [Rate Limit Handling](#rate-limit-handling)
-8. [Notifications](#notifications)
-9. [Context Length Management](#context-length-management)
-10. [Phase-Aware Model Switching](#phase-aware-model-switching)
-11. [Configuration](#configuration)
-12. [Requirements](#requirements)
-13. [Development](#development)
-14. [License](#license)
+Enable auto-start: system tray → **Settings → General → "Start Docker Desktop
+when you log in"**.  Docker must be running before launching claude-runner.
 
 ---
 
 ## Quick Start
 
-### 1. Install
+### 1. First run — auto-configure
 
-**From the pre-built executable (recommended for most users)**
-
-Download `claude-runner.exe` from the [Releases](https://github.com/LunaticSodium/ClaudeRunner/releases) page.
-
-**Recommended folder layout** — place the exe and your project books together in one folder:
-
-```
-claude-runner\
-  claude-runner.exe
-  my-project.yaml        ← your project book lives here
-  projects\              ← optional subfolder for multiple projects
-    work-task.yaml
-    side-project.yaml
-```
-
-Running `claude-runner run my-project.yaml` from any directory will find the
-file next to the exe automatically (no need for a full path).  On first launch
-the exe copies an annotated example project book to the same folder as a
-starting point.
-
-**From source**
-
-```cmd
-git clone https://github.com/LunaticSodium/ClaudeRunner.git
-cd claude-runner
-pip install -e ".[dev]"
-```
-
-### 2. Configure
-
-Run the interactive setup wizard on first use:
+On first launch the setup wizard runs automatically.  Run any command:
 
 ```cmd
 claude-runner configure
 ```
 
-The wizard asks for:
-- Your Anthropic API key (stored in `~/.claude-runner/config.yaml`, never echoed)
-- Default sandbox mode (`docker` or `native`)
-- Optional notification channels (desktop, email, webhook)
+The wizard covers four steps:
+1. **Claude Code authentication** — OAuth session is detected automatically; API key as fallback
+2. **Notifications** — ntfy.sh (recommended, free, no account), or email
+3. **Default feature settings** — CCCS protocol on/off, marathon runway on/off
+4. **Credential storage** — `secrets.yaml` or Windows Credential Manager
 
-The resulting config file is plain YAML and can be edited by hand at any time (see [Configuration](#configuration)).
-
-### 3. Run the hello-world example
-
-On first launch `claude-runner.exe` copies `claude-runner-example.yaml` next to
-itself.  Open it, set `sandbox.working_dir` to an empty git-initialised
-directory, then:
+Re-run at any time to update settings:
 
 ```cmd
-mkdir C:\Projects\hello-claude
-cd C:\Projects\hello-claude
-git init
-claude-runner run claude-runner-example.yaml
+claude-runner configure
 ```
 
-Claude will create `hello.py`, run it, write a `README.md`, and commit the result.
-See [TUTORIAL.md](TUTORIAL.md) for a full step-by-step walkthrough.
-
-### 4. Write your own project book
+### 2. Write a project book
 
 ```yaml
-# my-task.yaml  (place next to claude-runner.exe)
+# my-task.yaml
 name: my-task
-description: Refactor the authentication module to use JWTs.
+description: Refactor auth module to use JWTs.
 
 prompt: |
   Refactor auth/session.py and auth/middleware.py to issue and verify
-  JWT tokens using PyJWT. Remove the legacy cookie-based session store.
-  Add unit tests. Do not touch any file outside the auth/ directory.
+  JWT tokens using PyJWT.  Remove the legacy cookie-based session store.
+  Add unit tests.  Output ##RUNNER:COMPLETE## when done.
 
 sandbox:
-  working_dir: C:/Projects/my-app   # must exist on host
-
-notify:
-  on: [complete, error]
-  channels:
-    - type: desktop
+  working_dir: C:/Projects/my-app
+  backend: docker
 ```
 
+### 3. Run
+
 ```cmd
-claude-runner run projects/my-task.yaml
+claude-runner run my-task.yaml
 ```
 
 claude-runner will:
-1. Clone the repository into a fresh sandbox.
-2. Start Claude Code with the project goal as its initial prompt.
-3. Stream Claude's output to your terminal.
-4. Handle rate-limit pauses, context overflows, and retries automatically.
-5. Send a desktop notification (and optionally email/webhook) when done.
-
----
-
-## Project Book Format
-
-Project books live in the `projects/` directory (relative to the executable) or in any path you pass directly: `claude-runner run path/to/my-project.yaml`.
-
-```yaml
-# ------------------------------------------------------------------
-# Required fields
-# ------------------------------------------------------------------
-
-# Unique identifier used on the command line.
-name: my-project
-
-# Human-readable description shown in `claude-runner status` output.
-description: "Refactor the auth module to use JWTs."
-
-# Git repository to clone into the sandbox.
-# Accepts HTTPS or SSH URLs.
-repo: https://github.com/my-org/my-app.git
-
-# Branch (or tag/commit SHA) to check out.
-branch: main
-
-# The task prompt fed to Claude Code as the first message.
-# Multi-line YAML block scalars are recommended for long goals.
-goal: |
-  Refactor auth/session.py and auth/middleware.py to issue and verify
-  JWT tokens using PyJWT. Remove the legacy cookie-based session store.
-  Add unit tests. Do not touch any file outside the auth/ directory.
-
-# ------------------------------------------------------------------
-# Optional fields
-# ------------------------------------------------------------------
-
-# Sandbox mode: "docker" (isolated container) or "native" (host Python).
-# Overrides the global default in config.yaml.
-# Default: value of sandbox.default in config.yaml
-sandbox: docker
-
-# Maximum wall-clock time for the entire run, in minutes.
-# claude-runner will abort the run and notify you if this is exceeded.
-# Default: 0 (no limit)
-timeout_minutes: 120
-
-# Strategy to use when the conversation approaches the context limit.
-# Options:
-#   continue   -- append "continue from where you left off" (default)
-#   restate    -- resend the full goal + a summary of progress so far
-#   summarize  -- ask Claude to summarize the conversation, then continue
-# Default: continue
-context_strategy: restate
-
-# Rate-limit resume strategy (see "Rate Limit Handling" section).
-# Options: continue | restate | summarize
-# Default: continue
-rate_limit_strategy: continue
-
-# Environment variables to inject into the sandbox at runtime.
-# Values are plain strings; do not store secrets here -- use config.yaml
-# or a .env file referenced via env_file below.
-env:
-  NODE_ENV: test
-  LOG_LEVEL: debug
-
-# Path to a .env file whose contents are injected into the sandbox.
-# Relative paths are resolved from the project book's directory.
-env_file: .env.sandbox
-
-# Notification overrides for this project specifically.
-# These merge with (and take precedence over) config.yaml notifications.
-notifications:
-  on_complete:
-    desktop: true
-    email: false
-    webhook: true
-  on_error:
-    desktop: true
-    email: true
-    webhook: true
-  on_rate_limit:
-    desktop: true
-    email: false
-    webhook: false
-```
+1. Start a Docker container for the working directory
+2. Launch Claude Code with the prompt
+3. Stream output to your terminal
+4. Handle rate-limit pauses, context overflows, and retries automatically
+5. Send a desktop notification on completion or error
 
 ---
 
 ## Feature Machine
 
-claude-runner is built as a **feature machine**: a bare runner core with
-independent, mountable capabilities.  Every project book composes exactly the
-features it needs; nothing is inherited from a global "mode".
-
-Two feature axes are available today:
+claude-runner is a **feature machine**: a bare runner core with two
+independent, mountable feature axes.  Every project book composes exactly
+the combination it needs — nothing is inherited from a global mode.
 
 ### Protocol axis — *what Claude is told before the session*
 
 | Name | YAML | Behaviour |
 |---|---|---|
 | **universal** | *(omit `cccs`)* | No pre-session standards injection.  Claude operates on the task prompt alone. |
-| **cccs** | `cccs: {preset: cccs-v1.0}` | Injects citation-backed C# coding standards into `CLAUDE.md` before launch.  See [CCCS — C# Standards Preset](#cccs--c-standards-preset). |
+| **cccs** | `cccs: {preset: cccs-v1.0}` | Injects citation-backed C# coding standards into `CLAUDE.md` before launch.  See [CCCS](#cccs--c-standards-preset). |
 
 ### Runway axis — *how the runner behaves during the session*
 
 | Name | YAML | Behaviour |
 |---|---|---|
-| **dash** | *(omit `marathon_mode` or set `false`)* | Phase-aware model switching active.  A background watchdog reads `PHASE-N:` commits and switches models on trigger.  Best for shorter, supervised runs. |
-| **marathon** | `marathon_mode: true` | Single model for the entire session.  No watchdog, no mid-session switches.  Designed for long unattended runs where the runner must survive server restarts and API outages and resume without intervention. |
+| **dash** | *(omit `marathon_mode`)* | Phase-aware model switching active.  A background watchdog reads `PHASE-N:` commits and switches models on trigger.  Best for shorter or supervised runs. |
+| **marathon** | `marathon_mode: true` | Single model for the entire session.  No watchdog, no mid-session switches.  Designed for long unattended runs that must survive server restarts and API outages without intervention. |
 
 ### The four combinations
 
@@ -294,14 +151,13 @@ Two feature axes are available today:
               dash (phase switching)    marathon (single model)
               ─────────────────────    ───────────────────────
 universal  │  bare runner,            bare runner,
-           │  cost-optimised          maximum stability
+           │  phase switching         maximum stability
            │
 cccs       │  standards-enforced,     standards-enforced,
-           │  cost-optimised          maximum stability
+           │  phase switching         maximum stability
 ```
 
-The two axes are fully independent — any combination is valid and there is no
-conflict between them.
+The two axes are fully independent — any combination is valid.
 
 ### Example
 
@@ -314,51 +170,26 @@ cccs:
 marathon_mode: true
 ```
 
-```yaml
-# Universal protocol + dash runway  (bare runner, phase switching)
-# — omit both cccs and marathon_mode, or be explicit:
-marathon_mode: false
-```
-
 ---
 
 ## CCCS — C# Standards Preset
 
-**CCCS** (Claude Code C# Standards for Scientific Simulation) is a machine-readable
-specification, bundled as a `.cccs.toml` file, that does two things simultaneously:
+**CCCS** (Claude Code C# Standards for Scientific Simulation) is the built-in
+`cccs` protocol.  Before the first `claude -p` call it:
 
-1. **Validates your project YAML** — before the first `claude -p` call, the runner
-   checks that your project book satisfies structural requirements (phases defined,
-   environment fields present, recognised profile name, etc.).
+1. **Validates the project YAML** against a structural schema.
+2. **Injects a CLAUDE.md fragment** — citation-backed rules that Claude sees
+   as authoritative constraints throughout the session.
 
-2. **Injects a CLAUDE.md fragment** — a precisely scoped set of rules is appended
-   to the working directory's `CLAUDE.md` so Claude sees them as authoritative
-   constraints throughout the session, not just in the initial prompt.
-
-This is the primary mechanism for enforcing consistent, citation-backed coding
-standards across long autonomous runs — reproducible architecture, numerical
-rigour, phased delivery, and convergence verification all encoded in one file.
-
-### Why it exists
-
-LLMs have well-documented failure modes on scientific code: silent `float32` vs
-`float64` confusion, missing MCSE reporting, global mutable state, and skipping
-tests to make CI green.  CCCS encodes published countermeasures with full RFC 2119
-enforcement levels (`MUST` / `SHOULD` / `MAY`) and citation keys traced to the
-research literature.  The runner injects only the rules — not the citations — to
-stay within the ~200-line instruction budget where adherence stays above 92%.
-
-### Enabling CCCS in a project book
-
-Add a `cccs` block to any project YAML:
+### Enabling
 
 ```yaml
 cccs:
   preset: cccs-v1.0       # built-in preset (default)
-  profile: scisim         # omit to use the preset's default profile
+  profile: scisim         # scisim | engineering — omit for preset default
 ```
 
-To temporarily disable injection without removing the block:
+Temporarily revert to universal without removing the block:
 
 ```yaml
 cccs:
@@ -367,560 +198,474 @@ cccs:
 
 ### Profiles
 
-Two tail profiles ship with `cccs-v1.0`:
-
-| Profile | Use case | Extra requirements |
-|---|---|---|
-| `scisim` | Scientific simulation — full rigour | MCSE reporting, analytical validation, convergence checks, structured output columns |
-| `engineering` | Pure software engineering | Build + test gates only; no numerical requirements |
-
-### What gets injected
-
-The runner appends the following rule categories to `CLAUDE.md`, each wrapped in
-an XML tag per [Anthropic prompt engineering guidance](https://docs.anthropic.com/claude/docs/use-xml-tags):
-
-| Section tag | Summary |
+| Profile | Use case |
 |---|---|
-| `<architecture>` | Hexagonal core/adapter split; no static state; injectable dependencies; IRng interface; named parameters with units |
-| `<numerical_standards>` | `float64` default; MCSE alongside every estimate; convergence N vs 2N check; matched RNG seeds |
+| `scisim` | Scientific simulation — full rigour: MCSE reporting, analytical validation, convergence checks, structured output columns |
+| `engineering` | Build and test gates only; no numerical simulation requirements |
+
+### Rule sections injected into CLAUDE.md
+
+Each rule is prefixed `MUST` / `SHOULD` / `MAY` (RFC 2119).  The fragment
+stays under 150 lines to maintain >92% adherence.
+
+| Section | Summary |
+|---|---|
+| `<architecture>` | Hexagonal core/adapter split; no static state; injectable dependencies; `IRng` interface; named parameters with units |
+| `<numerical_standards>` | `float64` default; MCSE alongside every estimate; convergence N vs 2N; matched RNG seeds |
 | `<validation>` | At least one analytical validation; MMS for PDEs/ODEs; KS/chi² for stochastic distributions |
 | `<reproducibility>` | Config file for all params; runtime metadata logged (version, seed, git hash); structured results directory |
 | `<testing>` | xUnit/NUnit; regression baseline on every commit; every bug becomes a test; `dotnet test` after every phase |
 | `<coding_standards>` | XML docs; `Nullable enable`; no `var` for non-obvious types; `async Task` not `async void` |
-| `<delivery>` | Phased commits with feat/fix prefixes; never commit with failing tests; final V&V gate before delivery |
-| `<compact_instructions>` | What to preserve during context compaction so progress survives `/compact` |
+| `<delivery>` | Phased commits with `PHASE-N:` prefix; never commit with failing tests; final V&V gate before delivery |
+| `<compact_instructions>` | What to preserve during context compaction so phase progress survives `/compact` |
 
-### Acceptance gates (tail)
-
-For the `scisim` profile the runner stores these thresholds as hard gates for
-external verification after the session completes:
+### Acceptance gates (`scisim` profile)
 
 | Gate | Value |
 |---|---|
 | `dotnet build` exit code | 0 |
-| Warnings treated as errors | yes |
+| Warnings as errors | yes |
 | `dotnet test` exit code | 0 |
 | Line coverage — core namespace | ≥ 80 % |
 | Line coverage — numerics namespace | 100 % |
-| Minimum ensemble — central tendency | 500 repetitions |
-| Minimum ensemble — variance | 1 000 repetitions |
-| Minimum ensemble — tail statistics | 10 000 repetitions |
-| MCSE must be reported | yes |
+| Min ensemble — central tendency | 500 repetitions |
+| Min ensemble — variance | 1 000 repetitions |
+| Min ensemble — tail statistics | 10 000 repetitions |
+| MCSE reported | yes |
 | Convergence check (N vs 2N) | required |
-| Analytical validation present | ≥ 1 |
+| Analytical validation | ≥ 1 |
 | Runtime metadata logged | yes |
 | Seed logged | yes |
 
-### Full example project YAML
-
-```yaml
-name: mc-diffusion
-description: Monte Carlo heat diffusion simulator in C#
-
-cccs:
-  preset: cccs-v1.0
-  profile: scisim
-
-sandbox:
-  backend: docker
-  working_dir: C:/Projects/mc-diffusion
-
-execution:
-  timeout_hours: 6
-
-prompt: |
-  Build a Monte Carlo heat diffusion simulator in C# (.NET 8).
-  Follow all rules injected via CCCS in CLAUDE.md.
-  Deliver in three phases:
-    Phase 1 — core domain (IRng, IRenderer ports, SimulationEngine)
-    Phase 2 — numerical solver (explicit Euler, analytical validation)
-    Phase 3 — reporting (MCSE, structured CSV output, reproducibility metadata)
-  Commit each phase with PHASE-N: prefix.
-  Print ##RUNNER:COMPLETE## when done.
-```
-
-### Preset file location
-
-The bundled preset lives at:
-
-```
-claude_runner/presets/cccs-v1.0.cccs.toml
-```
-
-You can inspect, fork, or extend it to create your own domain-specific standard.
-Custom presets can be loaded by pointing `cccs.preset` at a file path instead of a short name.
-
----
-
-## CLI Reference
-
-All commands accept `--help` for inline documentation.
-
-| Command | Description |
-|---|---|
-| `run <project>` | Start a project run. `<project>` is a project name (matched against `projects/*.yaml`) or a path to a YAML file. |
-| `run <project> --sandbox docker` | Override the sandbox mode for this run only. |
-| `run <project> --dry-run` | Validate the project book and print the prompt that would be sent, without starting Claude Code. |
-| `validate <project>` | Validate a project book's YAML schema without running. Exits 0 on success. |
-| `status` | Show a table of all active and recently completed runs: project name, status, elapsed time, last event. |
-| `status <project>` | Show detailed status for a single named run. |
-| `abort <project>` | Gracefully stop a running project. Claude Code is sent SIGTERM; the sandbox is preserved for inspection. |
-| `abort <project> --force` | Send SIGKILL and destroy the sandbox immediately. |
-| `logs <project>` | Stream the live log for a running project, or print the saved log for a completed one. |
-| `logs <project> --tail 50` | Print only the last 50 lines of the log. |
-| `configure` | Launch the interactive configuration wizard. Writes `~/.claude-runner/config.yaml`. |
-| `configure --show` | Print the current configuration (API key is masked). |
-| `docker pull` | Pull the latest claude-runner Docker base image. |
-| `docker build` | Rebuild the local Docker image from `docker/Dockerfile`. |
-| `docker prune` | Remove all stopped claude-runner containers and dangling images. |
-
----
-
-## Sandbox Modes
-
-### Docker (hard sandbox) -- recommended
-
-When `sandbox: docker` is set, claude-runner spins up a fresh Docker container for each run using the bundled `docker/Dockerfile`. Claude Code and the cloned repository live entirely inside the container. The host filesystem is not mounted. Network access can be further restricted via `config.yaml`.
-
-**When to use Docker:**
-- Untrusted or unfamiliar codebases.
-- Tasks that install system packages or run arbitrary shell commands.
-- Any situation where you want a clean, reproducible environment.
-- Production or CI-like pipelines.
-
-**Prerequisites:** Docker Desktop must be running. See [Requirements](#requirements).
-
-**How it works:**
-
-1. `claude-runner` builds or pulls the base image (`claude-runner-base:latest`).
-2. It starts a container with the project's environment variables injected.
-3. Inside the container, it clones the repo, installs dependencies, and launches Claude Code.
-4. On completion (success or error), the container is stopped. Logs are extracted before destruction.
-5. The container is removed automatically unless `sandbox.keep_on_error: true` is set in `config.yaml`.
-
-### Native (soft sandbox)
-
-When `sandbox: native` is set, claude-runner runs Claude Code directly on the host machine using the host Python and Node.js installations. The repository is cloned into a temporary directory under `%TEMP%\claude-runner\<project>\`.
-
-**When to use native:**
-- Rapid iteration on trusted personal projects.
-- Environments where Docker Desktop is unavailable.
-- Tasks that need direct access to host GPU, hardware, or licensed software.
-
-**Caveats:** Claude Code has full access to your host filesystem and network. Use with care.
-
----
-
-## Rate Limit Handling
-
-Claude Code communicates rate-limit events to stdout using a structured JSON line format. claude-runner parses this stream in real time.
-
-**What happens when a rate limit is hit:**
-
-1. claude-runner detects the `rate_limit_exceeded` event.
-2. It reads the `retry_after` field from the event (seconds until the quota resets).
-3. It sends an `on_rate_limit` notification (see [Notifications](#notifications)).
-4. It sleeps until the reset time, printing a countdown to the terminal.
-5. On waking, it resumes using the strategy specified by `rate_limit_strategy` in the project book (or `config.yaml`):
-
-| Strategy | Behaviour |
-|---|---|
-| `continue` | Append a single line: `"Continue from where you left off."` This keeps conversation history intact and works well for most tasks. |
-| `restate` | Resend the full `goal` prompt followed by a short progress summary extracted from Claude's last assistant message. Use this when `continue` causes Claude to lose track of the objective. |
-| `summarize` | Ask Claude to produce a structured summary of completed and remaining work, then start a fresh conversation seeded with that summary. This costs extra tokens but is reliable for very long tasks. |
-
-**Exponential backoff:** If the API returns a rate-limit error before a `retry_after` field is available (e.g., a 429 with no body), claude-runner applies exponential backoff starting at 60 seconds, capped at 30 minutes, with jitter.
-
----
-
-## Notifications
-
-claude-runner supports three notification channels: desktop toast, ntfy.sh push, and email. Channels are configured per-project in the project book and can be set up interactively with `claude-runner configure`.
-
-### ntfy.sh *(recommended)*
-
-[ntfy.sh](https://ntfy.sh) is a free, open-source push notification service — no account or sign-up required. Install the ntfy app on your phone, subscribe to a topic, and receive real-time alerts wherever you are.
-
-**Setup (30 seconds):**
-1. Install the [ntfy app](https://ntfy.sh/#subscribe) on iOS or Android (or use the web UI at ntfy.sh)
-2. Subscribe to a topic name that only you know — e.g. `claude-runner-abc123`
-3. Run `claude-runner configure` and select **ntfy.sh** — it will send a test message instantly
-
-```yaml
-# In your project book:
-notify:
-  on: [complete, error, rate_limit]
-  channels:
-    - type: webhook
-      url: https://ntfy.sh/your-topic-name
-```
-
-### Desktop
-
-Uses the Windows system notification API via `apprise`. Works on Windows 10/11 with no external dependencies (bundled in the .exe).
-
-```yaml
-notify:
-  channels:
-    - type: desktop
-```
-
-### Email
-
-Sends plain-text email via SMTP. Useful for detailed completion reports with the git diff summary. Gmail users must use an [App Password](https://support.google.com/accounts/answer/185833).
-
-`claude-runner configure` walks through the Gmail App Password flow step by step.
-
-```yaml
-notify:
-  channels:
-    - type: email
-      to: you@gmail.com
-```
-
-### Event routing table
-
-| Event | Default desktop | Default email | Default webhook |
-|---|---|---|---|
-| `on_complete` (success) | yes | no | no |
-| `on_complete` (with changes) | yes | no | no |
-| `on_error` | yes | yes | no |
-| `on_rate_limit` | yes | no | no |
-| `on_abort` | yes | no | no |
-| `on_timeout` | yes | yes | no |
-| `on_context_trim` | no | no | no |
-
-All defaults can be overridden in `config.yaml` under `notifications.routing` or per-project under the `notifications` key of the project book.
+The preset file lives at `claude_runner/presets/cccs-v1.0.cccs.toml` and can
+be forked for custom domain standards.
 
 ---
 
 ## Phase-Aware Model Switching
 
-For long tasks with multiple distinct phases, claude-runner can automatically
-switch to a different model as the task progresses.  Expensive capability is
-applied only where it is actually needed, and faster/cheaper models handle
-routine scaffolding.
+Available on the **dash** runway.  A `ModelWatchdog` background thread polls
+`git log` every `poll_interval_seconds` and switches Claude Code to a
+different model when phase or context triggers fire.
 
 ### How it works
 
-1. **Phase contract** — when `model_schedule` is configured, claude-runner
-   injects a brief instruction block into `CLAUDE.md` before starting the
-   session.  The block tells Claude to prefix significant milestone commits
-   with `PHASE-{N}: ` (e.g. `PHASE-2: strategy classes implemented`).
-
-2. **ModelWatchdog** — a background thread polls `git log` every
-   `poll_interval_seconds` (default: 15 s) to detect the highest
-   `PHASE-{N}:` commit in the working directory.
-
-3. **Rule evaluation** — the watchdog evaluates each rule in `model_schedule.rules`
-   in order.  A rule fires when any of its `triggers` matches the current
-   phase number and/or context-window utilisation.  Each rule fires at most
-   once per session.
-
-4. **Model switch** — when a rule fires, the runner checkpoints context, stops
-   the current Claude Code process, and re-launches it with the new model set
-   via `ANTHROPIC_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` environment variables.
-   A resume prompt tells Claude to continue from where it left off.
+1. Runner injects a phase-contract block into `CLAUDE.md`: tells Claude to
+   prefix milestone commits with `PHASE-{N}: `.
+2. Watchdog polls `git log --format=%s -50`, parsing the highest `PHASE-N:`
+   commit number.
+3. When a rule's triggers match, the watchdog fires: checkpoint context →
+   stop Claude Code process → re-launch with new `model_id` set via
+   `ANTHROPIC_MODEL` + `CLAUDE_CODE_SUBAGENT_MODEL`.
+4. Each rule fires at most once per session.  Phase number never goes
+   backwards (monotonic).
 
 ### Configuration
 
 ```yaml
-marathon_mode: false   # set true to disable all model switching for this task
-
 model_schedule:
-  poll_interval_seconds: 15   # how often to check git log
+  poll_interval_seconds: 15
   rules:
-    # Use fast Haiku for phases 1–2 (scaffolding / boilerplate).
+    # Haiku for early scaffolding (phases 1–2)
     - triggers:
         - phase_gte: 1
           phase_lte: 2
       action:
         model_id: claude-haiku-4-5-20251001
-        message: "Fast Haiku for early scaffolding phases"
+        message: "Haiku for early scaffolding"
 
-    # Switch to capable Sonnet from phase 3 onwards (complex logic).
+    # Sonnet from phase 3 onwards (complex logic)
     - triggers:
         - phase_gte: 3
       action:
         model_id: claude-sonnet-4-6
-        message: "Sonnet for complex implementation phases"
+        message: "Sonnet for complex logic"
 
-    # Also switch to Sonnet if context is nearly full regardless of phase.
+    # Also switch if context is nearly full regardless of phase
     - triggers:
         - token_pct_gte: 0.85
       action:
         model_id: claude-sonnet-4-6
-        message: "Context nearly full — switching to Sonnet"
+        message: "Context nearly full"
 ```
 
 ### Trigger conditions
 
-Each `Trigger` entry supports four optional conditions; all present conditions
-must be satisfied simultaneously (AND logic).  Multiple triggers in one rule
-use OR logic — the rule fires when any one matches.
+Multiple triggers within one rule use **OR** logic.
+Multiple conditions within one trigger use **AND** logic.
 
-| Field | Type | Description |
+| Field | Type | Meaning |
 |---|---|---|
-| `phase_gte` | int | Current phase ≥ this value |
-| `phase_lte` | int | Current phase ≤ this value |
-| `token_pct_gte` | float 0–1 | Context utilisation ≥ this fraction |
-| `token_pct_lte` | float 0–1 | Context utilisation ≤ this fraction |
+| `phase_gte` | int | Current phase ≥ value |
+| `phase_lte` | int | Current phase ≤ value |
+| `token_pct_gte` | float 0–1 | Context utilisation ≥ fraction |
+| `token_pct_lte` | float 0–1 | Context utilisation ≤ fraction |
 
-### `marathon_mode` (marathon runway)
-
-Set `marathon_mode: true` to select the **marathon** runway — disables the
-entire model-switching subsystem: no ModelWatchdog, no model changes.  The
-runner uses a single model for the full session and is designed to survive
-server restarts, API outages, and long unattended runs without intervention.
-
-Omit (or set `false`) to use the **dash** runway with phase-aware switching.
-
-### Notification
-
-A `model_switch` event fires whenever a rule triggers.  Add it to `notify.on`
-to receive desktop/webhook alerts when the model changes:
+### Model switch notification
 
 ```yaml
 notify:
   on: [start, complete, error, model_switch]
-  channels:
-    - type: desktop
 ```
 
 ---
 
-## Context Length Management
-
-Claude Code conversations grow with every tool call, file read, and assistant message. When the accumulated token count approaches the model's context window, the quality of responses degrades and the API eventually returns a `context_length_exceeded` error.
-
-claude-runner tracks approximate token usage by counting characters in the raw conversation stream and applying a conservative characters-per-token estimate. When usage crosses the configured threshold (default: 80% of the model's context window), it applies the strategy from `context_strategy` in the project book:
-
-| Strategy | Token cost | Reliability |
-|---|---|---|
-| `continue` | Minimal | Good for short tasks or tasks with a clear continuation point |
-| `restate` | Low | Better for multi-step tasks where Claude may drift |
-| `summarize` | Medium | Best for very long tasks; uses an extra API call to distill progress |
-
-The threshold and estimation parameters are configurable:
+## Project Book Reference
 
 ```yaml
-context:
-  warning_threshold_pct: 80   # Trigger at 80% of window
-  chars_per_token: 4           # Used for approximate counting
-  default_strategy: restate
+# ── Required ──────────────────────────────────────────────────────────────
+
+name: my-task                    # short identifier, used on the CLI
+prompt: |
+  Full task description here.
+  Print ##RUNNER:COMPLETE## when finished.
+
+# ── Optional identity ─────────────────────────────────────────────────────
+
+description: "One-line summary shown in status output."
+
+# Injected into the resume prompt after rate-limit pauses / context trims.
+# Use to keep Claude oriented on very long tasks.
+context_anchors: |
+  Key decisions: X over Y because Z.
+
+# ── Feature machine ───────────────────────────────────────────────────────
+
+# Runway: false (default) = dash, true = marathon
+marathon_mode: false
+
+# Protocol: omit = universal, set = cccs
+cccs:
+  preset: cccs-v1.0              # built-in preset name
+  profile: scisim                # scisim | engineering
+  enabled: true                  # false = revert to universal temporarily
+
+# Phase-aware model schedule (dash runway only — ignored when marathon_mode: true)
+model_schedule:
+  poll_interval_seconds: 15
+  rules:
+    - triggers:
+        - phase_gte: 2
+      action:
+        model_id: claude-sonnet-4-6
+        message: "Switch to Sonnet from phase 2"
+
+# ── Sandbox ───────────────────────────────────────────────────────────────
+
+sandbox:
+  backend: docker                # auto | docker | native
+  working_dir: C:/Projects/my-app
+
+  # Host paths exposed inside the container as read-only bind mounts
+  readonly_mounts:
+    - host_path: C:/Shared/libs
+      mount_as: /mnt/libs
+
+  # Network control (docker only)
+  network:
+    disabled: false              # true = no outbound network
+    allow: []                    # allowlist when disabled: false
+
+  # Environment variables injected into the sandbox
+  env:
+    NODE_ENV: test
+    LOG_LEVEL: debug
+
+  # Allow Claude to modify the runner's own source (use with care)
+  allow_self_modification: false
+
+# ── Execution ─────────────────────────────────────────────────────────────
+
+execution:
+  timeout_hours: 4               # wall-clock limit (0 = no limit)
+  max_rate_limit_waits: 20       # consecutive rate limits before failing
+  skip_permissions: false        # pass --dangerously-skip-permissions
+
+  # Resume strategy after interruption: continue | restate | summarize
+  resume_strategy: restate
+
+  # Abort if Claude produces no output for this many minutes
+  silence_timeout_minutes: 10
+
+  # Named milestones — logged and notified when detected in Claude's output
+  milestones:
+    - pattern: "Phase 1 complete"
+      message: "Phase 1 done"
+
+  # Context window management
+  context:
+    checkpoint_threshold_tokens: 80000
+
+# ── Output ────────────────────────────────────────────────────────────────
+
+output:
+  git:
+    enabled: true
+    auto_push: false             # push to remote on completion
+    remote_url: https://github.com/my-org/my-app.git
+    branch: main
+
+# ── Notifications ─────────────────────────────────────────────────────────
+
+notify:
+  on: [start, complete, error, rate_limit, model_switch]
+  channels:
+    - type: desktop
+    - type: webhook
+      url: https://ntfy.sh/my-topic
+    - type: email
+      to: you@gmail.com
+
+# ── Acceptance criteria ───────────────────────────────────────────────────
+
+acceptance_criteria:
+  on_failure: retry              # retry | fail | notify
+  max_retries: 2
+  checks:
+    - type: file_exists
+      path: output/results.csv
+    - type: file_contains
+      path: output/results.csv
+      pattern: "convergence"
+    - type: command_succeeds
+      command: dotnet test
 ```
 
-Trimming events are logged and included in the final run summary. By default they do not trigger notifications; enable them by setting `on_context_trim` in the routing table.
+---
+
+## CLI Reference
+
+| Command | Description |
+|---|---|
+| `run <project>` | Start a project run.  `<project>` is a YAML path or a name matched against `projects/*.yaml`. |
+| `run <project> --dry-run` | Validate the project book and print the prompt without starting Claude. |
+| `validate <project>` | Validate a project book's YAML schema.  Exits 0 on success. |
+| `status` | Show all active and recently completed runs. |
+| `status <project>` | Detailed status for a single run. |
+| `abort <project>` | Gracefully stop a running project (SIGTERM). |
+| `abort <project> --force` | Kill immediately (SIGKILL). |
+| `logs <project>` | Stream the live log or print the saved log. |
+| `logs <project> --tail 50` | Last 50 lines only. |
+| `configure` | Interactive setup wizard. |
+| `configure --show` | Print current configuration (API key masked). |
+| `docker pull` | Pull the latest claude-runner Docker base image. |
+| `docker build` | Rebuild the local Docker image from `docker/Dockerfile`. |
+| `docker prune` | Remove stopped containers and dangling images. |
+| `marathon start` | Start the persistent marathon daemon. |
+| `marathon stop` | Stop the marathon daemon. |
+
+---
+
+## Sandbox Modes
+
+### Docker *(recommended)*
+
+Each run gets a fresh container.  The host filesystem is not mounted.  Network
+access is configurable per project.
+
+**When to use:** untrusted codebases, tasks that install system packages,
+production pipelines, any situation requiring a clean reproducible environment.
+
+**How it works:**
+1. Builds or pulls `claude-runner-base:latest`.
+2. Starts a container with env vars injected and `working_dir` bind-mounted.
+3. Launches Claude Code inside the container.
+4. On completion, logs are extracted and the container is stopped.
+
+### Native
+
+Runs Claude Code directly on the host.  Working directory is on the host
+filesystem.
+
+**When to use:** rapid iteration on trusted projects, environments without
+Docker, tasks that need host GPU or licensed software.
+
+**Caveat:** Claude Code has full access to your host filesystem and network.
+
+---
+
+## Notifications
+
+Three channels: **desktop** (Windows toast), **ntfy.sh** (free push,
+recommended), **email** (SMTP).
+
+```yaml
+notify:
+  on: [start, complete, error, rate_limit, model_switch]
+  channels:
+    - type: desktop
+    - type: webhook
+      url: https://ntfy.sh/your-topic
+    - type: email
+      to: you@gmail.com
+```
+
+### ntfy.sh setup (30 seconds)
+
+1. Install the [ntfy app](https://ntfy.sh) (iOS / Android) or open ntfy.sh in
+   your browser.
+2. Subscribe to a private topic name (treat it like a password — anyone who
+   knows it can send you messages).
+3. Run `claude-runner configure` → select ntfy → enter topic → test
+   notification fires immediately.
+
+### Event reference
+
+| Event | When it fires |
+|---|---|
+| `start` | Session launched |
+| `complete` | `##RUNNER:COMPLETE##` detected |
+| `error` | Unrecoverable failure |
+| `rate_limit` | API rate limit hit |
+| `model_switch` | ModelWatchdog fired (dash runway) |
+
+---
+
+## Acceptance Criteria
+
+After `##RUNNER:COMPLETE##` is detected, claude-runner can run a set of
+checks to verify the output.  On failure it retries, notifies, or fails the
+run per `on_failure`.
+
+```yaml
+acceptance_criteria:
+  on_failure: retry              # retry | fail | notify
+  max_retries: 2
+  checks:
+    - type: file_exists
+      path: results.csv
+
+    - type: file_contains
+      path: results.csv
+      pattern: "MCSE"
+
+    - type: command_succeeds
+      command: dotnet test PrisonersDilemma.csproj
+```
+
+| Check type | Required fields | Passes when |
+|---|---|---|
+| `file_exists` | `path` | File exists in working dir |
+| `file_contains` | `path`, `pattern` | File content matches pattern (regex) |
+| `command_succeeds` | `command` | Shell command exits 0 |
 
 ---
 
 ## Configuration
 
-The global configuration file lives at `~/.claude-runner/config.yaml`. It is created by `claude-runner configure` and can also be edited by hand.
+`~/.claude-runner/config.yaml` — written by `claude-runner configure`,
+editable by hand.  Secrets (API key, SMTP password, ntfy URL) are stored
+separately in `secrets.yaml` or Windows Credential Manager and never appear
+here.
 
 ```yaml
-# ~/.claude-runner/config.yaml
+# Authentication
+# API key — can also be set via ANTHROPIC_API_KEY env var.
+# Omit if using Claude.ai OAuth (detected automatically from ~/.claude/).
+api_key: ""
 
-# Anthropic API key. Can also be set via the ANTHROPIC_API_KEY env var.
-api_key: "sk-ant-..."
+# Sandbox
+sandbox_backend: docker          # docker | native
 
-# Default sandbox mode for all projects unless overridden in the project book.
-# Options: docker | native
-sandbox:
-  default: docker
+# Docker settings
+docker_base_image: claude-runner-base:latest
+docker_socket: "npipe:////./pipe/docker_engine"
 
-  # Docker-specific settings
-  docker:
-    # Base image to use for sandboxed runs.
-    image: claude-runner-base:latest
-    # Remove the container after each run (set false to inspect failed runs).
-    auto_remove: true
-    # Keep the container alive on error for post-mortem debugging.
-    keep_on_error: false
-    # Memory limit passed to `docker run --memory`.
-    memory_limit: "4g"
-    # CPU limit passed to `docker run --cpus`.
-    cpu_limit: "2.0"
-    # Disable network access inside the container.
-    # Useful when the task must not make outbound requests.
-    network_disabled: false
+# Session behaviour
+resume_strategy: continue        # continue | restate | summarize
+max_rate_limit_waits: 20
 
-# Context length management defaults (can be overridden per project book).
-context:
-  warning_threshold_pct: 80
-  chars_per_token: 4
-  default_strategy: continue
+# UI
+tui: true                        # false = plain log lines (CI-friendly)
 
-# Rate limit defaults (can be overridden per project book).
-rate_limit:
-  default_strategy: continue
-  max_backoff_seconds: 1800
+# Feature defaults — project books always override these
+cccs_enabled: false              # enable cccs protocol for all projects by default
+marathon_mode_default: false     # enable marathon runway for all projects by default
 
-# Notification channel configuration.
-notifications:
-  desktop:
-    enabled: true
+# Marathon daemon
+marathon:
+  enabled: false
+  poll_interval_minutes: 5
 
-  email:
-    enabled: false
-    smtp_host: smtp.gmail.com
-    smtp_port: 587
-    smtp_starttls: true
-    username: ""
-    password: ""          # Or set CLAUDE_RUNNER_SMTP_PASSWORD env var.
-    from_address: ""
-    to_addresses: []
-
-  webhook:
-    enabled: false
-    url: ""
-    method: POST
-    headers: {}
-    body_template: ""
-
-  # Override which events trigger which channels.
-  routing:
-    on_complete:
-      desktop: true
-      email: false
-      webhook: false
-    on_error:
-      desktop: true
-      email: true
-      webhook: false
-    on_rate_limit:
-      desktop: true
-      email: false
-      webhook: false
-    on_abort:
-      desktop: true
-      email: false
-      webhook: false
-    on_timeout:
-      desktop: true
-      email: true
-      webhook: false
-    on_context_trim:
-      desktop: false
-      email: false
-      webhook: false
-
-# Directory where run logs are stored.
-# Defaults to ~/.claude-runner/logs/
-log_dir: ""
-
-# Log retention in days. Logs older than this are pruned on startup.
-# Set to 0 to disable pruning.
-log_retention_days: 30
+# Storage (defaults shown — empty string uses default location)
+log_dir: ""                      # default: ~/.claude-runner/logs/
+state_dir: ""                    # default: ~/.claude-runner/state/
 ```
-
----
-
-## Requirements
-
-| Requirement | Minimum version | Notes |
-|---|---|---|
-| Python | 3.11 | Only needed when installing from source. Not required for the .exe. |
-| Claude Code CLI | Latest | Must be installed and authenticated before running claude-runner. Install with `npm install -g @anthropic-ai/claude-code`. |
-| Node.js | 18 LTS | Required by Claude Code CLI. |
-| Docker Desktop | 4.x | Required for `sandbox: docker` mode only. Must be running when claude-runner starts. |
-| Windows | 10 or 11 (64-bit) | The pre-built .exe targets Windows only. Source installation works on macOS and Linux with `sandbox: native`. |
-
-**Verifying the Claude Code CLI:**
-
-```cmd
-claude --version
-claude auth status
-```
-
-Both commands must succeed before running claude-runner. If `claude auth status` shows unauthenticated, run `claude auth login`.
 
 ---
 
 ## Development
 
-### Install from source
+### Install
 
 ```cmd
 git clone https://github.com/LunaticSodium/ClaudeRunner.git
-cd claude-runner
-python -m venv .venv
-.venv\Scripts\activate
+cd ClaudeRunner/claude-runner
+python -m venv .venv && .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-The `[dev]` extra installs `pytest`, `pytest-asyncio`, `ruff`, `mypy`, and `pyinstaller`.
-
-### Run tests
+### Tests
 
 ```cmd
-pytest tests/
+pytest tests/                    # all 407 tests
+pytest tests/ -k cccs            # CCCS parser (32 tests)
+pytest tests/ -k watchdog        # ModelWatchdog (23 tests)
+pytest tests/ -k configure       # configure wizard (15 tests)
 ```
 
-Individual test suites:
-
-```cmd
-pytest tests/unit/          # fast, no Docker required
-pytest tests/integration/   # requires Docker Desktop running
-pytest tests/e2e/           # requires Docker + a valid ANTHROPIC_API_KEY
-```
-
-### Lint and type-check
+### Lint / type-check
 
 ```cmd
 ruff check claude_runner/
 mypy claude_runner/
 ```
 
-### Build the executable
+### Build exe
 
 ```cmd
 python build_exe.py --clean
-```
-
-The output is `dist/claude-runner.exe`. See `build_exe.py --help` for options.
-
-Alternatively, use the spec file directly:
-
-```cmd
-pyinstaller claude-runner.spec
+# output: dist/claude-runner.exe
 ```
 
 ### Project layout
 
 ```
 claude-runner/
-  claude_runner/          Python package
-    main.py               Entry point (also used by PyInstaller)
-    cli.py                Click command definitions
-    runner.py             Core orchestration loop
-    config.py             Config loading and validation
-    project.py            Project book schema (Pydantic)
-    model_watchdog.py     Phase-aware model-switch background thread
-    cccs_parser.py        CCCS preset loader and CLAUDE.md renderer
+  claude_runner/
+    main.py                CLI entry point (Click)
+    runner.py              Core orchestration loop
+    config.py              Config loading (config.yaml + secrets)
+    project.py             Project book schema (Pydantic)
+    model_watchdog.py      Phase-aware model-switch background thread
+    cccs_parser.py         CCCS preset loader and CLAUDE.md renderer
+    context_manager.py     Token counting and context trimming
+    acceptance_runner.py   Post-completion acceptance checks
+    persistence.py         Task state and checkpoint management
+    notify.py              Notification dispatch
+    ntfy_client.py         ntfy.sh client
+    rate_limit.py          Rate-limit detection and backoff
+    tui.py                 Rich terminal UI
+    daemon.py              Marathon persistent daemon
+    autostart.py           Windows Task Scheduler registration
+    pipeline.py            Inbound message pipeline
+    git_inbox.py           Git-based message injection
+    sandbox/
+      docker_sandbox.py
+      native_sandbox.py
     presets/
       cccs-v1.0.cccs.toml  Bundled C# scientific simulation standard
-    sandbox/
-      docker_sandbox.py   Docker-based isolation
-      native_sandbox.py   Host-based execution
-    rate_limit.py         Rate-limit detection and backoff
-    notifications/
-      desktop.py          plyer desktop toasts
-      email.py            SMTP notifications
-      webhook.py          HTTP webhook dispatch
-    context.py            Token counting and trimming
-    status.py             Run status tracking
-    logs.py               Log streaming and storage
-  projects/               Bundled example project books
+  docs/
+    CCCS_SPEC.md           CCCS parser implementation specification
+  projects/
+    examples.yaml          Furina ASCII art (example task)
+    self-test.yaml         Runner self-diagnostic
+  tests/                   407 tests
   docker/
-    Dockerfile            Base image definition
-  assets/
-    claude-runner.ico     Application icon
-  tests/
-  build_exe.py            PyInstaller build script
-  claude-runner.spec      PyInstaller spec file
+    Dockerfile
+  watchdog.py              Standalone process watchdog (restart on crash)
+  build_exe.py
   pyproject.toml
-  README.md
 ```
 
 ### Contributing
@@ -935,4 +680,4 @@ claude-runner/
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for the full text.
+MIT License.  See [LICENSE](LICENSE) for the full text.
