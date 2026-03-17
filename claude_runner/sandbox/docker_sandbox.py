@@ -452,6 +452,7 @@ class DockerSandbox:
         prompt: str,
         on_line: Callable[[str], None],
         on_exit: Callable[[int], None],
+        model_id: Optional[str] = None,
     ) -> _DockerClaudeProcess:
         """
         Launch Claude Code inside the running container.
@@ -485,6 +486,10 @@ class DockerSandbox:
         exec_env: dict = {"CLAUDE_TASK_PROMPT": prompt}
         if self._api_key != _OAUTH_SENTINEL:
             exec_env["ANTHROPIC_API_KEY"] = self._api_key
+        if model_id:
+            exec_env["ANTHROPIC_MODEL"] = model_id
+            exec_env["CLAUDE_CODE_SUBAGENT_MODEL"] = model_id
+            logger.info("Model override active: %s", model_id)
 
         exec_id = self._client.api.exec_create(
             self._container.id,

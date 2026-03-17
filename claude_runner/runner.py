@@ -325,6 +325,15 @@ class TaskRunner:
         # None means no file was found or it was empty.
         self._claude_md_content: Optional[str] = None
 
+        # Phase-aware model switching state.
+        # _model_override is set by the ModelWatchdog apply_fn and consumed on the
+        # next launch_claude() call.  None means "use the default model".
+        self._model_override: Optional[str] = None
+        self._model_watchdog = None  # ModelWatchdog instance, started in _run_inner
+        # asyncio events for model switch — initialised in _initialise().
+        self._model_switch_event: Optional[asyncio.Event] = None
+        self._model_switch_reason: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Secrets config loader
     # ------------------------------------------------------------------
@@ -450,6 +459,12 @@ class TaskRunner:
         # --- Progress log --------------------------------------------------
         self._init_progress_log()
 
+        # --- CLAUDE.md phase contract injection ----------------------------
+        # Writes the phase-commit contract block before reading CLAUDE.md so
+        # the injected content is always picked up by _read_claude_md().
+        # Skipped when marathon_mode is True or no model_schedule is configured.
+        self._inject_claude_md_phase_contract()
+
         # --- CLAUDE.md injection -------------------------------------------
         self._claude_md_content = self._read_claude_md()
 
@@ -508,6 +523,12 @@ class TaskRunner:
         self._runner_complete_event = asyncio.Event()
         self._runner_error_event = asyncio.Event()
 
+        # Model-switch event — set by the ModelWatchdog apply_fn (from its
+        # background thread) when a rule fires.  Handled in the main loop by
+        # stopping the current Claude process and re-launching with the new model.
+        self._model_switch_event = asyncio.Event()
+        self._model_switch_reason: Optional[str] = None
+
         self._loop = asyncio.get_event_loop()
 
         def _on_rate_limit_detected(reset_at: datetime) -> None:
@@ -551,6 +572,14 @@ class TaskRunner:
             self._silence_watchdog(silence_timeout_s)
         )
 
+        # --- Start ModelWatchdog if model_schedule is configured ----------
+        marathon_mode = getattr(self._book, "marathon_mode", False)
+        model_schedule = getattr(self._book, "model_schedule", None)
+        if not marathon_mode and model_schedule is not None:
+            self._model_watchdog = self._create_model_watchdog(model_schedule)
+            if self._model_watchdog is not None:
+                self._model_watchdog.start()
+
         # --- Build initial prompt -----------------------------------------
         initial_prompt = self._build_initial_prompt()
         # Store only the decorated portion (RUNNER_PROTOCOL + anchors + task prompt,
@@ -569,12 +598,16 @@ class TaskRunner:
         await self._dispatch("start", {"task": self._book.name})
 
         # --- Launch Claude Code -------------------------------------------
-        logger.info("[ACTION] Launching Claude Code subprocess.")
+        if self._model_override:
+            logger.info("[ACTION] Launching Claude Code with model override: %s", self._model_override)
+        else:
+            logger.info("[ACTION] Launching Claude Code subprocess.")
         self._process = await _maybe_await(
             self._sandbox.launch_claude,
             prompt=initial_prompt,
             on_line=self._on_output_line,
             on_exit=None,  # exit handled via process.wait() below
+            model_id=self._model_override,
         )
 
         # Wire checkpoint callback now that the process handle is available.
@@ -629,20 +662,25 @@ class TaskRunner:
             rl_task = asyncio.ensure_future(self._rate_limit_event.wait())
             rc_task = asyncio.ensure_future(self._runner_complete_event.wait())
             re_task = asyncio.ensure_future(self._runner_error_event.wait())
+            ms_task = asyncio.ensure_future(self._model_switch_event.wait()) \
+                if self._model_switch_event is not None \
+                else asyncio.ensure_future(asyncio.sleep(3600))  # never fires
+
+            all_tasks = {done_task, rl_task, rc_task, re_task, ms_task}
 
             try:
                 finished, pending = await asyncio.wait(
-                    {done_task, rl_task, rc_task, re_task},
+                    all_tasks,
                     timeout=min(remaining_s, _STATE_CHECKPOINT_INTERVAL_S),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
             except Exception:
-                for t in (done_task, rl_task, rc_task, re_task):
+                for t in all_tasks:
                     t.cancel()
                 raise
 
             # Cancel whichever futures are still pending.
-            for t in (done_task, rl_task, rc_task, re_task):
+            for t in all_tasks:
                 if not t.done():
                     t.cancel()
 
@@ -703,6 +741,15 @@ class TaskRunner:
                     self._fault_log.append(f"[ERROR] {msg}")
                     await self._dispatch("error", {"error": msg, "task": self._book.name})
                     return self._make_result("failed", error_message=msg)
+
+            elif ms_task in finished:
+                # Model-switch event: watchdog fired a rule.  Checkpoint, stop the
+                # current process, and re-launch with the new model.
+                self._model_switch_event.clear()
+                result = await self._handle_model_switch(resume_strategy=resume_strategy)
+                if result is not None:
+                    return result
+                continue
 
             elif rl_task in finished:
                 # Rate-limit event detected (not a runner marker).
@@ -822,6 +869,157 @@ class TaskRunner:
         self._drain_inbox()
 
         return None  # Success — caller continues the monitoring loop.
+
+    # ------------------------------------------------------------------
+    # Model-switch handler
+    # ------------------------------------------------------------------
+
+    async def _handle_model_switch(self, resume_strategy: str) -> Optional[TaskResult]:
+        """
+        Handle a model-switch event fired by the ModelWatchdog.
+
+        Stops the current Claude Code process, checkpoints context, re-launches
+        with the new model (stored in self._model_override), and dispatches a
+        ``model_switch`` notification.
+
+        Returns None on success (caller should continue the monitoring loop),
+        or a TaskResult if the re-launch fails.
+        """
+        new_model = self._model_override
+        reason = self._model_switch_reason or f"Model switched to {new_model}"
+        logger.info(
+            "[MODEL SWITCH] Switching to model=%r  reason=%r", new_model, reason
+        )
+
+        # --- Checkpoint context before stopping the process ---------------
+        try:
+            self._context_manager.inject_checkpoint()
+        except Exception as exc:
+            logger.warning("Model switch: checkpoint injection failed: %s", exc)
+
+        # --- Stop the current process -------------------------------------
+        if self._process is not None:
+            try:
+                if hasattr(self._process, "is_alive") and self._process.is_alive():
+                    if hasattr(self._process, "terminate"):
+                        self._process.terminate()
+                    elif hasattr(self._process, "stop"):
+                        self._process.stop()
+                    # Give the process a moment to terminate gracefully.
+                    await asyncio.sleep(1.0)
+            except Exception as exc:
+                logger.warning("Model switch: error stopping current process: %s", exc)
+            self._process = None
+
+        # Reset protocol-marker events for the new session.
+        if self._runner_complete_event is not None:
+            self._runner_complete_event.clear()
+        if self._runner_error_event is not None:
+            self._runner_error_event.clear()
+        if self._rate_detector is not None:
+            self._rate_detector.reset()
+
+        # --- Dispatch model_switch notification ---------------------------
+        await self._dispatch(
+            "model_switch",
+            {
+                "task": self._book.name,
+                "new_model": new_model,
+                "reason": reason,
+                "phase": self._model_watchdog.current_phase if self._model_watchdog else 0,
+            },
+        )
+
+        # --- Log to progress log ------------------------------------------
+        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _switch_entry = f"[{ts}] [DECISION] Model switched to {new_model}: {reason}\n"
+        try:
+            log_path = (
+                self._context_manager.progress_log_path
+                if self._context_manager is not None else None
+            )
+            if log_path is not None and log_path.exists():
+                with log_path.open("a", encoding="utf-8") as _fh:
+                    _fh.write(_switch_entry)
+        except Exception:
+            pass
+
+        # --- Build resume prompt ------------------------------------------
+        resume_prompt = self._context_manager.build_resume_prompt(
+            base_resume=(
+                f"You have been switched to model {new_model}. "
+                "Continue the task from where you left off."
+            ),
+            strategy=resume_strategy,
+        )
+
+        # --- Re-launch with new model -------------------------------------
+        try:
+            self._process = await _maybe_await(
+                self._sandbox.launch_claude,
+                prompt=resume_prompt,
+                on_line=self._on_output_line,
+                on_exit=None,
+                model_id=self._model_override,
+            )
+        except Exception as exc:
+            msg = f"Model switch: failed to re-launch Claude Code: {exc}"
+            logger.error(msg)
+            self._fault_log.append(f"[ERROR] {msg}")
+            return self._make_result("failed", error_message=msg)
+
+        self._context_manager.set_on_inject_checkpoint(self._send_to_process)
+        self._context_manager.count_input(resume_prompt)
+        self._persistence.save(self._make_state("running"))
+        logger.info("[MODEL SWITCH] Re-launched with model=%r.", new_model)
+        return None  # Continue the monitoring loop.
+
+    # ------------------------------------------------------------------
+    # ModelWatchdog factory
+    # ------------------------------------------------------------------
+
+    def _create_model_watchdog(self, model_schedule):
+        """
+        Build and return a ModelWatchdog for the given ModelSchedule, or None
+        if the working directory is unavailable.
+        """
+        from .model_watchdog import ModelWatchdog  # noqa: PLC0415
+
+        try:
+            working_dir = self._working_dir()
+        except Exception as exc:
+            logger.warning("ModelWatchdog skipped: cannot resolve working dir: %s", exc)
+            return None
+
+        loop = self._loop
+
+        def _apply_fn(model_id: str, reason: str) -> None:
+            """Called from the watchdog thread — must be thread-safe."""
+            self._model_override = model_id
+            self._model_switch_reason = reason
+            logger.info(
+                "[ModelWatchdog] Queued model switch → %s  (%s)", model_id, reason
+            )
+            if loop is not None and self._model_switch_event is not None:
+                loop.call_soon_threadsafe(self._model_switch_event.set)
+
+        token_threshold = (
+            self._context_manager.threshold_tokens
+            if self._context_manager is not None else 150_000
+        )
+
+        def _get_token_pct() -> float:
+            if self._context_manager is None or token_threshold <= 0:
+                return 0.0
+            return min(self._context_manager.estimated_tokens / token_threshold, 1.0)
+
+        return ModelWatchdog(
+            working_dir=working_dir,
+            rules=model_schedule.rules,
+            apply_fn=_apply_fn,
+            poll_interval=model_schedule.poll_interval_seconds,
+            get_token_pct=_get_token_pct,
+        )
 
     # ------------------------------------------------------------------
     # Completion handler
@@ -1455,6 +1653,78 @@ class TaskRunner:
             logger.warning(warn)
             self._fault_log.append(f"[WARN] {warn}")
 
+    # Phase-contract marker so we never double-inject across reruns.
+    _PHASE_CONTRACT_MARKER = "<!-- BEGIN claude-runner phase contract"
+
+    def _inject_claude_md_phase_contract(self) -> None:
+        """
+        Append the phase-commit contract block to <working_dir>/.claude/CLAUDE.md.
+
+        The block instructs Claude Code to prefix significant milestone commits
+        with ``PHASE-{N}: `` so that the ModelWatchdog can detect progress.
+
+        Silently skipped when:
+        - ``marathon_mode`` is True on the project book.
+        - No ``model_schedule`` is configured.
+        - The block marker is already present (idempotent — safe on resume).
+        - The working directory is unavailable.
+        """
+        if getattr(self._book, "marathon_mode", False):
+            return
+        if getattr(self._book, "model_schedule", None) is None:
+            return
+
+        try:
+            wd = self._working_dir()
+        except Exception:
+            return
+
+        claude_dir = wd / ".claude"
+        try:
+            claude_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create .claude/ for CLAUDE.md injection: %s", exc)
+            return
+
+        claude_md = claude_dir / "CLAUDE.md"
+
+        # Read existing content (if any) and check for our marker.
+        existing = ""
+        if claude_md.exists():
+            try:
+                existing = claude_md.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
+        if self._PHASE_CONTRACT_MARKER in existing:
+            logger.debug("CLAUDE.md phase contract already present — skipping injection.")
+            return
+
+        contract_block = (
+            "\n"
+            "<!-- BEGIN claude-runner phase contract — do not remove -->\n"
+            "## Phase Contract (claude-runner)\n\n"
+            "This session is managed by **claude-runner** with phase-aware model scheduling.\n\n"
+            "**Required**: when you complete a significant phase of work, prefix your git commit\n"
+            "message with `PHASE-{N}: ` where N is the phase number (integer ≥ 1).  For example:\n\n"
+            "    git commit -m \"PHASE-1: environment bootstrap complete\"\n"
+            "    git commit -m \"PHASE-3: all strategies implemented\"\n\n"
+            "The runner monitors your commit history to track progress and may switch the active\n"
+            "model between phases to balance speed and capability.  You do not need to do anything\n"
+            "else — just include the `PHASE-{N}:` prefix in commits that mark phase transitions.\n"
+            "<!-- END claude-runner phase contract -->\n"
+        )
+
+        try:
+            with claude_md.open("a", encoding="utf-8") as fh:
+                fh.write(contract_block)
+            logger.info(
+                "[ACTION] Phase contract appended to CLAUDE.md (%d chars added).",
+                len(contract_block),
+            )
+        except OSError as exc:
+            logger.warning("Could not write phase contract to CLAUDE.md: %s", exc)
+
     def _read_claude_md(self) -> Optional[str]:
         """
         Read <working_dir>/.claude/CLAUDE.md if it exists and is non-empty.
@@ -1666,6 +1936,15 @@ class TaskRunner:
 
     async def _cleanup(self) -> None:
         """Tear down resources unconditionally."""
+        # Stop the ModelWatchdog background thread before cancelling asyncio tasks
+        # so it doesn't try to fire apply_fn after the event loop is gone.
+        if self._model_watchdog is not None:
+            try:
+                self._model_watchdog.stop()
+            except Exception as exc:
+                logger.warning("Error stopping ModelWatchdog: %s", exc)
+            self._model_watchdog = None
+
         for task_attr in ("_checkpoint_task", "_silence_watchdog_task"):
             task = getattr(self, task_attr, None)
             if task is not None and not task.done():

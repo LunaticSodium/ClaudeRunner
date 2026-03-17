@@ -1,4 +1,4 @@
-# claude-runner
+# claude-runner  ·  v1.0
 
 ## Download
 
@@ -73,10 +73,11 @@ To view or delete stored credentials later:
 5. [Rate Limit Handling](#rate-limit-handling)
 6. [Notifications](#notifications)
 7. [Context Length Management](#context-length-management)
-8. [Configuration](#configuration)
-9. [Requirements](#requirements)
-10. [Development](#development)
-11. [License](#license)
+8. [Phase-Aware Model Switching](#phase-aware-model-switching)
+9. [Configuration](#configuration)
+10. [Requirements](#requirements)
+11. [Development](#development)
+12. [License](#license)
 
 ---
 
@@ -405,6 +406,99 @@ All defaults can be overridden in `config.yaml` under `notifications.routing` or
 
 ---
 
+## Phase-Aware Model Switching
+
+For long tasks with multiple distinct phases, claude-runner can automatically
+switch to a different model as the task progresses.  Expensive capability is
+applied only where it is actually needed, and faster/cheaper models handle
+routine scaffolding.
+
+### How it works
+
+1. **Phase contract** — when `model_schedule` is configured, claude-runner
+   injects a brief instruction block into `CLAUDE.md` before starting the
+   session.  The block tells Claude to prefix significant milestone commits
+   with `PHASE-{N}: ` (e.g. `PHASE-2: strategy classes implemented`).
+
+2. **ModelWatchdog** — a background thread polls `git log` every
+   `poll_interval_seconds` (default: 15 s) to detect the highest
+   `PHASE-{N}:` commit in the working directory.
+
+3. **Rule evaluation** — the watchdog evaluates each rule in `model_schedule.rules`
+   in order.  A rule fires when any of its `triggers` matches the current
+   phase number and/or context-window utilisation.  Each rule fires at most
+   once per session.
+
+4. **Model switch** — when a rule fires, the runner checkpoints context, stops
+   the current Claude Code process, and re-launches it with the new model set
+   via `ANTHROPIC_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` environment variables.
+   A resume prompt tells Claude to continue from where it left off.
+
+### Configuration
+
+```yaml
+marathon_mode: false   # set true to disable all model switching for this task
+
+model_schedule:
+  poll_interval_seconds: 15   # how often to check git log
+  rules:
+    # Use fast Haiku for phases 1–2 (scaffolding / boilerplate).
+    - triggers:
+        - phase_gte: 1
+          phase_lte: 2
+      action:
+        model_id: claude-haiku-4-5-20251001
+        message: "Fast Haiku for early scaffolding phases"
+
+    # Switch to capable Sonnet from phase 3 onwards (complex logic).
+    - triggers:
+        - phase_gte: 3
+      action:
+        model_id: claude-sonnet-4-6
+        message: "Sonnet for complex implementation phases"
+
+    # Also switch to Sonnet if context is nearly full regardless of phase.
+    - triggers:
+        - token_pct_gte: 0.85
+      action:
+        model_id: claude-sonnet-4-6
+        message: "Context nearly full — switching to Sonnet"
+```
+
+### Trigger conditions
+
+Each `Trigger` entry supports four optional conditions; all present conditions
+must be satisfied simultaneously (AND logic).  Multiple triggers in one rule
+use OR logic — the rule fires when any one matches.
+
+| Field | Type | Description |
+|---|---|---|
+| `phase_gte` | int | Current phase ≥ this value |
+| `phase_lte` | int | Current phase ≤ this value |
+| `token_pct_gte` | float 0–1 | Context utilisation ≥ this fraction |
+| `token_pct_lte` | float 0–1 | Context utilisation ≤ this fraction |
+
+### `marathon_mode`
+
+Set `marathon_mode: true` to disable the entire model-switching subsystem for
+a task — no CLAUDE.md injection, no ModelWatchdog, no model changes.  Use for
+very long unattended runs where model consistency matters more than cost
+optimisation, or when the task's git workflow doesn't use `PHASE-N:` commits.
+
+### Notification
+
+A `model_switch` event fires whenever a rule triggers.  Add it to `notify.on`
+to receive desktop/webhook alerts when the model changes:
+
+```yaml
+notify:
+  on: [start, complete, error, model_switch]
+  channels:
+    - type: desktop
+```
+
+---
+
 ## Context Length Management
 
 Claude Code conversations grow with every tool call, file read, and assistant message. When the accumulated token count approaches the model's context window, the quality of responses degrades and the API eventually returns a `context_length_exceeded` error.
@@ -612,6 +706,7 @@ claude-runner/
     runner.py             Core orchestration loop
     config.py             Config loading and validation
     project.py            Project book schema (Pydantic)
+    model_watchdog.py     Phase-aware model-switch background thread
     sandbox/
       docker_sandbox.py   Docker-based isolation
       native_sandbox.py   Host-based execution

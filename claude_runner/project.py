@@ -61,7 +61,127 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ResumeStrategy = Literal["continue", "restate", "summarize"]
-NotifyEvent = Literal["start", "rate_limit", "resume", "complete", "error"]
+NotifyEvent = Literal["start", "rate_limit", "resume", "complete", "error", "model_switch"]
+
+# ---------------------------------------------------------------------------
+# Model-schedule sub-models
+# ---------------------------------------------------------------------------
+
+
+class ModelAction(BaseModel):
+    """The model to switch to when a rule fires.
+
+    Attributes
+    ----------
+    model_id:
+        Anthropic model identifier, e.g. ``"claude-haiku-4-5-20251001"``.
+    message:
+        Optional human-readable explanation logged when the switch fires.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str = Field(..., description="Anthropic model ID to switch to.")
+    message: str | None = Field(
+        default=None,
+        description="Optional log/notification message emitted when this action fires.",
+    )
+
+
+class Trigger(BaseModel):
+    """Conditions that must ALL be satisfied for a PhaseRule to fire.
+
+    Phase and token conditions are evaluated together (AND logic).  A rule
+    with multiple Trigger entries fires when ANY trigger matches (OR logic).
+
+    Attributes
+    ----------
+    phase_gte:
+        Minimum phase number detected from git commit messages (inclusive).
+    phase_lte:
+        Maximum phase number (inclusive).
+    token_pct_gte:
+        Minimum context-window utilisation fraction (0.0 – 1.0, inclusive).
+    token_pct_lte:
+        Maximum context-window utilisation fraction (inclusive).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    phase_gte: int | None = Field(default=None, ge=0, description="Phase >= this value.")
+    phase_lte: int | None = Field(default=None, ge=0, description="Phase <= this value.")
+    token_pct_gte: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Context utilisation >= this fraction.",
+    )
+    token_pct_lte: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Context utilisation <= this fraction.",
+    )
+
+    def matches(self, phase: int, token_pct: float) -> bool:
+        """Return True when all non-None conditions are satisfied."""
+        if self.phase_gte is not None and phase < self.phase_gte:
+            return False
+        if self.phase_lte is not None and phase > self.phase_lte:
+            return False
+        if self.token_pct_gte is not None and token_pct < self.token_pct_gte:
+            return False
+        if self.token_pct_lte is not None and token_pct > self.token_pct_lte:
+            return False
+        return True
+
+
+class PhaseRule(BaseModel):
+    """A single model-switch rule: fire *action* when any *trigger* matches.
+
+    Attributes
+    ----------
+    triggers:
+        List of :class:`Trigger` objects evaluated with OR logic.  The rule
+        fires when at least one trigger matches the current phase/token state.
+    action:
+        The :class:`ModelAction` applied when the rule fires.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    triggers: list[Trigger] = Field(
+        ..., min_length=1, description="At least one trigger required."
+    )
+    action: ModelAction
+
+
+class ModelSchedule(BaseModel):
+    """Phase-aware model-switching schedule for a task.
+
+    The runner's background ModelWatchdog evaluates these rules against the
+    current phase (derived from ``PHASE-{N}:`` git commit prefixes) and context
+    utilisation.  When a rule fires, the model is switched on the next Claude
+    Code restart.
+
+    Attributes
+    ----------
+    rules:
+        Ordered list of :class:`PhaseRule` objects.  Each rule fires at most
+        once per session.  Rules are evaluated in list order.
+    poll_interval_seconds:
+        How often (seconds) the watchdog polls git log for phase advances.
+        Shorter intervals detect phase changes faster at the cost of more
+        subprocess spawns.  Default: 15 s.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rules: list[PhaseRule] = Field(
+        ..., min_length=1, description="At least one rule required."
+    )
+    poll_interval_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        description="Polling interval for git log phase detection (seconds).",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Sandbox sub-models
@@ -581,6 +701,24 @@ class ProjectBook(BaseModel):
             "sent to Claude Code: the initial prompt, every resume injection, and "
             "every context checkpoint prompt.  Write once here; claude-runner "
             "injects silently.  Does not appear in notifications or email content."
+        ),
+    )
+    marathon_mode: bool = Field(
+        default=False,
+        description=(
+            "When True, disables all phase-aware model-switching logic: "
+            "CLAUDE.md phase contract injection, ModelWatchdog, and all related "
+            "event handling are skipped.  Use for very long unattended runs where "
+            "model consistency is more important than cost optimisation."
+        ),
+    )
+    model_schedule: ModelSchedule | None = Field(
+        default=None,
+        description=(
+            "Phase-aware model-switching schedule.  When set (and marathon_mode is False), "
+            "the runner injects the phase contract into CLAUDE.md and starts a background "
+            "ModelWatchdog that switches models based on git commit phase markers and context "
+            "utilisation triggers.  Ignored when marathon_mode is True."
         ),
     )
     sandbox: SandboxConfig | None = Field(

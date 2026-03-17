@@ -1,0 +1,186 @@
+"""
+model_watchdog.py — Background thread that monitors git commit messages and
+triggers model switches when phase-aware rules match.
+
+Phase contract
+--------------
+Claude Code must prefix significant-milestone commit messages with
+``PHASE-{N}: `` (e.g. ``PHASE-2: strategy classes done``) so that the watchdog
+can detect the current phase from ``git log`` output.  The runner injects this
+contract into ``CLAUDE.md`` before launching Claude Code (unless
+``marathon_mode`` is True).
+
+The watchdog fires at most once per PhaseRule per session: once a rule's action
+is applied it is permanently suppressed for the remainder of the run.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Callable, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Matches "PHASE-N:" at the start of a git commit subject line (case-insensitive).
+_PHASE_RE = re.compile(r"^PHASE-(\d+):\s*", re.IGNORECASE)
+
+
+class ModelWatchdog:
+    """
+    Background thread that polls the working directory's git log to detect
+    phase advances and evaluate model-switch triggers.
+
+    Parameters
+    ----------
+    working_dir:
+        Host-side working directory where ``git log`` is run to detect phases.
+    rules:
+        List of :class:`PhaseRule` objects from ``model_schedule.rules``.
+        Each rule fires at most once per session.
+    apply_fn:
+        ``(model_id: str, reason: str) -> None``.  Called once per fired rule,
+        from the watchdog thread.  Implementations must be thread-safe.
+    poll_interval:
+        How often (seconds) to poll git log.  Defaults to 15 s.
+    get_token_pct:
+        Optional callable returning the current context-window utilisation as a
+        fraction in [0.0, 1.0].  Used to evaluate ``token_pct_gte`` /
+        ``token_pct_lte`` trigger conditions.  When ``None``, token-pct
+        conditions are treated as 0.0 (i.e. token-pct-gte > 0 never fires).
+    """
+
+    def __init__(
+        self,
+        working_dir: Path,
+        rules: List,  # list[PhaseRule] — avoids circular import at call site
+        apply_fn: Callable[[str, str], None],
+        poll_interval: float = 15.0,
+        get_token_pct: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self._working_dir = working_dir
+        self._rules = rules
+        self._apply_fn = apply_fn
+        self._poll_interval = poll_interval
+        self._get_token_pct = get_token_pct
+
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        # Indices of rules that have already fired — prevents re-firing.
+        self._fired: set[int] = set()
+
+        # Last detected phase number (0 = none yet).
+        self._current_phase: int = 0
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Start the background polling thread."""
+        self._thread = threading.Thread(
+            target=self._loop,
+            daemon=True,
+            name="model-watchdog",
+        )
+        self._thread.start()
+        logger.info(
+            "ModelWatchdog started (poll_interval=%.1fs, %d rule(s)).",
+            self._poll_interval,
+            len(self._rules),
+        )
+
+    def stop(self) -> None:
+        """Signal the background thread to stop and join it (up to 5 s)."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        logger.info("ModelWatchdog stopped (phase at stop: %d).", self._current_phase)
+
+    @property
+    def current_phase(self) -> int:
+        """Last detected phase number from git log.  0 = none detected yet."""
+        return self._current_phase
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception:  # noqa: BLE001
+                logger.exception("ModelWatchdog._tick() raised unexpectedly — continuing.")
+            self._stop_event.wait(timeout=self._poll_interval)
+
+    def _tick(self) -> None:
+        """One poll iteration: detect current phase and evaluate unfired rules."""
+        phase = self._read_current_phase()
+        self._current_phase = phase
+        token_pct = self._get_token_pct() if self._get_token_pct is not None else 0.0
+
+        for idx, rule in enumerate(self._rules):
+            if idx in self._fired:
+                continue
+            for trigger in rule.triggers:
+                if trigger.matches(phase=phase, token_pct=token_pct):
+                    self._fire(idx, rule)
+                    break  # only fire once per tick per rule
+
+    def _fire(self, idx: int, rule) -> None:
+        """Mark a rule as fired and invoke apply_fn."""
+        self._fired.add(idx)
+        action = rule.action
+        reason = action.message or f"PHASE-{self._current_phase}: rule {idx} triggered"
+        logger.info(
+            "[ModelWatchdog] Firing rule %d → model=%r  reason=%r",
+            idx,
+            action.model_id,
+            reason,
+        )
+        try:
+            self._apply_fn(action.model_id, reason)
+        except Exception:  # noqa: BLE001
+            logger.exception("ModelWatchdog apply_fn raised for rule %d", idx)
+
+    def _read_current_phase(self) -> int:
+        """Return the highest PHASE-N number found in the last 50 git commits.
+
+        Returns the previous value of ``self._current_phase`` on error so that
+        a transient git failure does not reset the detected phase.
+        """
+        git_dir = self._working_dir / ".git"
+        if not git_dir.exists():
+            return 0  # no repo yet; phase stays 0
+
+        try:
+            result = subprocess.run(
+                ["git", "log", "--oneline", "-50", "--format=%s"],
+                cwd=self._working_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return self._current_phase  # keep last known value on error
+
+        if result.returncode != 0:
+            return self._current_phase
+
+        highest = 0
+        for line in result.stdout.splitlines():
+            m = _PHASE_RE.match(line.strip())
+            if m:
+                n = int(m.group(1))
+                if n > highest:
+                    highest = n
+
+        # Never go backwards: if git history is rewritten or the working dir is
+        # replaced mid-session, preserve the highest phase we have ever seen.
+        return max(highest, 0)

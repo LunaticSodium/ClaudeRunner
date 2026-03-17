@@ -176,6 +176,7 @@ class NativeSandbox:
         prompt: str,
         on_line: Callable[[str], None],
         on_exit: Callable[[int], None],
+        model_id: Optional[str] = None,
     ) -> object:
         """
         Launch Claude Code as a local subprocess using ConPTY (via ClaudeProcess).
@@ -207,6 +208,12 @@ class NativeSandbox:
         cmd = self._build_command(prompt)
         working_dir = self.get_working_dir_path()
 
+        # Apply model override via env vars when requested.
+        run_env = self._env
+        if model_id:
+            run_env = {**self._env, "ANTHROPIC_MODEL": model_id, "CLAUDE_CODE_SUBAGENT_MODEL": model_id}
+            logger.info("Model override active: %s", model_id)
+
         logger.info(
             "Launching Claude (native/pipe): %s  [cwd=%s]",
             " ".join(cmd[:3]),  # omit the prompt from the log line
@@ -216,7 +223,7 @@ class NativeSandbox:
         self._process = PipeProcess(
             command=cmd,
             working_dir=working_dir,
-            env=self._env,
+            env=run_env,
             on_line=on_line,
             on_exit=on_exit,
             show_console=self._show_claude,
