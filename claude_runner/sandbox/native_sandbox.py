@@ -143,6 +143,29 @@ class NativeSandbox:
         if self._api_key != _OAUTH_SENTINEL:
             self._env["ANTHROPIC_API_KEY"] = self._api_key
 
+        # Claude Code on Windows requires git bash for shell operations.
+        # Probe common install locations and inject CLAUDE_CODE_GIT_BASH_PATH
+        # if it is not already set.  Without this, 'claude' exits with code 1
+        # and the message "Claude Code on Windows requires git-bash".
+        if "CLAUDE_CODE_GIT_BASH_PATH" not in self._env:
+            _bash_candidates = [
+                Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+                / "Git" / "usr" / "bin" / "bash.exe",
+                Path.home() / "AppData" / "Local" / "Programs"
+                / "Git" / "usr" / "bin" / "bash.exe",
+            ]
+            for _bash in _bash_candidates:
+                if _bash.exists():
+                    self._env["CLAUDE_CODE_GIT_BASH_PATH"] = str(_bash)
+                    logger.info("Auto-detected git bash: %s", _bash)
+                    break
+            else:
+                logger.warning(
+                    "git bash not found in common locations. "
+                    "Claude Code may fail on Windows. "
+                    "Set CLAUDE_CODE_GIT_BASH_PATH to your bash.exe path."
+                )
+
         # Ensure working directory exists.
         working_dir = self.get_working_dir_path()
         working_dir.mkdir(parents=True, exist_ok=True)

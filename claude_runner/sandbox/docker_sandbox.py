@@ -301,6 +301,8 @@ class DockerSandbox:
         # Note: if the access token expires mid-run Claude Code will attempt a
         # refresh but cannot persist the result; the task may fail after expiry.
         _using_oauth = (self._api_key == _OAUTH_SENTINEL)
+        # Extra Mount objects (tmpfs overlays); populated in the OAuth block.
+        extra_mounts: list = []
         if _using_oauth:
             # Mount ~/.claude.json read-only for authentication.
             claude_json = Path.home() / ".claude.json"
@@ -313,22 +315,51 @@ class DockerSandbox:
                     "Claude Code inside the container may fail to authenticate."
                 )
 
-            # Mount ~/.claude/ read-only for auth session tokens and settings.
-            # Claude Code reads OAuth session tokens from ~/.claude/sessions/.
+            # Mount ~/.claude/ read-only for auth session tokens and global config.
+            # Claude Code reads OAuth session tokens from ~/.claude/settings.json.
             claude_dir = Path.home() / ".claude"
             if claude_dir.exists():
+                # Pre-create the runtime-write subdirectories on the host so
+                # that they exist inside the read-only bind mount.  Docker
+                # requires the mountpoint directory to already exist when the
+                # parent mount is read-only; it cannot create it at container
+                # start time.  These directories are standard Claude Code state
+                # dirs; creating them is benign if they don't exist yet.
+                _runtime_subdirs = ["projects", "todos", "statsig", "__pycache__"]
+                for _subdir in _runtime_subdirs:
+                    (claude_dir / _subdir).mkdir(exist_ok=True)
+
                 volumes[str(claude_dir)] = {"bind": "/home/claude/.claude", "mode": "ro"}
                 logger.info("OAuth mode: mounted %s → /home/claude/.claude (read-only)", claude_dir)
 
-            # Overlay ~/.claude/projects/ with a fresh writable directory so
-            # Claude Code can write sub-agent task files and project state.
-            # Docker processes bind mounts in order; the projects/ overlay takes
-            # precedence over the read-only ~/.claude mount for that subdirectory.
-            working_dir_path = self.get_working_dir_path()
-            claude_projects_rw = working_dir_path / ".claude-rw" / "projects"
-            claude_projects_rw.mkdir(parents=True, exist_ok=True)
-            volumes[str(claude_projects_rw)] = {"bind": "/home/claude/.claude/projects", "mode": "rw"}
-            logger.info("OAuth mode: writable overlay → /home/claude/.claude/projects")
+            # Overlay tmpfs mounts on subdirectories that Claude Code writes to
+            # at runtime.  The parent ~/.claude bind mount remains read-only,
+            # preserving the auth-token / global-config security boundary.
+            # These tmpfs volumes are ephemeral: destroyed with the container.
+            #
+            # Subdirectories observed via `docker diff` on a running container:
+            #   projects/   — sub-agent task files, project-level session state
+            #   todos/      — Claude Code's internal todo tracking
+            #   statsig/    — feature-flag / telemetry cache
+            #   __pycache__ — Python bytecode cache used by the claude launcher
+            _claude_tmpfs: list[tuple[str, int]] = [
+                ("/home/claude/.claude/projects",   256 * 1024 * 1024),  # 256 MB
+                ("/home/claude/.claude/todos",        32 * 1024 * 1024),  #  32 MB
+                ("/home/claude/.claude/statsig",      32 * 1024 * 1024),  #  32 MB
+                ("/home/claude/.claude/__pycache__",  16 * 1024 * 1024),  #  16 MB
+            ]
+            for target, size in _claude_tmpfs:
+                extra_mounts.append(
+                    docker.types.Mount(
+                        target=target,
+                        source=None,
+                        type="tmpfs",
+                        read_only=False,
+                        tmpfs_size=size,
+                        tmpfs_mode=0o777,
+                    )
+                )
+                logger.info("OAuth mode: tmpfs overlay → %s (%d MB)", target, size // (1024 * 1024))
 
         # SECURITY: Do not inherit host environment.  Inject only explicit vars.
         # - TERM: needed for Claude Code's PTY detection.
@@ -387,6 +418,10 @@ class DockerSandbox:
             # host.docker.internal resolves to the host machine's gateway IP.
             extra_hosts={"host.docker.internal": "host-gateway"},
             volumes=volumes,
+            # extra_mounts holds tmpfs overlays on ~/.claude subdirs (OAuth mode).
+            # Docker applies these after the volumes bind mounts, so the tmpfs
+            # correctly shadows the subdirectory of the read-only parent bind mount.
+            mounts=extra_mounts if extra_mounts else None,
             environment=env,
             mem_limit=self._container_memory,
             nano_cpus=int(self._container_cpus * 1e9),

@@ -10,6 +10,7 @@ Usage:
 """
 
 import logging
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,16 @@ from .docker_sandbox import DockerSandbox
 from .native_sandbox import NativeSandbox
 
 logger = logging.getLogger(__name__)
+
+# Directories whose modification by Claude Code would compromise the runner.
+# Working inside projects/ or any external directory is fine.
+# Working inside claude_runner/ (the Python package) or tests/ is blocked.
+_RUNNER_PROTECTED_DIRS: tuple[Path, ...] = (
+    Path(__file__).resolve().parent.parent,          # claude_runner/
+    Path(__file__).resolve().parent.parent.parent / "tests",  # tests/
+)
+# The repo root itself is also protected (catches working_dir: '../ClaudeRunner').
+_RUNNER_SOURCE_ROOT: Path = Path(__file__).resolve().parent.parent.parent
 
 
 def resolve_working_dir(
@@ -59,6 +70,49 @@ def resolve_working_dir(
             "sandbox.working_dir not set and no book_path known — "
             "falling back to %s", wd
         )
+
+    # ── Safety: detect self-modification ────────────────────────────────────
+    # Block when the working directory is the repo root itself, or inside the
+    # claude_runner/ package or tests/ directory.  Working inside projects/ or
+    # any external path is fine — those are intended artifact directories.
+    #
+    # Suppressed only when sandbox.allow_self_modification: true AND
+    # sandbox.backend: docker are both set (containment layer is present).
+    _wd_resolved = wd.resolve()
+    _is_self = (
+        _wd_resolved == _RUNNER_SOURCE_ROOT
+        or any(
+            _wd_resolved == d or _wd_resolved.is_relative_to(d)
+            for d in _RUNNER_PROTECTED_DIRS
+        )
+    )
+
+    if _is_self:
+        pb_sandbox = getattr(project_book, "sandbox", None)
+        _allow = getattr(pb_sandbox, "allow_self_modification", False)
+        _docker = getattr(pb_sandbox, "backend", "auto") == "docker"
+        if _allow and _docker:
+            logger.warning(
+                "Working directory %s is inside the claude-runner source tree. "
+                "allow_self_modification=true with Docker sandbox — proceeding with caution.",
+                wd,
+            )
+        else:
+            logger.error(
+                "SAFETY BLOCK: working_dir %s resolves inside the claude-runner "
+                "source package (%s). Claude Code would have unrestricted write "
+                "access to the runner's own code. "
+                "To allow this, set both sandbox.allow_self_modification: true "
+                "AND sandbox.backend: docker in your project book.",
+                wd,
+                _RUNNER_SOURCE_ROOT,
+            )
+            raise ValueError(
+                f"Safety block: sandbox.working_dir {wd!r} is inside the "
+                "claude-runner source tree. Use an isolated working directory, "
+                "or set sandbox.allow_self_modification: true with backend: docker."
+            )
+    # ────────────────────────────────────────────────────────────────────────
 
     if not wd.exists():
         logger.info("Working directory %s does not exist — creating it.", wd)

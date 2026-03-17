@@ -169,6 +169,14 @@ class SandboxConfig(BaseModel):
             "ANTHROPIC_API_KEY or GIT_TOKEN which are managed by claude-runner."
         ),
     )
+    allow_self_modification: bool = Field(
+        default=False,
+        description=(
+            "Allow working_dir to resolve inside the claude-runner source tree. "
+            "DANGEROUS: only effective when backend is also 'docker'. "
+            "Without Docker the safety block in resolve_working_dir() fires regardless."
+        ),
+    )
 
     @field_validator("working_dir", mode="before")
     @classmethod
