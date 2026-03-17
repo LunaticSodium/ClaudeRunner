@@ -68,16 +68,17 @@ To view or delete stored credentials later:
 
 1. [Quick Start](#quick-start)
 2. [Project Book Format](#project-book-format)
-3. [CLI Reference](#cli-reference)
-4. [Sandbox Modes](#sandbox-modes)
-5. [Rate Limit Handling](#rate-limit-handling)
-6. [Notifications](#notifications)
-7. [Context Length Management](#context-length-management)
-8. [Phase-Aware Model Switching](#phase-aware-model-switching)
-9. [Configuration](#configuration)
-10. [Requirements](#requirements)
-11. [Development](#development)
-12. [License](#license)
+3. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
+4. [CLI Reference](#cli-reference)
+5. [Sandbox Modes](#sandbox-modes)
+6. [Rate Limit Handling](#rate-limit-handling)
+7. [Notifications](#notifications)
+8. [Context Length Management](#context-length-management)
+9. [Phase-Aware Model Switching](#phase-aware-model-switching)
+10. [Configuration](#configuration)
+11. [Requirements](#requirements)
+12. [Development](#development)
+13. [License](#license)
 
 ---
 
@@ -261,6 +262,136 @@ notifications:
     email: false
     webhook: false
 ```
+
+---
+
+## CCCS — C# Standards Preset
+
+**CCCS** (Claude Code C# Standards for Scientific Simulation) is a machine-readable
+specification, bundled as a `.cccs.toml` file, that does two things simultaneously:
+
+1. **Validates your project YAML** — before the first `claude -p` call, the runner
+   checks that your project book satisfies structural requirements (phases defined,
+   environment fields present, recognised profile name, etc.).
+
+2. **Injects a CLAUDE.md fragment** — a precisely scoped set of rules is appended
+   to the working directory's `CLAUDE.md` so Claude sees them as authoritative
+   constraints throughout the session, not just in the initial prompt.
+
+This is the primary mechanism for enforcing consistent, citation-backed coding
+standards across long autonomous runs — reproducible architecture, numerical
+rigour, phased delivery, and convergence verification all encoded in one file.
+
+### Why it exists
+
+LLMs have well-documented failure modes on scientific code: silent `float32` vs
+`float64` confusion, missing MCSE reporting, global mutable state, and skipping
+tests to make CI green.  CCCS encodes published countermeasures with full RFC 2119
+enforcement levels (`MUST` / `SHOULD` / `MAY`) and citation keys traced to the
+research literature.  The runner injects only the rules — not the citations — to
+stay within the ~200-line instruction budget where adherence stays above 92%.
+
+### Enabling CCCS in a project book
+
+Add a `cccs` block to any project YAML:
+
+```yaml
+cccs:
+  preset: cccs-v1.0       # built-in preset (default)
+  profile: scisim         # omit to use the preset's default profile
+```
+
+To temporarily disable injection without removing the block:
+
+```yaml
+cccs:
+  enabled: false
+```
+
+### Profiles
+
+Two tail profiles ship with `cccs-v1.0`:
+
+| Profile | Use case | Extra requirements |
+|---|---|---|
+| `scisim` | Scientific simulation — full rigour | MCSE reporting, analytical validation, convergence checks, structured output columns |
+| `engineering` | Pure software engineering | Build + test gates only; no numerical requirements |
+
+### What gets injected
+
+The runner appends the following rule categories to `CLAUDE.md`, each wrapped in
+an XML tag per [Anthropic prompt engineering guidance](https://docs.anthropic.com/claude/docs/use-xml-tags):
+
+| Section tag | Summary |
+|---|---|
+| `<architecture>` | Hexagonal core/adapter split; no static state; injectable dependencies; IRng interface; named parameters with units |
+| `<numerical_standards>` | `float64` default; MCSE alongside every estimate; convergence N vs 2N check; matched RNG seeds |
+| `<validation>` | At least one analytical validation; MMS for PDEs/ODEs; KS/chi² for stochastic distributions |
+| `<reproducibility>` | Config file for all params; runtime metadata logged (version, seed, git hash); structured results directory |
+| `<testing>` | xUnit/NUnit; regression baseline on every commit; every bug becomes a test; `dotnet test` after every phase |
+| `<coding_standards>` | XML docs; `Nullable enable`; no `var` for non-obvious types; `async Task` not `async void` |
+| `<delivery>` | Phased commits with feat/fix prefixes; never commit with failing tests; final V&V gate before delivery |
+| `<compact_instructions>` | What to preserve during context compaction so progress survives `/compact` |
+
+### Acceptance gates (tail)
+
+For the `scisim` profile the runner stores these thresholds as hard gates for
+external verification after the session completes:
+
+| Gate | Value |
+|---|---|
+| `dotnet build` exit code | 0 |
+| Warnings treated as errors | yes |
+| `dotnet test` exit code | 0 |
+| Line coverage — core namespace | ≥ 80 % |
+| Line coverage — numerics namespace | 100 % |
+| Minimum ensemble — central tendency | 500 repetitions |
+| Minimum ensemble — variance | 1 000 repetitions |
+| Minimum ensemble — tail statistics | 10 000 repetitions |
+| MCSE must be reported | yes |
+| Convergence check (N vs 2N) | required |
+| Analytical validation present | ≥ 1 |
+| Runtime metadata logged | yes |
+| Seed logged | yes |
+
+### Full example project YAML
+
+```yaml
+name: mc-diffusion
+description: Monte Carlo heat diffusion simulator in C#
+
+cccs:
+  preset: cccs-v1.0
+  profile: scisim
+
+sandbox:
+  backend: docker
+  working_dir: C:/Projects/mc-diffusion
+
+execution:
+  timeout_hours: 6
+
+prompt: |
+  Build a Monte Carlo heat diffusion simulator in C# (.NET 8).
+  Follow all rules injected via CCCS in CLAUDE.md.
+  Deliver in three phases:
+    Phase 1 — core domain (IRng, IRenderer ports, SimulationEngine)
+    Phase 2 — numerical solver (explicit Euler, analytical validation)
+    Phase 3 — reporting (MCSE, structured CSV output, reproducibility metadata)
+  Commit each phase with PHASE-N: prefix.
+  Print ##RUNNER:COMPLETE## when done.
+```
+
+### Preset file location
+
+The bundled preset lives at:
+
+```
+claude_runner/presets/cccs-v1.0.cccs.toml
+```
+
+You can inspect, fork, or extend it to create your own domain-specific standard.
+Custom presets can be loaded by pointing `cccs.preset` at a file path instead of a short name.
 
 ---
 
@@ -707,6 +838,9 @@ claude-runner/
     config.py             Config loading and validation
     project.py            Project book schema (Pydantic)
     model_watchdog.py     Phase-aware model-switch background thread
+    cccs_parser.py        CCCS preset loader and CLAUDE.md renderer
+    presets/
+      cccs-v1.0.cccs.toml  Bundled C# scientific simulation standard
     sandbox/
       docker_sandbox.py   Docker-based isolation
       native_sandbox.py   Host-based execution

@@ -465,6 +465,13 @@ class TaskRunner:
         # Skipped when marathon_mode is True or no model_schedule is configured.
         self._inject_claude_md_phase_contract()
 
+        # --- CCCS preset injection -----------------------------------------
+        # When the project book has a cccs block (and cccs.enabled is True),
+        # loads the named .cccs.toml preset and appends its rendered fragment
+        # to CLAUDE.md before Claude is launched.  This is entirely optional;
+        # omitting the cccs key (or setting enabled: false) skips this step.
+        self._inject_cccs_fragment()
+
         # --- CLAUDE.md injection -------------------------------------------
         self._claude_md_content = self._read_claude_md()
 
@@ -1724,6 +1731,63 @@ class TaskRunner:
             )
         except OSError as exc:
             logger.warning("Could not write phase contract to CLAUDE.md: %s", exc)
+
+    def _inject_cccs_fragment(self) -> None:
+        """Append a rendered CCCS CLAUDE.md fragment when ``cccs`` is configured.
+
+        Behaviour
+        ---------
+        - Skipped when ``book.cccs`` is ``None`` or ``book.cccs.enabled`` is ``False``.
+        - Loads the named preset from ``claude_runner/presets/<preset>.cccs.toml``.
+        - Renders the fragment for the configured profile (or the preset default).
+        - Appends it to ``.claude/CLAUDE.md`` (creating the file/dir if needed).
+        - Idempotent: guarded by an ``<!-- BEGIN cccs-<preset> -->`` HTML comment
+          so re-running the runner won't double-inject.
+        """
+        cccs_cfg = getattr(self._book, "cccs", None)
+        if cccs_cfg is None or not cccs_cfg.enabled:
+            return
+
+        from .cccs_parser import CCCSRenderError, load_preset  # noqa: PLC0415
+
+        preset_name: str = cccs_cfg.preset
+        marker = f"<!-- BEGIN cccs-{preset_name} -->"
+
+        try:
+            spec = load_preset(preset_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load CCCS preset '%s': %s", preset_name, exc)
+            return
+
+        profile: str = cccs_cfg.profile or spec.default_profile
+
+        try:
+            fragment = spec.render_claudemd(profile=profile)
+        except CCCSRenderError as exc:
+            logger.warning("CCCS render error for preset '%s': %s", preset_name, exc)
+            return
+
+        working_dir = self._sandbox.working_dir if self._sandbox else self._book.working_dir
+        claude_dir = Path(working_dir) / ".claude"
+        claude_md = claude_dir / "CLAUDE.md"
+
+        try:
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            existing = claude_md.read_text(encoding="utf-8") if claude_md.exists() else ""
+            if marker in existing:
+                logger.debug("[CCCS] Fragment already present in CLAUDE.md — skipping.")
+                return
+            block = f"\n{marker}\n{fragment}<!-- END cccs-{preset_name} -->\n"
+            with claude_md.open("a", encoding="utf-8") as fh:
+                fh.write(block)
+            logger.info(
+                "[ACTION] CCCS '%s' fragment (%s profile, %d chars) appended to CLAUDE.md.",
+                preset_name,
+                profile,
+                len(block),
+            )
+        except OSError as exc:
+            logger.warning("Could not write CCCS fragment to CLAUDE.md: %s", exc)
 
     def _read_claude_md(self) -> Optional[str]:
         """

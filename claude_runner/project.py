@@ -184,6 +184,43 @@ class ModelSchedule(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# CCCS preset config
+# ---------------------------------------------------------------------------
+
+
+class CccsConfig(BaseModel):
+    """Configuration for the optional CCCS (Claude Code C# Standards) preset.
+
+    When present on a :class:`ProjectBook`, the runner loads the named preset
+    from ``claude_runner/presets/<preset>.cccs.toml``, validates the project
+    YAML against its schema, and injects a rendered CLAUDE.md fragment before
+    the first ``claude -p`` call.
+
+    Set ``enabled: false`` to temporarily disable injection without removing
+    the config block.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Set to false to skip CCCS injection for this run.",
+    )
+    preset: str = Field(
+        default="cccs-v1.0",
+        description=(
+            "Short name of the built-in preset file to load "
+            "(resolved to claude_runner/presets/<preset>.cccs.toml)."
+        ),
+    )
+    profile: str | None = Field(
+        default=None,
+        description=(
+            "Tail profile to activate (e.g. 'scisim', 'engineering'). "
+            "When None the preset's default_profile is used."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sandbox sub-models
 # ---------------------------------------------------------------------------
 
@@ -719,6 +756,15 @@ class ProjectBook(BaseModel):
             "the runner injects the phase contract into CLAUDE.md and starts a background "
             "ModelWatchdog that switches models based on git commit phase markers and context "
             "utilisation triggers.  Ignored when marathon_mode is True."
+        ),
+    )
+    cccs: CccsConfig | None = Field(
+        default=None,
+        description=(
+            "Optional CCCS (Claude Code C# Standards) preset.  When set, the runner "
+            "loads the named .cccs.toml preset, validates the project YAML against its "
+            "schema, and injects a rendered CLAUDE.md fragment before the first claude "
+            "invocation.  Set enabled: false to temporarily skip injection."
         ),
     )
     sandbox: SandboxConfig | None = Field(

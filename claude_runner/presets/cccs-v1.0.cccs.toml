@@ -1,0 +1,477 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# CCCS v1.0 — Claude Code C# Standards for Scientific Simulation
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# This file is a machine-readable specification consumed by ClaudeRunner.
+# It serves two purposes simultaneously:
+#   1. Schema source — Runner validates project YAML structure against this.
+#   2. Prompt source — Runner renders a CLAUDE.md fragment from this for the agent.
+#
+# Every numerical threshold and behavioural constraint traces to a published
+# reference. Citation keys (e.g. [wilson2014]) resolve in cccs-v1.0.bib.
+#
+# File format: TOML 1.0  (Python: tomllib stdlib ≥3.11, tomli-w for write)
+# Filename convention: <name>-v<semver>.cccs.toml
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[meta]
+spec_name    = "CCCS"
+full_name    = "Claude Code C# Standards for Scientific Simulation"
+version      = "1.0.0"
+language     = "C#"
+runtime      = ".NET 8+"
+domain       = "scientific-simulation"
+license      = "CC-BY-4.0"
+authors      = ["Honacoo (LunaticSodium)"]
+bibliography = "cccs-v1.0.bib"
+
+# Which tail profile to activate. Runner selects one at YAML parse time.
+# "scisim"      — full scientific rigour (default for this spec)
+# "engineering"  — build/test gates only, no MCSE/MMS requirements
+default_profile = "scisim"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1: HEADER — Bootstrap instructions for the agent
+# ─────────────────────────────────────────────────────────────────────────────
+# The Runner injects this block verbatim at the top of the CLAUDE.md fragment.
+# Purpose: teach Code how to interpret the rest of the injected content.
+# This is the "trust root" of the entire chain. Keep it tight and unambiguous.
+
+[header]
+# Maximum lines the rendered CLAUDE.md fragment may occupy.
+# Above 200 lines, rule adherence drops from >92% to ~71%.
+# ref: [humanlayer2025] — 150–200 instruction limit for frontier LLMs
+# ref: [arize2025]      — 200-line threshold, >92% adherence below it
+max_rendered_lines = 150
+
+# Token budget ceiling for the entire CLAUDE.md (all presets + project header).
+# Claude Code system prompt ≈ 50 instructions; CLAUDE.md must leave headroom.
+# ref: [humanlayer2025] — ~50 instructions consumed by system prompt
+max_token_budget = 4000
+
+# The bootstrap preamble injected before all other content.
+# Uses <> XML-tag syntax for section boundaries per Anthropic guidance.
+# ref: [anthropic_prompt_guide] — XML tags help Claude parse complex prompts
+bootstrap_preamble = """
+You are operating under CCCS v1.0 (Claude Code C# Standards for Scientific Simulation).
+This document uses <section_name> XML tags to delimit constraint categories.
+Rules marked MUST are non-negotiable (RFC 2119). Rules marked SHOULD are strong defaults.
+When in doubt, prefer correctness over performance, explicitness over brevity.
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2: SYNTAX — Tag vocabulary and enforcement levels
+# ─────────────────────────────────────────────────────────────────────────────
+# Defines the XML-tag namespace used in the rendered CLAUDE.md fragment.
+# The Runner uses this to validate that the rendered output is well-formed.
+
+[syntax]
+# Enforcement levels follow RFC 2119 semantics.
+# ref: [csdd2025] — RFC 2119 enforcement + CWE mappings achieved 73% vuln reduction
+#                   vs near-zero compliance from vague "use secure practices" instructions
+enforcement_levels = ["MUST", "SHOULD", "MAY"]
+
+# Section tags used in the rendered CLAUDE.md fragment.
+section_tags = [
+    "architecture",
+    "numerical_standards",
+    "validation",
+    "reproducibility",
+    "testing",
+    "coding_standards",
+    "delivery",
+    "compact_instructions",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3: FORMAT — The agent-facing rules, organised by concern
+# ─────────────────────────────────────────────────────────────────────────────
+# Each sub-table below maps to one <tag> in the rendered CLAUDE.md.
+# The `rules` array contains the actual prompt lines injected into CLAUDE.md.
+# The `ref` field on each rule traces to a citation key in the .bib file.
+
+# ── 3.1 Architecture ─────────────────────────────────────────────────────────
+
+[[format.architecture.rules]]
+level = "MUST"
+text  = "Simulation core has ZERO external dependencies — references only System, System.Collections.Generic, System.Numerics, System.Linq."
+ref   = "wilson2014"
+note  = "Wilson et al. §4d: 'reduce dependencies'; hexagonal isolation enables pure-logic testing"
+
+[[format.architecture.rules]]
+level = "MUST"
+text  = "All engine/UI/IO interaction flows through port interfaces (e.g. IRenderer, IDataSink). Core never calls concrete implementations directly."
+ref   = "oberkampf2010"
+note  = "V&V requires separation of concerns to isolate numerical code from visualization for independent verification"
+
+[[format.architecture.rules]]
+level = "MUST"
+text  = "All randomness flows through an explicit IRng interface seeded from a single root seed. The root seed MUST be logged with every run."
+ref   = "morris2019"
+note  = "ADEMP §4: reproducibility requires explicit seed management; matched seeds enable paired method comparisons reducing MCSE"
+
+[[format.architecture.rules]]
+level = "MUST"
+text  = "Every numerical constant must be a named parameter with units documented in XML comments. Zero hardcoded magic numbers in simulation core."
+ref   = "wilson2014"
+note  = "Wilson et al. §3b: 'give sensible names to variables', §4b: 'document interfaces and reasons, not implementations'"
+
+[[format.architecture.rules]]
+level = "SHOULD"
+text  = "Parameter sweeps: implement as config-driven loops iterating over a parameter space object, not as code changes."
+ref   = "morris2019"
+note  = "ADEMP: data-generating mechanisms should be parameterised, not hard-wired"
+
+[[format.architecture.rules]]
+level = "MUST"
+text  = "No static mutable state. No singletons. Use constructor injection or method injection for all dependencies."
+ref   = "wilson2014"
+note  = "Wilson et al. §4d: avoid global state; testability requires injectable dependencies"
+
+# ── 3.2 Numerical Standards ──────────────────────────────────────────────────
+
+[[format.numerical_standards.rules]]
+level = "MUST"
+text  = "Default to System.Double (float64) for ALL scientific computation. Document with [Precision(\"float32\")] attribute where 32-bit is intentionally used for performance."
+ref   = "evalplus2023"
+note  = "LLMs default to float32 when float64 is needed — a persistent silent error category that produces incorrect output with no warnings"
+
+[[format.numerical_standards.rules]]
+level = "MUST"
+text  = "Implement convergence checks: compare results at N and 2N iterations/steps. Log the convergence ratio. If ratio deviates from expected order by >10%, flag as WARNING."
+ref   = "oberkampf2010"
+note  = "Oberkampf & Roy Ch.4: Richardson extrapolation and order-of-accuracy verification require systematic mesh/step refinement"
+
+[[format.numerical_standards.rules]]
+level = "MUST"
+text  = "For stochastic simulations: report Monte Carlo Standard Error (MCSE) alongside every point estimate. MCSE = empirical_SE / sqrt(N_repetitions)."
+ref   = "morris2019"
+note  = "Morris et al. §5: 'Monte Carlo errors play an important role in understanding the role of chance'; severely under-reported in practice"
+
+[[format.numerical_standards.rules]]
+level = "MUST"
+text  = "Use same RNG seed sequence across compared methods for matched comparisons. This reduces MCSE for method-vs-method evaluation."
+ref   = "morris2019"
+note  = "Morris et al. §4: 'match repetitions' to reduce Monte Carlo SE when comparing methods"
+
+[[format.numerical_standards.rules]]
+level = "SHOULD"
+text  = "Assertions on physical invariants (conservation laws, bounds, monotonicity) in computational hot loops. Use Debug.Assert or conditional compilation."
+ref   = "wilson2014"
+note  = "Wilson et al. §5a: 'add assertions to programs to check their operation — everyone makes mistakes'"
+
+# ── 3.3 Validation ───────────────────────────────────────────────────────────
+
+[[format.validation.rules]]
+level = "MUST"
+text  = "Implement at least ONE analytical validation: a test case with a known closed-form solution where numerical output is compared to exact within a stated tolerance."
+ref   = "oberkampf2010"
+note  = "Oberkampf & Roy Ch.4–5: code verification requires comparison against known analytical solutions"
+
+[[format.validation.rules]]
+level = "SHOULD"
+text  = "For PDEs/ODEs: use Method of Manufactured Solutions (MMS) — construct analytical solution, derive source terms, verify code reproduces to expected order of accuracy."
+ref   = "oberkampf2010"
+note  = "MMS is the primary code verification technique in V&V; LLMs never spontaneously implement it"
+
+[[format.validation.rules]]
+level = "SHOULD"
+text  = "For stochastic models: verify output distributions against known analytical distributions using Kolmogorov-Smirnov or chi-squared tests at p < 0.01."
+ref   = "morris2019"
+note  = "ADEMP performance measures require formal statistical comparison, not visual inspection"
+
+[[format.validation.rules]]
+level = "SHOULD"
+text  = "Benchmark against published results with explicit numerical comparison. Reference the source paper DOI and table/figure number."
+ref   = "fair4rs2022"
+note  = "FAIR4RS: Reusability requires traceable provenance of validation benchmarks"
+
+# ── 3.4 Reproducibility ─────────────────────────────────────────────────────
+
+[[format.reproducibility.rules]]
+level = "MUST"
+text  = "Config file (YAML/TOML/JSON) for ALL simulation parameters — zero hardcoded values in source. Config schema is versioned alongside code."
+ref   = "wilson2017"
+note  = "Wilson et al. 'Good Enough Practices': separate configuration from code for reproducibility"
+
+[[format.reproducibility.rules]]
+level = "MUST"
+text  = "Log at runtime: all parameters, .NET version, OS platform, UTC timestamp, git commit hash. Write to a structured metadata header in output files."
+ref   = "fair4rs2022"
+note  = "FAIR4RS Interoperability: software must log sufficient metadata for reproduction"
+
+[[format.reproducibility.rules]]
+level = "MUST"
+text  = "Results directory structure: results/{experiment_name}/{yyyyMMdd_HHmmss}_{seed}/. Each run is a self-contained directory."
+ref   = "wilson2014"
+note  = "Wilson et al. §6: 'organize project directory structure to aid reproducibility'"
+
+[[format.reproducibility.rules]]
+level = "SHOULD"
+text  = "Dependencies pinned in lockfile. Include a Dockerfile or container spec for full environment reproducibility."
+ref   = "fair4rs2022"
+note  = "FAIR4RS Accessibility: environment must be reproducible beyond the original developer's machine"
+
+[[format.reproducibility.rules]]
+level = "SHOULD"
+text  = "Include CITATION.cff in repository root with all contributor names and ORCID identifiers."
+ref   = "fair4rs2022"
+note  = "FAIR4RS Findability: software must be citable; CITATION.cff is the community-accepted format"
+
+# ── 3.5 Testing ──────────────────────────────────────────────────────────────
+
+[[format.testing.rules]]
+level = "MUST"
+text  = "Unit tests on core simulation functions with known-output cases. Use xUnit or NUnit. No engine/UI runtime required for core tests."
+ref   = "wilson2014"
+note  = "Wilson et al. §5b: 'use automated testing'; pure-logic tests run 10x faster without engine runtime"
+
+[[format.testing.rules]]
+level = "MUST"
+text  = "Regression tests: store expected output for reference configurations. Compare on every commit with a tolerance-aware assertion (AbsoluteTolerance, RelativeTolerance)."
+ref   = "oberkampf2010"
+note  = "V&V: regression testing catches silent numerical drift that weak test suites miss"
+
+[[format.testing.rules]]
+level = "MUST"
+text  = "Every bug discovered becomes a regression test BEFORE the fix is committed."
+ref   = "wilson2014"
+note  = "Wilson et al. §5c: 'turn bugs into test cases'"
+
+[[format.testing.rules]]
+level = "MUST"
+text  = "Run dotnet test after every implementation phase. Fix ALL failures before proceeding. Never skip a test to make CI green."
+ref   = "csdd2025"
+note  = "CSDD: deterministic verification gates achieved 73% vulnerability reduction vs self-assessed completion"
+
+[[format.testing.rules]]
+level = "SHOULD"
+text  = "Convergence tests: verify numerical error decreases at expected rate with refinement (halving step size should reduce error by 2^p for order-p method)."
+ref   = "oberkampf2010"
+note  = "Oberkampf & Roy: order-of-accuracy testing is the gold standard for code verification"
+
+[[format.testing.rules]]
+level = "SHOULD"
+text  = "Statistical tests (KS test, chi-squared) for distribution-dependent code. Use a fixed seed and known target distribution."
+ref   = "morris2019"
+note  = "Formal statistical testing is required to verify stochastic simulation correctness"
+
+# ── 3.6 Coding Standards ─────────────────────────────────────────────────────
+
+[[format.coding_standards.rules]]
+level = "MUST"
+text  = "XML documentation on all public types and members (/// <summary>). Include <param> and <returns> tags with units where applicable."
+ref   = "wilson2014"
+note  = "Wilson et al. §4b: 'document interfaces'; XML docs also improve LLM comprehension of API contracts"
+
+[[format.coding_standards.rules]]
+level = "MUST"
+text  = "Nullable reference types enabled (<Nullable>enable</Nullable>). Treat all nullable warnings as errors."
+ref   = "evalplus2023"
+note  = "Null-related errors are a top LLM silent failure category; compiler enforcement eliminates this class"
+
+[[format.coding_standards.rules]]
+level = "MUST"
+text  = "No var for non-obvious types. Explicit type declarations improve AI readability and reduce silent type confusion."
+ref   = "evalplus2023"
+note  = "Explicit types help both human review and LLM understanding; implicit types increase silent error risk"
+
+[[format.coding_standards.rules]]
+level = "SHOULD"
+text  = "Prefer composition over inheritance for non-framework types. Interfaces over abstract base classes."
+ref   = "wilson2014"
+note  = "Composition improves testability via mock injection"
+
+[[format.coding_standards.rules]]
+level = "MUST"
+text  = "Async operations use async Task, never async void (except event handlers). Propagate CancellationToken through all async chains."
+ref   = "wilson2014"
+note  = "async void silently swallows exceptions — a common LLM mistake with no compile-time warning"
+
+[[format.coding_standards.rules]]
+level = "SHOULD"
+text  = "String interpolation over concatenation. nameof() over string literals for member references. One class per file, filename matches class name."
+ref   = "wilson2014"
+note  = "Consistency conventions reduce cognitive load for both humans and LLMs"
+
+# ── 3.7 Delivery ─────────────────────────────────────────────────────────────
+
+[[format.delivery.rules]]
+level = "MUST"
+text  = "Work in phases. Each phase ends with: all tests green → git commit. Commit messages: feat(module): description or fix(module): description."
+ref   = "csdd2025"
+note  = "Phased delivery with deterministic gates; agents that self-orchestrate routinely skip steps"
+
+[[format.delivery.rules]]
+level = "MUST"
+text  = "Never commit code with failing tests. If stuck after 3 attempts on a failure, document in TODO.md and move on."
+ref   = "csdd2025"
+note  = "CSDD: bounded retry (3–5 attempts) then rollback prevents infinite loops"
+
+[[format.delivery.rules]]
+level = "MUST"
+text  = "Before final delivery: run full test suite, verify zero warnings from dotnet build, verify all analytical validations pass."
+ref   = "oberkampf2010"
+note  = "Final V&V gate before release"
+
+# ── 3.8 Compact Instructions ─────────────────────────────────────────────────
+
+[[format.compact_instructions.rules]]
+level = "MUST"
+text  = "When compacting context, ALWAYS preserve: (a) current delivery phase and completed phases, (b) all modified file paths and purposes, (c) failing tests and error messages, (d) the architecture boundary (which namespace is core vs adapter), (e) current RNG seed and ensemble size, (f) validation status of analytical checks."
+ref   = "humanlayer2025"
+note  = "Instruction centrifugation causes drift after 20–100 turns; structured preservation counters recency bias"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4: TAIL — Acceptance criteria and verification thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+# These are the hard gates that Runner checks EXTERNALLY after agent completes.
+# The agent never self-assesses these; Runner runs the checks deterministically.
+
+# ── 4.1 Profile: scisim (scientific simulation) ─────────────────────────────
+
+[tail.scisim]
+profile_name = "Scientific Simulation"
+description  = "Full scientific rigour: MCSE reporting, analytical validation, convergence verification."
+
+[tail.scisim.build_gate]
+# dotnet build must exit 0 with zero warnings treated as errors
+dotnet_build_exit_code = 0
+treat_warnings_as_errors = true
+ref = "csdd2025"
+
+[tail.scisim.test_gate]
+# dotnet test must pass with stated coverage thresholds
+dotnet_test_exit_code = 0
+min_line_coverage_core_pct = 80        # simulation core namespace
+min_line_coverage_adapter_pct = 60     # adapter/IO namespace
+min_line_coverage_numerics_pct = 100   # numerical utility functions
+ref = "wilson2014"
+note = "Wilson et al.: test coverage on scientific code; 100% on numerics per Oberkampf & Roy V&V requirements"
+
+[tail.scisim.numerical_gate]
+# Minimum ensemble sizes for stochastic simulations
+# ref: [fenton2008] — n = (z_α/2)² / (tolerance/σ)²; at 95% conf, 0.1σ tol → n = 384
+# ref: [morris2019] — practical minimums: 500 central tendency, 1000 variance, 10000 tails
+min_ensemble_central_tendency = 500
+min_ensemble_variance         = 1000
+min_ensemble_tail_statistics  = 10000
+theoretical_lower_bound       = 384    # Fenton & Griffiths formula, 95% conf, 0.1σ
+mcse_must_be_reported         = true
+convergence_check_required    = true   # N vs 2N comparison mandatory
+default_float_precision       = "float64"
+float32_requires_justification = true
+ref_ensemble = "fenton2008"
+ref_mcse     = "morris2019"
+
+[tail.scisim.validation_gate]
+# At least one analytical validation must exist and pass
+min_analytical_validations = 1
+mms_recommended            = true   # Method of Manufactured Solutions
+benchmark_comparison       = true   # comparison against published results
+ref = "oberkampf2010"
+
+[tail.scisim.reproducibility_gate]
+config_file_required     = true     # no hardcoded params
+runtime_metadata_logged  = true     # versions, platform, timestamp, git hash
+seed_logged              = true     # RNG root seed in output
+results_dir_structured   = true     # results/{name}/{timestamp}_{seed}/
+citation_file_present    = true     # CITATION.cff or CITATION.bib
+ref = "fair4rs2022"
+
+[tail.scisim.reporting_gate]
+# Output tables must include these columns for stochastic results
+required_columns = ["point_estimate", "standard_error", "confidence_interval", "n_repetitions"]
+ademp_structure  = true              # Aims/Data-generating/Estimands/Methods/Performance
+negative_results_documented = true   # failed configurations must not be silently omitted
+ref = "morris2019"
+
+
+# ── 4.2 Profile: engineering (pure software engineering) ─────────────────────
+
+[tail.engineering]
+profile_name = "Engineering"
+description  = "Build and test gates only. No scientific simulation-specific requirements."
+
+[tail.engineering.build_gate]
+dotnet_build_exit_code = 0
+treat_warnings_as_errors = true
+ref = "csdd2025"
+
+[tail.engineering.test_gate]
+dotnet_test_exit_code = 0
+min_line_coverage_core_pct    = 80
+min_line_coverage_adapter_pct = 60
+ref = "wilson2014"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5: RUNNER PARAMETERS — Consumed by Runner, not by the agent
+# ─────────────────────────────────────────────────────────────────────────────
+# These control Runner's own behaviour and are never injected into CLAUDE.md.
+
+[runner]
+# Context management thresholds
+# ref: [humanlayer2025] — auto-compact at 75% is too late; manual at 50–60% is optimal
+compact_trigger_pct = 55             # suggest /compact at this context fill level
+max_turns_before_compact_warning = 40  # warn if approaching drift zone (20–100 turns)
+
+# Retry and rollback policy
+# ref: [csdd2025] — 3–5 attempts, then rollback for human intervention
+max_retry_per_phase = 3
+on_max_retry = "rollback_and_log"    # options: rollback_and_log, skip_and_log, abort
+
+# Session lifecycle
+commit_before_clear = true           # always git commit before /clear
+resume_with_context_pointers = true  # after /clear, point agent to decisions.md + TODO.md
+
+# CLAUDE.md composition order
+claudemd_sections = [
+    "project_header",        # project name, description, current phase
+    "active_presets",        # e.g. this CCCS file, rendered as CLAUDE.md fragment
+    "per_project_rules",     # from project YAML
+]
+
+# Rendered CLAUDE.md total line budget across all sections
+# ref: [arize2025] — files >400 lines: 71% adherence; <200 lines: >92%
+claudemd_total_max_lines = 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6: SCHEMA DEFINITION — For validating project YAML files
+# ─────────────────────────────────────────────────────────────────────────────
+# Runner's Python parser uses this to validate that a project YAML
+# conforms to CCCS structural requirements before the first claude invocation.
+
+[schema]
+# Required top-level keys in any CCCS-compliant project YAML
+required_keys = [
+    "project.name",
+    "project.description",
+    "project.presets",           # e.g. ["cccs-v1"]
+    "project.profile",          # e.g. "scisim" or "engineering"
+    "phases",                   # array of phase definitions
+]
+
+# Each phase must contain:
+required_phase_keys = [
+    "name",
+    "deliverables",             # what this phase produces
+    "hard_acceptance_criteria", # H1..Hn — machine-verifiable
+]
+
+# Optional but recommended per-phase keys
+optional_phase_keys = [
+    "soft_acceptance_criteria", # S1..Sn — judgment-based
+    "depends_on",              # prior phase names
+    "max_turns",               # per-phase turn limit
+]
+
+# Environment bootstrap fields (template in spec, values in project YAML)
+[schema.environment]
+required = ["dotnet_version", "target_framework"]
+optional = ["docker_image", "ci_platform", "additional_tools"]
