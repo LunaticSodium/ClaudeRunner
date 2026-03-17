@@ -53,7 +53,7 @@ def _image_exists(client) -> bool:
         return False
 
 
-def _run_in_fresh_container(client, cmd: str, mounts: list | None = None) -> tuple[int, str]:
+def _run_in_fresh_container(client, cmd: str, mounts: list | None = None, volumes: dict | None = None) -> tuple[int, str]:
     """
     Run *cmd* (via ``bash -c``) in a temporary container and return
     ``(exit_code, combined_stdout_stderr)``.
@@ -71,6 +71,8 @@ def _run_in_fresh_container(client, cmd: str, mounts: list | None = None) -> tup
     )
     if mounts:
         kwargs["mounts"] = mounts
+    if volumes:
+        kwargs["volumes"] = volumes
 
     try:
         output = client.containers.run(**kwargs)
@@ -84,109 +86,89 @@ def _run_in_fresh_container(client, cmd: str, mounts: list | None = None) -> tup
 # ---------------------------------------------------------------------------
 
 
-class TestOAuthTmpfsMounts:
-    """Verify that tmpfs overlays on ~/.claude subdirs behave correctly."""
+class TestOAuthWritableCopyMounts:
+    """
+    Verify that the writable-copy OAuth mount strategy works correctly.
+
+    DockerSandbox copies auth-critical files from ~/.claude into a per-run
+    writable directory and bind-mounts that as /home/claude/.claude (rw).
+    This avoids the read-only 9p filesystem issue that prevents Claude Code
+    from writing runtime state.
+    """
 
     @pytest.fixture(autouse=True)
     def require_image(self, docker_client):
         if not _image_exists(docker_client):
             pytest.skip(f"Docker image {IMAGE!r} not present — skipping mount tests")
 
-    def _make_mounts(self) -> list:
-        """Build the same tmpfs mounts that DockerSandbox creates in OAuth mode."""
-        _claude_tmpfs = [
-            ("/home/claude/.claude/projects",   256 * 1024 * 1024),
-            ("/home/claude/.claude/todos",        32 * 1024 * 1024),
-            ("/home/claude/.claude/statsig",      32 * 1024 * 1024),
-            ("/home/claude/.claude/__pycache__",  16 * 1024 * 1024),
-        ]
-        return [
-            docker.types.Mount(
-                target=target,
-                source=None,
-                type="tmpfs",
-                read_only=False,
-                tmpfs_size=size,
-                tmpfs_mode=0o777,
-            )
-            for target, size in _claude_tmpfs
-        ]
-
-    def test_write_to_projects_subdir_succeeds(self, docker_client):
-        """Writing into the tmpfs-overlaid projects/ directory must succeed."""
-        mounts = self._make_mounts()
-        cmd = (
-            "mkdir -p /home/claude/.claude/projects && "
-            "echo test > /home/claude/.claude/projects/probe.txt && "
-            "cat /home/claude/.claude/projects/probe.txt"
-        )
-        exit_code, output = _run_in_fresh_container(docker_client, cmd, mounts=mounts)
-        assert exit_code == 0, f"Expected exit 0, got {exit_code}. Output: {output}"
-        assert "test" in output, f"Expected 'test' in output, got: {output!r}"
-
-    def test_write_to_todos_subdir_succeeds(self, docker_client):
-        """Writing into the tmpfs-overlaid todos/ directory must succeed."""
-        mounts = self._make_mounts()
-        cmd = (
-            "mkdir -p /home/claude/.claude/todos && "
-            "echo todo-item > /home/claude/.claude/todos/item.txt && "
-            "cat /home/claude/.claude/todos/item.txt"
-        )
-        exit_code, output = _run_in_fresh_container(docker_client, cmd, mounts=mounts)
-        assert exit_code == 0, f"Expected exit 0, got {exit_code}. Output: {output}"
-        assert "todo-item" in output, f"Expected 'todo-item' in output, got: {output!r}"
-
-    def test_write_to_parent_claude_dir_fails(self, docker_client):
+    def test_writable_claude_dir_allows_arbitrary_writes(self, docker_client, tmp_path):
         """
-        Writing directly into /home/claude/.claude (the read-only parent) must
-        fail while writing into the tmpfs-overlaid projects/ subdirectory must
-        succeed.
-
-        We simulate the DockerSandbox OAuth mount strategy: bind the parent
-        read-only, pre-create the 'projects' subdirectory so Docker can use it
-        as a tmpfs mountpoint, then verify the security boundary holds.
+        A writable bind-mounted .claude dir must accept writes to any subdir.
         """
-        import tempfile
-        from pathlib import Path
+        claude_rw = tmp_path / "claude"
+        claude_rw.mkdir()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Pre-create 'projects/' so it exists as a mountpoint inside the
-            # read-only bind mount (Docker cannot create it at runtime when the
-            # parent is read-only — this mirrors what DockerSandbox.setup() does).
-            (Path(tmpdir) / "projects").mkdir()
+        volumes = {str(claude_rw): {"bind": "/home/claude/.claude", "mode": "rw"}}
 
-            bind_mount = docker.types.Mount(
-                target="/home/claude/.claude",
-                source=tmpdir,
-                type="bind",
-                read_only=True,
-            )
-            tmpfs_projects = docker.types.Mount(
-                target="/home/claude/.claude/projects",
-                source=None,
-                type="tmpfs",
-                read_only=False,
-                tmpfs_size=32 * 1024 * 1024,
-                tmpfs_mode=0o777,
-            )
+        # Write to several subdirs that Claude Code uses at runtime.
+        cmd = (
+            "mkdir -p /home/claude/.claude/projects /home/claude/.claude/tasks "
+            "/home/claude/.claude/cache /home/claude/.claude/telemetry && "
+            "echo proj > /home/claude/.claude/projects/probe.txt && "
+            "echo task > /home/claude/.claude/tasks/probe.txt && "
+            "echo cache > /home/claude/.claude/cache/probe.txt && "
+            "echo tele > /home/claude/.claude/telemetry/probe.txt && "
+            "cat /home/claude/.claude/projects/probe.txt "
+            "/home/claude/.claude/tasks/probe.txt "
+            "/home/claude/.claude/cache/probe.txt "
+            "/home/claude/.claude/telemetry/probe.txt"
+        )
+        exit_code, output = _run_in_fresh_container(docker_client, cmd, volumes=volumes)
+        assert exit_code == 0, f"Expected exit 0, got {exit_code}. Output: {output}"
+        assert "proj" in output
+        assert "task" in output
+        assert "cache" in output
+        assert "tele" in output
 
-            # Writing to projects/ (tmpfs overlay) must succeed.
-            cmd_projects = (
-                "echo ok > /home/claude/.claude/projects/probe.txt && "
-                "cat /home/claude/.claude/projects/probe.txt"
-            )
-            exit_code, output = _run_in_fresh_container(
-                docker_client, cmd_projects, mounts=[bind_mount, tmpfs_projects]
-            )
-            assert exit_code == 0, f"projects/ write failed (exit {exit_code}): {output}"
-            assert "ok" in output, f"Expected 'ok' in output, got: {output!r}"
+    def test_sessions_copied_in_are_readable(self, docker_client, tmp_path):
+        """
+        Session tokens copied into the writable dir must be readable by the container.
+        """
+        claude_rw = tmp_path / "claude"
+        sessions_dir = claude_rw / "sessions"
+        sessions_dir.mkdir(parents=True)
+        (sessions_dir / "12345.json").write_text('{"token": "test-token"}', encoding="utf-8")
 
-            # Writing directly into the read-only parent bind must fail.
-            cmd_parent = "echo x > /home/claude/.claude/probe.txt"
-            exit_code_parent, _ = _run_in_fresh_container(
-                docker_client, cmd_parent, mounts=[bind_mount, tmpfs_projects]
-            )
-            assert exit_code_parent != 0, (
-                "Expected non-zero exit when writing to the read-only parent "
-                f"/home/claude/.claude, but got exit code {exit_code_parent}"
-            )
+        volumes = {str(claude_rw): {"bind": "/home/claude/.claude", "mode": "rw"}}
+
+        cmd = "cat /home/claude/.claude/sessions/12345.json"
+        exit_code, output = _run_in_fresh_container(docker_client, cmd, volumes=volumes)
+        assert exit_code == 0, f"Expected exit 0, got {exit_code}. Output: {output}"
+        assert "test-token" in output
+
+    def test_container_writes_do_not_escape_to_host_original(self, docker_client, tmp_path):
+        """
+        Writes inside the container go to the copy, not back to the host source.
+        This is inherent to the copy strategy but worth asserting explicitly.
+        """
+        # Simulate host source dir (read-only reference)
+        host_source = tmp_path / "host_claude"
+        host_source.mkdir()
+        (host_source / "original.txt").write_text("original", encoding="utf-8")
+
+        # The per-run copy — this is what gets mounted
+        claude_rw = tmp_path / "claude"
+        claude_rw.mkdir()
+        import shutil
+        shutil.copy2(host_source / "original.txt", claude_rw / "original.txt")
+
+        volumes = {str(claude_rw): {"bind": "/home/claude/.claude", "mode": "rw"}}
+
+        cmd = "echo modified > /home/claude/.claude/original.txt"
+        exit_code, _ = _run_in_fresh_container(docker_client, cmd, volumes=volumes)
+        assert exit_code == 0
+
+        # The container modified the copy, not the host source.
+        assert (host_source / "original.txt").read_text(encoding="utf-8").strip() == "original"
+        # The copy was modified.
+        assert "modified" in (claude_rw / "original.txt").read_text(encoding="utf-8")

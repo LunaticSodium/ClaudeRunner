@@ -296,12 +296,9 @@ class DockerSandbox:
             volumes[str(host_path)] = {"bind": f"/ref/{name}", "mode": "ro"}
 
         # OAuth mode: mount the host's Claude Code credentials so the container
-        # can authenticate without an API key.  Mounted read-only so the
-        # container cannot modify the host session.
-        # Note: if the access token expires mid-run Claude Code will attempt a
-        # refresh but cannot persist the result; the task may fail after expiry.
+        # can authenticate without an API key.
         _using_oauth = (self._api_key == _OAUTH_SENTINEL)
-        # Extra Mount objects (tmpfs overlays); populated in the OAuth block.
+        # extra_mounts is unused here now but kept for potential future use.
         extra_mounts: list = []
         if _using_oauth:
             # Mount ~/.claude.json read-only for authentication.
@@ -315,51 +312,50 @@ class DockerSandbox:
                     "Claude Code inside the container may fail to authenticate."
                 )
 
-            # Mount ~/.claude/ read-only for auth session tokens and global config.
-            # Claude Code reads OAuth session tokens from ~/.claude/settings.json.
+            # Strategy: copy only the auth-critical files from ~/.claude into a
+            # per-run writable directory and bind-mount that as /home/claude/.claude.
+            #
+            # Mounting ~/.claude/ directly (even with tmpfs overlays for writable
+            # subdirs) leaves many subdirs read-only because the 9p bind covers
+            # the entire tree.  Claude Code writes to a large number of subdirs at
+            # runtime (cache/, tasks/, telemetry/, sessions/, etc.), so enumerating
+            # all of them is fragile.  A writable copy avoids the problem entirely.
+            #
+            # Auth-critical files copied in:
+            #   sessions/   — OAuth session tokens (read by Claude Code at startup)
+            #   settings.json — global settings (preferences, not credentials)
+            #
+            # Everything else starts empty and is created by Claude Code as needed.
+            # The copy is discarded when the container is removed.
+            import shutil  # noqa: PLC0415
+            working_dir_path = self.get_working_dir_path()
+            claude_rw = working_dir_path / ".claude-rw" / "claude"
+            if claude_rw.exists():
+                shutil.rmtree(claude_rw)
+            claude_rw.mkdir(parents=True)
+
             claude_dir = Path.home() / ".claude"
             if claude_dir.exists():
-                # Pre-create the runtime-write subdirectories on the host so
-                # that they exist inside the read-only bind mount.  Docker
-                # requires the mountpoint directory to already exist when the
-                # parent mount is read-only; it cannot create it at container
-                # start time.  These directories are standard Claude Code state
-                # dirs; creating them is benign if they don't exist yet.
-                _runtime_subdirs = ["projects", "todos", "statsig", "__pycache__"]
-                for _subdir in _runtime_subdirs:
-                    (claude_dir / _subdir).mkdir(exist_ok=True)
-
-                volumes[str(claude_dir)] = {"bind": "/home/claude/.claude", "mode": "ro"}
-                logger.info("OAuth mode: mounted %s → /home/claude/.claude (read-only)", claude_dir)
-
-            # Overlay tmpfs mounts on subdirectories that Claude Code writes to
-            # at runtime.  The parent ~/.claude bind mount remains read-only,
-            # preserving the auth-token / global-config security boundary.
-            # These tmpfs volumes are ephemeral: destroyed with the container.
-            #
-            # Subdirectories observed via `docker diff` on a running container:
-            #   projects/   — sub-agent task files, project-level session state
-            #   todos/      — Claude Code's internal todo tracking
-            #   statsig/    — feature-flag / telemetry cache
-            #   __pycache__ — Python bytecode cache used by the claude launcher
-            _claude_tmpfs: list[tuple[str, int]] = [
-                ("/home/claude/.claude/projects",   256 * 1024 * 1024),  # 256 MB
-                ("/home/claude/.claude/todos",        32 * 1024 * 1024),  #  32 MB
-                ("/home/claude/.claude/statsig",      32 * 1024 * 1024),  #  32 MB
-                ("/home/claude/.claude/__pycache__",  16 * 1024 * 1024),  #  16 MB
-            ]
-            for target, size in _claude_tmpfs:
-                extra_mounts.append(
-                    docker.types.Mount(
-                        target=target,
-                        source=None,
-                        type="tmpfs",
-                        read_only=False,
-                        tmpfs_size=size,
-                        tmpfs_mode=0o777,
+                # Copy .credentials.json — the actual OAuth access/refresh tokens.
+                # This hidden file is the primary auth credential read by Claude Code.
+                creds_src = claude_dir / ".credentials.json"
+                if creds_src.is_file():
+                    shutil.copy2(creds_src, claude_rw / ".credentials.json")
+                    logger.info("OAuth mode: copied .credentials.json into writable .claude dir")
+                else:
+                    logger.warning(
+                        "OAuth mode: ~/.claude/.credentials.json not found — "
+                        "Claude Code inside the container may fail to authenticate."
                     )
-                )
-                logger.info("OAuth mode: tmpfs overlay → %s (%d MB)", target, size // (1024 * 1024))
+
+                # Copy settings.json (non-sensitive preferences)
+                settings_src = claude_dir / "settings.json"
+                if settings_src.is_file():
+                    shutil.copy2(settings_src, claude_rw / "settings.json")
+                    logger.info("OAuth mode: copied settings.json into writable .claude dir")
+
+            volumes[str(claude_rw)] = {"bind": "/home/claude/.claude", "mode": "rw"}
+            logger.info("OAuth mode: mounted writable .claude copy → /home/claude/.claude")
 
         # SECURITY: Do not inherit host environment.  Inject only explicit vars.
         # - TERM: needed for Claude Code's PTY detection.
