@@ -123,10 +123,11 @@ class _DockerClaudeProcess:
         sock = self._socket
 
         def _read_exactly(n: int) -> bytes:
-            """Read exactly n bytes from the SocketIO, raising EOFError on close."""
+            """Read exactly n bytes from the socket (NpipeSocket or SocketIO)."""
             data = b""
+            _recv = getattr(sock, "recv", None) or sock.read
             while len(data) < n:
-                chunk = sock.read(n - len(data))
+                chunk = _recv(n - len(data))
                 if not chunk:
                     raise EOFError("Docker exec socket closed")
                 data += chunk
