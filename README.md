@@ -427,8 +427,8 @@ acceptance_criteria:
     - type: file_contains
       path: output/results.csv
       pattern: "convergence"
-    - type: command_succeeds
-      command: dotnet test
+    - type: command
+      run: dotnet test
 ```
 
 ---
@@ -539,15 +539,17 @@ acceptance_criteria:
       path: results.csv
       pattern: "MCSE"
 
-    - type: command_succeeds
-      command: dotnet test PrisonersDilemma.csproj
+    - type: command
+      run: dotnet test PrisonersDilemma.csproj
+      expected_exit: 0
 ```
 
 | Check type | Required fields | Passes when |
 |---|---|---|
 | `file_exists` | `path` | File exists in working dir |
 | `file_contains` | `path`, `pattern` | File content matches pattern (regex) |
-| `command_succeeds` | `command` | Shell command exits 0 |
+| `command` | `run` | Shell command exits `expected_exit` (default 0) |
+| `llm_judge` | `prompt` | LLM judge call returns a passing verdict |
 
 ---
 
