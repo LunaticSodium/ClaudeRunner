@@ -48,6 +48,7 @@ logger = logging.getLogger("claude_runner.main")
 
 # Default configuration paths
 _DEFAULT_CONFIG_DIR = pathlib.Path.home() / ".claude-runner"
+_DEFAULT_CONFIG_FILE = _DEFAULT_CONFIG_DIR / "config.yaml"
 _DEFAULT_SECRETS_FILE = _DEFAULT_CONFIG_DIR / "secrets.yaml"
 _DEFAULT_STATE_DIR = _DEFAULT_CONFIG_DIR / "state"
 _DEFAULT_LOG_DIR = _DEFAULT_CONFIG_DIR / "logs"
@@ -203,17 +204,25 @@ def _ensure_initialized() -> None:
             "\n[bold green]First run detected.[/bold green] "
             "An example project book has been copied to:\n"
             f"  [cyan]{example_dest}[/cyan]\n"
-            "Edit it to describe your first task, then run:\n"
-            "  [cyan]claude-runner run claude-runner-example.yaml[/cyan]\n"
-        )
-    else:
-        _console.print(
-            "\n[bold green]First run detected.[/bold green] "
-            "Run [cyan]claude-runner configure[/cyan] to set up "
-            "notifications and verify your environment.\n"
         )
 
+    # Touch the marker BEFORE invoking configure so that configure's own call
+    # to _ensure_initialized() sees first_run=False and does not recurse.
     _INITIALIZED_MARKER.touch()
+
+    _console.print(
+        Panel(
+            "[bold cyan]Welcome to claude-runner![/bold cyan]\n\n"
+            "Let's complete a quick one-time setup.\n"
+            "Press Ctrl+C at any time to skip and configure later with:\n"
+            "  [cyan]claude-runner configure[/cyan]",
+            border_style="cyan",
+        )
+    )
+    try:
+        configure.callback()  # invoke wizard logic directly (bypasses Click arg parsing)
+    except (KeyboardInterrupt, click.exceptions.Abort):
+        _console.print("\n[dim]Setup skipped. Run [cyan]claude-runner configure[/cyan] when ready.[/dim]")
 
 
 def _abort(message: str, exit_code: int = 1) -> None:
@@ -1183,7 +1192,7 @@ def configure() -> None:
     # ═══════════════════════════════════════════════════════════════════════════
     # Step 1: Detect Claude Code installation and authentication
     # ═══════════════════════════════════════════════════════════════════════════
-    _console.rule("[bold]Step 1 of 3: Claude Code Authentication[/bold]")
+    _console.rule("[bold]Step 1 of 4: Claude Code Authentication[/bold]")
 
     import shutil as _shutil  # noqa: PLC0415
     claude_path = _shutil.which("claude")
@@ -1248,7 +1257,7 @@ def configure() -> None:
     # ═══════════════════════════════════════════════════════════════════════════
     # Step B: Notifications (optional)
     # ═══════════════════════════════════════════════════════════════════════════
-    _console.rule("[bold]Step 2 of 3: Notifications (optional)[/bold]")
+    _console.rule("[bold]Step 2 of 4: Notifications (optional)[/bold]")
     _console.print(
         "claude-runner can notify you when a task completes or fails.\n\n"
         "  [bold]1[/bold]  ntfy.sh  [green](recommended — no account required)[/green]\n"
@@ -1280,9 +1289,48 @@ def configure() -> None:
         _info("Skipping notification configuration.")
 
     # ═══════════════════════════════════════════════════════════════════════════
+    # Step 3: Default project features
+    # ═══════════════════════════════════════════════════════════════════════════
+    _console.rule("[bold]Step 3 of 4: Default Project Features[/bold]")
+    _console.print(
+        "These defaults apply to every project run unless the project book overrides them.\n"
+    )
+
+    # ── CCCS ──────────────────────────────────────────────────────────────────
+    _console.print(
+        "[bold]CCCS — C# Standards Preset[/bold]\n"
+        "Injects citation-backed coding standards (architecture, numerical rigour,\n"
+        "testing, reproducibility) into CLAUDE.md before each run.  Best suited\n"
+        "for C# / .NET scientific simulation projects.\n"
+    )
+    enable_cccs = click.confirm("Enable CCCS for all projects by default?", default=False)
+
+    # ── Marathon mode ──────────────────────────────────────────────────────────
+    _console.print(
+        "\n[bold]Marathon mode[/bold]\n"
+        "Disables phase-aware model switching for all runs.  Use when you want\n"
+        "a single model throughout every task and never need automatic phase\n"
+        "detection.  Can always be toggled per project book.\n"
+    )
+    enable_marathon = click.confirm("Enable marathon mode by default?", default=False)
+
+    config_updates: dict = {}
+    if enable_cccs:
+        config_updates["cccs_enabled"] = True
+        _ok("CCCS preset enabled by default.")
+    if enable_marathon:
+        config_updates["marathon_mode_default"] = True
+        _ok("Marathon mode enabled by default.")
+
+    if config_updates:
+        _save_to_config_yaml(config_updates)
+    else:
+        _info("Feature defaults unchanged (both off).")
+
+    # ═══════════════════════════════════════════════════════════════════════════
     # Step C: Save credentials
     # ═══════════════════════════════════════════════════════════════════════════
-    _console.rule("[bold]Step 3 of 3: Save Credentials[/bold]")
+    _console.rule("[bold]Step 4 of 4: Save Credentials[/bold]")
 
     _console.print(
         "\nWhere should credentials be saved?\n\n"
@@ -1538,6 +1586,29 @@ def _test_smtp(
     except (smtplib.SMTPException, socket.error, OSError) as exc:
         _warn(f"SMTP error: {exc}")
         return False
+
+
+def _save_to_config_yaml(updates: dict) -> None:
+    """Merge *updates* into ~/.claude-runner/config.yaml (non-secret settings)."""
+    try:
+        import yaml  # type: ignore[import]
+    except ImportError:
+        _warn("pyyaml not installed — cannot write config.yaml.")
+        return
+    existing: dict = {}
+    if _DEFAULT_CONFIG_FILE.exists():
+        try:
+            with _DEFAULT_CONFIG_FILE.open("r", encoding="utf-8") as fh:
+                existing = yaml.safe_load(fh) or {}
+        except Exception:
+            existing = {}
+    existing.update(updates)
+    try:
+        with _DEFAULT_CONFIG_FILE.open("w", encoding="utf-8") as fh:
+            yaml.dump(existing, fh, default_flow_style=False, allow_unicode=True)
+        _ok(f"Settings saved to {_DEFAULT_CONFIG_FILE}")
+    except OSError as exc:
+        _warn(f"Could not write config.yaml: {exc}")
 
 
 def _save_to_secrets_yaml(secrets: dict) -> None:

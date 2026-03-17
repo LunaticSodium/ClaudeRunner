@@ -161,6 +161,12 @@ class Config:
     # Marathon mode sub-config (always present; opt-in via marathon.enabled).
     marathon: MarathonConfig = None  # type: ignore[assignment]  # set in __init__
 
+    # Global feature defaults — can be overridden per project book.
+    # cccs_enabled: inject the CCCS C# standards preset into every run by default.
+    # marathon_mode_default: skip phase-aware model switching for every run by default.
+    cccs_enabled: bool = False
+    marathon_mode_default: bool = False
+
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
@@ -173,6 +179,8 @@ class Config:
         self.state_dir = Config.state_dir
         self.tui = Config.tui
         self.marathon = MarathonConfig()
+        self.cccs_enabled = Config.cccs_enabled
+        self.marathon_mode_default = Config.marathon_mode_default
         self.resume_strategy = Config.resume_strategy
         self.max_rate_limit_waits = Config.max_rate_limit_waits
         self.docker_base_image = Config.docker_base_image
@@ -316,7 +324,7 @@ class Config:
         """
         _str_fields = {"sandbox_backend", "resume_strategy", "docker_base_image", "docker_socket"}
         _path_fields = {"log_dir", "state_dir"}
-        _bool_fields = {"tui"}
+        _bool_fields = {"tui", "cccs_enabled", "marathon_mode_default"}
         _int_fields = {"max_rate_limit_waits"}
 
         known_fields = _str_fields | _path_fields | _bool_fields | _int_fields
