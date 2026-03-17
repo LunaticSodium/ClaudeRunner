@@ -345,8 +345,16 @@ class GitOutputConfig(BaseModel):
         Prefix for auto-created branches.  The task name (slugified) is
         appended: ``claude-task/refactor-authentication-module``.
     auto_push:
-        Whether to ``git push`` after the commit.  Requires the working
-        directory to have a remote configured.
+        Whether to ``git push`` after the commit.  When ``remote_url`` is
+        set the runner configures the remote automatically; otherwise the
+        working directory must already have ``origin`` configured.
+    remote_url:
+        HTTPS remote URL to push to, e.g.
+        ``https://github.com/org/repo.git``.  When set the runner will
+        ``git init`` if needed, add/update ``origin`` to this URL, and
+        inject ``git_token`` from config for authentication.  Credentials
+        are passed via the URL (``https://<token>@host/...``) so they
+        never touch disk outside the runner process.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -354,6 +362,7 @@ class GitOutputConfig(BaseModel):
     enabled: bool = True
     branch_prefix: str = "claude-task/"
     auto_push: bool = False
+    remote_url: str | None = None
 
 
 class OutputConfig(BaseModel):

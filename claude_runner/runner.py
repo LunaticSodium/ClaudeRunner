@@ -1153,14 +1153,79 @@ class TaskRunner:
             logger.warning("Git workflow skipped: working directory unknown.")
             return ""
 
-        # --- Check this is a git repo ------------------------------------
+        remote_url: str | None = getattr(git_cfg, "remote_url", None)
+
+        # --- Ensure this is a git repo -----------------------------------
+        # If remote_url is set we init automatically; otherwise we require
+        # the directory to already be a repo (legacy behaviour).
         check = subprocess.run(
             ["git", "rev-parse", "--git-dir"],
             cwd=working_dir, capture_output=True, text=True, timeout=10,
         )
         if check.returncode != 0:
-            logger.info("Git workflow skipped: %s is not a git repository.", working_dir)
-            return ""
+            if not remote_url:
+                logger.info("Git workflow skipped: %s is not a git repository.", working_dir)
+                return ""
+            # Init a fresh repo so we can push to remote_url.
+            init_result = subprocess.run(
+                ["git", "init"],
+                cwd=working_dir, capture_output=True, text=True, timeout=30,
+            )
+            if init_result.returncode != 0:
+                logger.warning("Git workflow: git init failed: %s", init_result.stderr.strip())
+                return ""
+            # Set default branch to main.
+            subprocess.run(
+                ["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+                cwd=working_dir, capture_output=True, text=True, timeout=10,
+            )
+            logger.info("Git workflow: initialised new repo in %s", working_dir)
+
+        # --- Configure remote origin from remote_url (if given) ----------
+        if remote_url:
+            # Inject token into the URL for passwordless HTTPS auth.
+            # Token comes from config.git_token or config.secrets.git_token.
+            git_token = (
+                getattr(self._config, "git_token", None)
+                or getattr(getattr(self._config, "secrets", None), "git_token", None)
+            )
+            auth_url = remote_url
+            if git_token:
+                from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
+                parts = urlsplit(remote_url)
+                auth_url = urlunsplit(parts._replace(netloc=f"{git_token}@{parts.netloc}"))
+
+            # Set or update origin.
+            remote_check = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=working_dir, capture_output=True, text=True, timeout=10,
+            )
+            if remote_check.returncode == 0:
+                subprocess.run(
+                    ["git", "remote", "set-url", "origin", auth_url],
+                    cwd=working_dir, capture_output=True, text=True, timeout=10,
+                )
+            else:
+                subprocess.run(
+                    ["git", "remote", "add", "origin", auth_url],
+                    cwd=working_dir, capture_output=True, text=True, timeout=10,
+                )
+            logger.info("Git workflow: origin set to %s", remote_url)  # log URL without token
+
+        # --- Configure git identity if not set ---------------------------
+        identity_check = subprocess.run(
+            ["git", "config", "user.email"],
+            cwd=working_dir, capture_output=True, text=True, timeout=10,
+        )
+        if identity_check.returncode != 0 or not identity_check.stdout.strip():
+            subprocess.run(
+                ["git", "config", "user.email", "claude-runner@localhost"],
+                cwd=working_dir, capture_output=True, text=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "claude-runner"],
+                cwd=working_dir, capture_output=True, text=True, timeout=10,
+            )
 
         branch_prefix = getattr(git_cfg, "branch_prefix", "claude-task/")
         auto_push = getattr(git_cfg, "auto_push", False)
