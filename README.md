@@ -16,10 +16,10 @@ supervise manually.
 
 ## Table of Contents
 
-1. [Install](#install)
-2. [Prerequisites](#prerequisites)
-3. [Quick Start](#quick-start)
-4. [Feature Machine](#feature-machine)
+1. [Download](#download)
+2. [Install](#install)
+3. [Prerequisites](#prerequisites)
+4. [Quick Start](#quick-start)
 5. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
 6. [Phase-Aware Model Switching](#phase-aware-model-switching)
 7. [Project Book Reference](#project-book-reference)
@@ -30,6 +30,18 @@ supervise manually.
 12. [Configuration](#configuration)
 13. [Development](#development)
 14. [License](#license)
+
+---
+
+## Download
+
+Pre-built Windows executable — no Python required:
+
+**[→ Releases on GitHub](https://github.com/LunaticSodium/ClaudeRunner/releases)**
+
+Download `claude-runner.exe` from the latest release, place it anywhere on your `PATH`, and skip to [Prerequisites](#prerequisites).
+
+To build from source instead, see [Install](#install).
 
 ---
 
@@ -125,57 +137,14 @@ claude-runner will:
 
 ---
 
-## Feature Machine
-
-claude-runner is a **feature machine**: a bare runner core with two
-independent, mountable feature axes.  Every project book composes exactly
-the combination it needs — nothing is inherited from a global mode.
-
-### Protocol axis — *what Claude is told before the session*
-
-| Name | YAML | Behaviour |
-|---|---|---|
-| **universal** | *(omit `cccs`)* | No pre-session standards injection.  Claude operates on the task prompt alone. |
-| **cccs** | `cccs: {preset: cccs-v1.0}` | Injects citation-backed C# coding standards into `CLAUDE.md` before launch.  See [CCCS](#cccs--c-standards-preset). |
-
-### Runway axis — *how the runner behaves during the session*
-
-| Name | YAML | Behaviour |
-|---|---|---|
-| **dash** | *(omit `marathon_mode`)* | Phase-aware model switching active.  A background watchdog reads `PHASE-N:` commits and switches models on trigger.  Best for shorter or supervised runs. |
-| **marathon** | `marathon_mode: true` | Single model for the entire session.  No watchdog, no mid-session switches.  Designed for long unattended runs that must survive server restarts and API outages without intervention. |
-
-### The four combinations
-
-```
-              dash (phase switching)    marathon (single model)
-              ─────────────────────    ───────────────────────
-universal  │  bare runner,            bare runner,
-           │  phase switching         maximum stability
-           │
-cccs       │  standards-enforced,     standards-enforced,
-           │  phase switching         maximum stability
-```
-
-The two axes are fully independent — any combination is valid.
-
-### Example
-
-```yaml
-# CCCS protocol + marathon runway
-cccs:
-  preset: cccs-v1.0
-  profile: scisim
-
-marathon_mode: true
-```
-
----
-
 ## CCCS — C# Standards Preset
 
+Each project book has two independent toggles:
+- **`cccs`** — injects citation-backed C# coding standards into `CLAUDE.md` before the session starts.  Omit for no standards injection.
+- **`marathon_mode`** — keeps a single model for the whole session and survives server restarts/outages.  Omit (or `false`) for phase-aware model switching.
+
 **CCCS** (Claude Code C# Standards for Scientific Simulation) is the built-in
-`cccs` protocol.  Before the first `claude -p` call it:
+standards preset.  Before the first `claude -p` call it:
 
 1. **Validates the project YAML** against a structural schema.
 2. **Injects a CLAUDE.md fragment** — citation-backed rules that Claude sees
