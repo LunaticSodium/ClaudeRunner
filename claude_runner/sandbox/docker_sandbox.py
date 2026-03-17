@@ -113,11 +113,36 @@ class _DockerClaudeProcess:
     # ------------------------------------------------------------------
 
     def _pump(self) -> None:
-        """Read output from the docker exec socket and dispatch lines."""
+        """Read output from the docker exec socket and dispatch lines.
+
+        With tty=False, Docker multiplexes stdout/stderr in frames:
+          [stream_type(1)][padding(3)][size(4)][data(size)]
+        We read frames and dispatch only stdout (type=1) and stderr (type=2).
+        """
         buf = b""
+        sock = self._socket
+
+        # Unwrap to the raw socket so we can do fixed-size reads.
+        raw = getattr(sock, "_sock", sock)
+
+        def _read_exactly(n: int) -> bytes:
+            data = b""
+            while len(data) < n:
+                chunk = raw.recv(n - len(data))
+                if not chunk:
+                    raise EOFError("Docker exec socket closed")
+                data += chunk
+            return data
+
         try:
-            for chunk in self._socket:
-                buf += chunk
+            while True:
+                header = _read_exactly(8)
+                _stream_type = header[0]          # 1=stdout, 2=stderr (ignore 0=stdin)
+                frame_size = int.from_bytes(header[4:8], "big")
+                if frame_size == 0:
+                    continue
+                payload = _read_exactly(frame_size)
+                buf += payload
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     decoded = line.decode(errors="replace").rstrip("\r")
@@ -125,7 +150,7 @@ class _DockerClaudeProcess:
                         self._on_line(decoded)
                     except Exception:  # noqa: BLE001
                         logger.exception("on_line callback raised")
-        except Exception as exc:  # noqa: BLE001
+        except (EOFError, OSError, Exception) as exc:  # noqa: BLE001
             logger.debug("Docker exec socket closed: %s", exc)
         finally:
             # Flush remaining buffer
@@ -356,10 +381,10 @@ class DockerSandbox:
         exec_id = self._client.api.exec_create(
             self._container.id,
             cmd=["bash", "-lc", cmd],
-            stdin=True,
+            stdin=False,
             stdout=True,
             stderr=True,
-            tty=True,
+            tty=False,
             environment=exec_env,
             workdir="/workspace",
         )["Id"]
@@ -367,7 +392,7 @@ class DockerSandbox:
         socket = self._client.api.exec_start(
             exec_id,
             detach=False,
-            tty=True,
+            tty=False,
             socket=True,
         )
 

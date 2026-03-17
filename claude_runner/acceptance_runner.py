@@ -97,13 +97,13 @@ def _check_command(check: "AcceptanceCheck", working_dir: Path) -> Optional[str]
         return "command check is missing 'run'"
     expected_exit = check.expect_exit if check.expect_exit is not None else 0
     try:
-        args = shlex.split(check.run)
         result = subprocess.run(
-            args,
+            check.run,
             cwd=working_dir,
             capture_output=True,
             text=True,
             timeout=120,
+            shell=True,
         )
         actual_exit = result.returncode
     except FileNotFoundError as exc:
