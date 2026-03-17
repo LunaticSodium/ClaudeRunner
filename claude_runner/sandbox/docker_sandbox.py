@@ -117,18 +117,16 @@ class _DockerClaudeProcess:
 
         With tty=False, Docker multiplexes stdout/stderr in frames:
           [stream_type(1)][padding(3)][size(4)][data(size)]
-        We read frames and dispatch only stdout (type=1) and stderr (type=2).
+        We read frames using SocketIO.read() and dispatch lines to on_line.
         """
         buf = b""
         sock = self._socket
 
-        # Unwrap to the raw socket so we can do fixed-size reads.
-        raw = getattr(sock, "_sock", sock)
-
         def _read_exactly(n: int) -> bytes:
+            """Read exactly n bytes from the SocketIO, raising EOFError on close."""
             data = b""
             while len(data) < n:
-                chunk = raw.recv(n - len(data))
+                chunk = sock.read(n - len(data))
                 if not chunk:
                     raise EOFError("Docker exec socket closed")
                 data += chunk
@@ -137,7 +135,7 @@ class _DockerClaudeProcess:
         try:
             while True:
                 header = _read_exactly(8)
-                _stream_type = header[0]          # 1=stdout, 2=stderr (ignore 0=stdin)
+                # stream_type: 1=stdout, 2=stderr
                 frame_size = int.from_bytes(header[4:8], "big")
                 if frame_size == 0:
                     continue
