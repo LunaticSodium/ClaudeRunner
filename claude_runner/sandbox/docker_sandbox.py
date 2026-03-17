@@ -14,6 +14,7 @@ Docker socket (Windows):  npipe:////./pipe/docker_engine
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 import threading
@@ -91,6 +92,12 @@ class _DockerClaudeProcess:
         self._thread.join(timeout=timeout)
         return self._return_code if self._return_code is not None else -1
 
+    async def wait_async(self) -> int:
+        """Async-compatible wait — runs the blocking join in a thread executor."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._thread.join)
+        return self._return_code if self._return_code is not None else -1
+
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
@@ -144,10 +151,11 @@ class _DockerClaudeProcess:
         else:
             self._return_code = -1
 
-        try:
-            self._on_exit(self._return_code)
-        except Exception:  # noqa: BLE001
-            logger.exception("on_exit callback raised")
+        if self._on_exit is not None:
+            try:
+                self._on_exit(self._return_code)
+            except Exception:  # noqa: BLE001
+                logger.exception("on_exit callback raised")
 
 
 # ---------------------------------------------------------------------------

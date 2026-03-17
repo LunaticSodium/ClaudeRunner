@@ -621,7 +621,11 @@ class TaskRunner:
             # whichever comes first.  We poll with a short timeout so
             # we can service the deadline check.
             remaining_s = (deadline - now).total_seconds()
-            done_task = asyncio.ensure_future(self._process.wait())
+            _wait_fn = getattr(self._process, "wait_async", None) or self._process.wait
+            done_task = asyncio.ensure_future(
+                _wait_fn() if asyncio.iscoroutinefunction(_wait_fn)
+                else asyncio.get_event_loop().run_in_executor(None, _wait_fn)
+            )
             rl_task = asyncio.ensure_future(self._rate_limit_event.wait())
             rc_task = asyncio.ensure_future(self._runner_complete_event.wait())
             re_task = asyncio.ensure_future(self._runner_error_event.wait())
