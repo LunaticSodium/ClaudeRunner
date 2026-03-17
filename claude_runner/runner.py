@@ -1162,6 +1162,7 @@ class TaskRunner:
             ["git", "rev-parse", "--git-dir"],
             cwd=working_dir, capture_output=True, text=True, timeout=10,
         )
+        freshly_initted = False
         if check.returncode != 0:
             if not remote_url:
                 logger.info("Git workflow skipped: %s is not a git repository.", working_dir)
@@ -1179,7 +1180,16 @@ class TaskRunner:
                 ["git", "symbolic-ref", "HEAD", "refs/heads/main"],
                 cwd=working_dir, capture_output=True, text=True, timeout=10,
             )
+            freshly_initted = True
             logger.info("Git workflow: initialised new repo in %s", working_dir)
+
+        # --- Write .gitattributes for fresh repos -------------------------
+        # Only written when we just called git init (new workspace with no
+        # prior git history).  Existing repos — including those where Claude
+        # cloned or pulled code from GitHub during the task — are left alone
+        # so we don't override their established line-ending conventions.
+        if freshly_initted:
+            _write_gitattributes(working_dir)
 
         # --- Configure remote origin from remote_url (if given) ----------
         if remote_url:
@@ -1969,6 +1979,32 @@ class TaskRunner:
 # ---------------------------------------------------------------------------
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def _write_gitattributes(repo_path: Path) -> None:
+    """Write a .gitattributes file that normalises all text files to LF.
+
+    Called only for freshly ``git init``-ed repos so we never override the
+    line-ending conventions of an existing repository.  The file is staged
+    immediately so it takes effect before the first ``git add -A``, which
+    prevents the spurious "LF will be replaced by CRLF" warnings on Windows.
+    """
+    content = (
+        "* text=auto eol=lf\n"
+        "*.sh text eol=lf\n"
+        "*.py text eol=lf\n"
+        "*.cs text eol=lf\n"
+        "*.yaml text eol=lf\n"
+        "*.json text eol=lf\n"
+        "*.md text eol=lf\n"
+    )
+    ga_path = repo_path / ".gitattributes"
+    ga_path.write_text(content, encoding="utf-8")
+    subprocess.run(
+        ["git", "add", ".gitattributes"],
+        cwd=repo_path, check=True, capture_output=True,
+    )
+    logger.debug("Git workflow: wrote .gitattributes in %s", repo_path)
 
 
 def _strip_ansi(text: str) -> str:
