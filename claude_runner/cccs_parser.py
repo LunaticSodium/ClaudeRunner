@@ -62,7 +62,7 @@ class CCCSSpec:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "CCCSSpec":
+    def from_file(cls, path: str | Path) -> CCCSSpec:
         """Load and validate a ``.cccs.toml`` file.
 
         Raises :class:`CCCSParseError` when the file is missing, not valid

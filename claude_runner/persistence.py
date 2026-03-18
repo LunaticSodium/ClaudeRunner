@@ -100,7 +100,7 @@ class TaskState:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TaskState":
+    def from_dict(cls, data: dict[str, Any]) -> TaskState:
         """
         Construct a ``TaskState`` from a plain dict (e.g. loaded from JSON).
 
@@ -290,7 +290,7 @@ class PersistenceManager:
     # Pause/resume helpers
     # ------------------------------------------------------------------
 
-    def write_paused_state(self, state: "TaskState") -> None:
+    def write_paused_state(self, state: TaskState) -> None:
         """Persist *state* with ``current_phase="paused"`` and ``paused=True``.
 
         This is a convenience wrapper around :meth:`save` that ensures the
@@ -307,7 +307,7 @@ class PersistenceManager:
         self.save(state)
         logger.info("Paused state written for task %r.", self._task_name)
 
-    def read_state(self, project_id: str | None = None) -> "TaskState | None":  # noqa: ARG002
+    def read_state(self, project_id: str | None = None) -> TaskState | None:  # noqa: ARG002
         """Load and return the persisted :class:`TaskState` (alias for :meth:`load`).
 
         The *project_id* parameter is accepted for API symmetry but ignored —

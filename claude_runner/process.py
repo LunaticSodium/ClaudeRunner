@@ -22,15 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
-import os
 import subprocess
 import sys
-import logging
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +70,7 @@ class ProcessError(Exception):
 # Backend detection
 # ---------------------------------------------------------------------------
 
-_BACKEND: Optional[str] = None  # "winpty" | "wexpect" | None (detected lazily)
+_BACKEND: str | None = None  # "winpty" | "wexpect" | None (detected lazily)
 
 
 def _detect_backend() -> str:
@@ -151,12 +150,12 @@ class ClaudeProcess:
         self._cols = cols
         self._rows = rows
 
-        self._backend: Optional[str] = None
+        self._backend: str | None = None
         self._pty = None          # winpty.PtyProcess  or  wexpect child
         self._pid: int = -1
-        self._exit_code: Optional[int] = None
+        self._exit_code: int | None = None
 
-        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -277,7 +276,7 @@ class ClaudeProcess:
         return self._pid
 
     @property
-    def exit_code(self) -> Optional[int]:
+    def exit_code(self) -> int | None:
         """
         Exit code of the subprocess, or None if it is still running.
         -1 indicates an abnormal termination without a retrievable exit status.
@@ -361,7 +360,7 @@ class ClaudeProcess:
                 except Exception as cb_exc:
                     log.warning("on_exit callback raised: %s", cb_exc)
 
-    def _read_chunk(self) -> Optional[str]:
+    def _read_chunk(self) -> str | None:
         """
         Read a chunk of output from the PTY.
 
@@ -382,9 +381,8 @@ class ClaudeProcess:
             log.debug("_read_chunk error (treating as EOF): %s", exc)
             return None
 
-    def _read_chunk_winpty(self) -> Optional[str]:
+    def _read_chunk_winpty(self) -> str | None:
         """Read from a pywinpty PtyProcess."""
-        import winpty
 
         if not self._pty.isalive():
             # Drain any buffered data first
@@ -409,7 +407,7 @@ class ClaudeProcess:
             return data.decode("utf-8", errors="replace")
         return data
 
-    def _read_chunk_wexpect(self) -> Optional[str]:
+    def _read_chunk_wexpect(self) -> str | None:
         """Read from a wexpect child."""
         import wexpect
 
@@ -527,11 +525,11 @@ class PipeProcess:
         self._on_exit = on_exit
         self._show_console = show_console
 
-        self._proc: Optional[subprocess.Popen] = None
+        self._proc: subprocess.Popen | None = None
         self._pid: int = -1
-        self._exit_code: Optional[int] = None
+        self._exit_code: int | None = None
 
-        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         # Set by _deliver_line() when the first output line arrives.
         # Used by start() to verify the process is producing output.
@@ -686,7 +684,7 @@ class PipeProcess:
         return self._pid
 
     @property
-    def exit_code(self) -> Optional[int]:
+    def exit_code(self) -> int | None:
         return self._exit_code
 
     # ------------------------------------------------------------------

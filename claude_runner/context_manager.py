@@ -31,7 +31,6 @@ import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -140,9 +139,9 @@ class ContextManager:
         threshold_tokens: int = 150_000,
         reset_on_rate_limit: bool = True,
         inject_log_on_resume: bool = True,
-        progress_log_path: Optional[Path] = None,
-        on_inject_checkpoint: Optional[Callable[[str], None]] = None,
-        context_anchors: Optional[str] = None,
+        progress_log_path: Path | None = None,
+        on_inject_checkpoint: Callable[[str], None] | None = None,
+        context_anchors: str | None = None,
     ) -> None:
         if threshold_tokens <= 0:
             raise ValueError(
@@ -152,11 +151,11 @@ class ContextManager:
         self._threshold_tokens: int = threshold_tokens
         self.reset_on_rate_limit: bool = reset_on_rate_limit
         self.inject_log_on_resume: bool = inject_log_on_resume
-        self.progress_log_path: Optional[Path] = progress_log_path
-        self._on_inject_checkpoint: Optional[Callable[[str], None]] = on_inject_checkpoint
+        self.progress_log_path: Path | None = progress_log_path
+        self._on_inject_checkpoint: Callable[[str], None] | None = on_inject_checkpoint
         # context_anchors: stripped plain-text instructions prepended verbatim to
         # every outbound prompt.  None means the feature is disabled.
-        self._context_anchors: Optional[str] = context_anchors.strip() if context_anchors else None
+        self._context_anchors: str | None = context_anchors.strip() if context_anchors else None
 
         # Mutable state
         self._token_estimate: int = 0

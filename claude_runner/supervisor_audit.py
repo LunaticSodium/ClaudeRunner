@@ -101,16 +101,16 @@ def append_self_check_entry(
         log_path = audit_dir / "self_check_log.md"
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         entry_lines = [
-            f"\n---\n",
+            "\n---\n",
             f"## Self-Check Entry [{counter}/{limit}] — Dash {dash_n}",
-            f"",
+            "",
             f"**Timestamp:** {ts}",
             f"**Issue found:** {issue}",
             f"**Source:** {source}",
             f"**Severity:** {severity}",
             f"**Recommended action:** {recommended_action}",
             f"**Change made:** {change_made}",
-            f"",
+            "",
         ]
         entry = "\n".join(entry_lines)
         with log_path.open("a", encoding="utf-8") as fh:

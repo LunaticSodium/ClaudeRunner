@@ -20,9 +20,8 @@ import logging
 import re
 import subprocess
 import threading
-import time
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +56,10 @@ class ModelWatchdog:
     def __init__(
         self,
         working_dir: Path,
-        rules: List,  # list[PhaseRule] — avoids circular import at call site
+        rules: list,  # list[PhaseRule] — avoids circular import at call site
         apply_fn: Callable[[str, str], None],
         poll_interval: float = 15.0,
-        get_token_pct: Optional[Callable[[], float]] = None,
+        get_token_pct: Callable[[], float] | None = None,
     ) -> None:
         self._working_dir = working_dir
         self._rules = rules
@@ -69,7 +68,7 @@ class ModelWatchdog:
         self._get_token_pct = get_token_pct
 
         self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
 
         # Indices of rules that have already fired — prevents re-firing.
         self._fired: set[int] = set()

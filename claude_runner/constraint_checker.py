@@ -20,7 +20,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .project import ImplementationConstraint
@@ -52,9 +52,9 @@ class ConstraintResult:
 
 
 def check_constraint(
-    constraint: "ImplementationConstraint",
+    constraint: ImplementationConstraint,
     working_dir: Path,
-    api_key: Optional[str] = None,
+    api_key: str | None = None,
 ) -> ConstraintResult:
     """Verify a single *constraint* against *working_dir*.
 
@@ -95,9 +95,9 @@ def check_constraint(
 
 
 def check_all_constraints(
-    constraints: "list[ImplementationConstraint]",
+    constraints: list[ImplementationConstraint],
     working_dir: Path,
-    api_key: Optional[str] = None,
+    api_key: str | None = None,
 ) -> list[ConstraintResult]:
     """Verify all *constraints* and return one :class:`ConstraintResult` each.
 
@@ -137,7 +137,7 @@ def check_all_constraints(
 
 
 def _check_file_contains(
-    constraint: "ImplementationConstraint",
+    constraint: ImplementationConstraint,
     working_dir: Path,
 ) -> ConstraintResult:
     """Verify using Python re.search (portable alternative to grep -P)."""
@@ -194,7 +194,7 @@ def _check_file_contains(
 
 
 def _check_llm_judge(
-    constraint: "ImplementationConstraint",
+    constraint: ImplementationConstraint,
     working_dir: Path,
     api_key: str,
 ) -> ConstraintResult:
@@ -253,7 +253,8 @@ def _check_llm_judge(
             system="You are a code reviewer. Answer only YES or NO.",
             messages=[{"role": "user", "content": user_message}],
         )
-        verdict_raw = response.content[0].text.strip()
+        block = response.content[0]
+        verdict_raw = (block.text if hasattr(block, "text") else "").strip()
     except Exception as exc:
         return ConstraintResult(
             id=constraint.id,

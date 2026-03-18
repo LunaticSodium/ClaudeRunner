@@ -17,7 +17,6 @@ Commands
 from __future__ import annotations
 
 import asyncio
-import glob
 import json
 import logging
 import os
@@ -25,9 +24,7 @@ import pathlib
 import platform
 import shutil
 import smtplib
-import socket
 import sys
-from typing import Optional
 
 import click
 from rich.console import Console
@@ -81,7 +78,7 @@ def _check_docker_quick() -> bool:
     return pathlib.Path("/var/run/docker.sock").exists()
 
 
-def _find_example_template() -> Optional[pathlib.Path]:
+def _find_example_template() -> pathlib.Path | None:
     """Return the path to the bundled examples.yaml template."""
     if getattr(sys, "frozen", False):
         p = pathlib.Path(getattr(sys, "_MEIPASS", "")) / "examples.yaml"
@@ -186,7 +183,7 @@ def _ensure_initialized() -> None:
         return
 
     # Copy example project book next to the exe (frozen builds only)
-    example_dest: Optional[pathlib.Path] = None
+    example_dest: pathlib.Path | None = None
     if getattr(sys, "frozen", False):
         exe_dir = pathlib.Path(sys.argv[0]).parent
         if not list(exe_dir.glob("*.yaml")):
@@ -246,7 +243,7 @@ def _warn(message: str) -> None:
 _OAUTH_SENTINEL = "__claude_oauth__"
 
 
-def _resolve_api_key() -> Optional[str]:
+def _resolve_api_key() -> str | None:
     """
     Resolve ANTHROPIC_API_KEY through the 5-source priority chain.
 
@@ -345,7 +342,7 @@ def _load_global_config():
         _abort(f"Failed to load global config: {exc}")
 
 
-def _find_state_file(task_name: Optional[str]) -> Optional[pathlib.Path]:
+def _find_state_file(task_name: str | None) -> pathlib.Path | None:
     """Locate a state file for the given task name (or the most recent one)."""
     if task_name:
         candidate = _DEFAULT_STATE_DIR / f"{task_name}.json"
@@ -854,7 +851,7 @@ def queue(queue_file: str, tui: bool) -> None:
 
     _ensure_initialized()
 
-    with open(queue_file, "r", encoding="utf-8") as fh:
+    with open(queue_file, encoding="utf-8") as fh:
         queue_cfg = yaml.safe_load(fh)
 
     tasks = queue_cfg.get("tasks", [])
@@ -891,7 +888,7 @@ def queue(queue_file: str, tui: bool) -> None:
                 failed.append(pb_path)
                 _warn(f"Task failed: {pb_path}")
                 if fail_fast:
-                    _abort(f"Stopping queue after failure (fail_fast=true).")
+                    _abort("Stopping queue after failure (fail_fast=true).")
                     break
 
     if failed:
@@ -1103,7 +1100,7 @@ def validate(project_book: str) -> None:
 
 @cli.command("status")
 @click.option("--task", default=None, help="YAML filename stem to inspect, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
-def status(task: Optional[str]) -> None:
+def status(task: str | None) -> None:
     """Check the status of a running or completed task.
 
     If --task is omitted, shows the most recently modified state file.
@@ -1152,7 +1149,7 @@ def status(task: Optional[str]) -> None:
 @cli.command("abort")
 @click.option("--task", default=None, help="YAML filename stem to abort, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 @click.option("--force", is_flag=True, default=False, help="Skip confirmation prompt.")
-def abort(task: Optional[str], force: bool) -> None:
+def abort(task: str | None, force: bool) -> None:
     """Abort a running task.
 
     This sends a termination signal to the Claude Code process and cleans up the
@@ -1224,7 +1221,7 @@ def abort(task: Optional[str], force: bool) -> None:
 @click.option("--raw", is_flag=True, default=False, help="Print raw log without formatting.")
 @click.option("--trash", "show_trash", is_flag=True, default=False, help="List trash log entries from ~/.claude-runner/trash/.")
 @click.option("--last", "last_n", default=None, type=int, help="With --trash: show full content of N most recent trash entries (default 1 when flag given).")
-def logs(task: Optional[str], tail: int, raw: bool, show_trash: bool, last_n: Optional[int]) -> None:
+def logs(task: str | None, tail: int, raw: bool, show_trash: bool, last_n: int | None) -> None:
     """View logs from a task's last run.
 
     Searches ~/.claude-runner/logs/ for a log file matching the task name.
@@ -1271,8 +1268,8 @@ def logs(task: Optional[str], tail: int, raw: bool, show_trash: bool, last_n: Op
             for tf in trash_files:
                 try:
                     first_lines = tf.read_text(encoding="utf-8", errors="replace").splitlines()
-                    stage = next((l.replace("stage: ", "") for l in first_lines if l.startswith("stage: ")), "?")
-                    reason = next((l.replace("reason: ", "") for l in first_lines if l.startswith("reason: ")), "")
+                    stage = next((ln.replace("stage: ", "") for ln in first_lines if ln.startswith("stage: ")), "?")
+                    reason = next((ln.replace("reason: ", "") for ln in first_lines if ln.startswith("reason: ")), "")
                     reason_preview = reason[:80]
                 except Exception:
                     stage = "?"
@@ -1565,8 +1562,8 @@ def _run_ntfy_guide(secrets: dict) -> None:
     # Send a test notification.
     _info(f"Sending test notification to {ntfy_url} …")
     try:
+        import urllib.error  # noqa: PLC0415
         import urllib.request  # noqa: PLC0415
-        import urllib.error    # noqa: PLC0415
         req = urllib.request.Request(
             ntfy_url,
             data=b"claude-runner is configured and ready.",
@@ -1614,10 +1611,10 @@ def _run_gmail_app_password_guide(email_address: str, secrets: dict) -> None:
         "  → Under [italic]'How you sign in to Google'[/italic], click [italic]'2-Step Verification'[/italic]\n"
         "  → Follow the setup flow, then return here.\n"
     )
-    choice = click.prompt(
+    click.prompt(
         "Press Enter when ready, or type S to skip if already enabled",
         default="",
-    ).strip().upper()
+    )
 
     # ── Step 2 of 4: Create an App Password ───────────────────────────────────
     _console.print(
@@ -1710,7 +1707,7 @@ def _run_generic_smtp_guide(email_address: str, secrets: dict) -> None:
             "Saving anyway — re-run 'configure' to retry."
         )
     else:
-        _ok(f"SMTP test successful.")
+        _ok("SMTP test successful.")
 
     secrets.update(
         {
@@ -1757,7 +1754,7 @@ def _test_smtp(
             )
             server.sendmail(username, [to_address], message)
         return True
-    except (smtplib.SMTPException, socket.error, OSError) as exc:
+    except (smtplib.SMTPException, OSError) as exc:
         _warn(f"SMTP error: {exc}")
         return False
 
@@ -1924,7 +1921,7 @@ def docker_update_cmd(no_cache: bool) -> None:
         pathlib.Path(__file__).parent.parent / "docker" / "Dockerfile",
         pathlib.Path.cwd() / "docker" / "Dockerfile",
     ]
-    dockerfile_path: Optional[pathlib.Path] = None
+    dockerfile_path: pathlib.Path | None = None
     for candidate in dockerfile_candidates:
         if candidate.exists():
             dockerfile_path = candidate
@@ -2007,7 +2004,7 @@ def _wait_for_key(prompt: str = "\nPress any key to exit...") -> None:
     print()
 
 
-def _bundled_projects_dir() -> Optional[pathlib.Path]:
+def _bundled_projects_dir() -> pathlib.Path | None:
     """Return the directory to scan for project YAML files.
 
     In a frozen PyInstaller exe this is the folder containing the exe itself,
@@ -2046,7 +2043,7 @@ def _resolve_project_path(user_input: str) -> str:
     return user_input
 
 
-def _pick_project_interactively() -> Optional[str]:
+def _pick_project_interactively() -> str | None:
     """List bundled project YAML files and let the user pick one by number,
     or type a custom path.  Returns the resolved path, or None to cancel.
     """
@@ -2142,8 +2139,8 @@ def marathon_cmd() -> None:
     Publishes startup/shutdown notifications to the ntfy out channel.
     """
     _ensure_initialized()
-    from .daemon import MarathonDaemon  # noqa: PLC0415
     from .config import Config  # noqa: PLC0415
+    from .daemon import MarathonDaemon  # noqa: PLC0415
 
     cfg = Config.load()
     daemon = MarathonDaemon(config=cfg)
@@ -2170,8 +2167,9 @@ def stop_cmd() -> None:
     """
     _ensure_initialized()
     import signal  # noqa: PLC0415
-    from .daemon import read_daemon_pid  # noqa: PLC0415
+
     from .autostart import unregister  # noqa: PLC0415
+    from .daemon import read_daemon_pid  # noqa: PLC0415
 
     pid = read_daemon_pid()
     if pid is not None:

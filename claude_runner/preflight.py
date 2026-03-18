@@ -38,7 +38,7 @@ class PreflightError(Exception):
 
 
 def run_preflight(
-    project: "ProjectBook",
+    project: ProjectBook,
     working_dir: Path,
     skip: bool = False,
 ) -> list[str]:
@@ -112,7 +112,7 @@ def run_preflight(
 # ---------------------------------------------------------------------------
 
 
-def _check_and_resolve_model_ids(project: "ProjectBook", warnings: list[str]) -> None:
+def _check_and_resolve_model_ids(project: ProjectBook, warnings: list[str]) -> None:
     """Run alias resolution and warn about any unknown/stale model IDs."""
     try:
         from .model_resolver import resolve_model_ids  # noqa: PLC0415
@@ -125,7 +125,7 @@ def _check_and_resolve_model_ids(project: "ProjectBook", warnings: list[str]) ->
         _check_model_ids_format(project, warnings)
 
 
-def _check_model_ids_format(project: "ProjectBook", warnings: list[str]) -> None:
+def _check_model_ids_format(project: ProjectBook, warnings: list[str]) -> None:
     """Warn if any model_id in the schedule looks like a stale alias (format check only)."""
     schedule = getattr(project, "model_schedule", None)
     if schedule is None:
@@ -143,7 +143,7 @@ def _check_model_ids_format(project: "ProjectBook", warnings: list[str]) -> None
             )
 
 
-def _check_required_env(project: "ProjectBook", warnings: list[str]) -> None:  # noqa: ARG001
+def _check_required_env(project: ProjectBook, warnings: list[str]) -> None:  # noqa: ARG001
     """Hard-fail if any env var in preflight.required_env is missing."""
     preflight_cfg = getattr(project, "preflight", None)
     if preflight_cfg is None:
@@ -159,7 +159,7 @@ def _check_required_env(project: "ProjectBook", warnings: list[str]) -> None:  #
         logger.debug("[preflight] All %d required_env var(s) present.", len(required))
 
 
-def _check_ntfy(project: "ProjectBook", warnings: list[str]) -> None:
+def _check_ntfy(project: ProjectBook, warnings: list[str]) -> None:
     """Warn if configured ntfy channel is unreachable (do not fail the run)."""
     try:
         _do_check_ntfy(project, warnings)
@@ -167,7 +167,7 @@ def _check_ntfy(project: "ProjectBook", warnings: list[str]) -> None:
         logger.debug("[preflight] ntfy reachability check raised unexpectedly: %s", exc)
 
 
-def _do_check_ntfy(project: "ProjectBook", warnings: list[str]) -> None:
+def _do_check_ntfy(project: ProjectBook, warnings: list[str]) -> None:
     """Inner ntfy check (may raise; wrapped by _check_ntfy)."""
     # Only check if notify config has channels — look for ntfy-style channels
     # by checking secrets config for ntfy configuration.

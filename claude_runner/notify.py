@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re as _re
 import time
 from datetime import datetime, timezone
 from typing import Callable
@@ -54,7 +55,6 @@ _TRUNCATION_MARKER: str = "…[truncated]"
 
 # Heuristic: lines that look like tool invocations (Claude Code tool use).
 # We scan backwards past these to find the last natural-language block.
-import re as _re
 _TOOL_LINE_PATTERN: _re.Pattern = _re.compile(
     r"^(?:"
     r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●○◉►▶→]"   # spinner / bullet characters

@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .project import SupervisorProtocolConfig
@@ -64,7 +63,7 @@ class SupervisorProtocol:
 
     def __init__(
         self,
-        config: "SupervisorProtocolConfig",
+        config: SupervisorProtocolConfig,
         project_id: str,
         ntfy_client,
         working_dir: Path,
@@ -377,7 +376,7 @@ class SupervisorProtocol:
             logger.warning("_poll_cmd failed: %s", exc)
             return []
 
-    def _wait_for_self_check_response(self, dash_n: int) -> Optional[dict]:
+    def _wait_for_self_check_response(self, dash_n: int) -> dict | None:
         """Poll pending.md for a self-check response from Claude Code.
 
         Returns a dict with parsed fields, or ``None`` on timeout.

@@ -13,7 +13,7 @@ import os
 import pathlib
 import threading
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .config import Config as GlobalConfig
@@ -33,13 +33,13 @@ class MarathonDaemon:
     mode, or explicitly via ``claude-runner marathon``.
     """
 
-    def __init__(self, config: "GlobalConfig") -> None:
+    def __init__(self, config: GlobalConfig) -> None:
         self.config = config
         self.start_time: datetime = datetime.now(timezone.utc)
-        self.active_task: Optional[str] = None  # task name string
+        self.active_task: str | None = None  # task name string
         self._shutdown = threading.Event()
-        self._ntfy_client: Optional[object] = None  # NtfyClient, set lazily
-        self._supervisor: Optional["SupervisorProtocol"] = None  # set by caller if enabled
+        self._ntfy_client: object | None = None  # NtfyClient, set lazily
+        self._supervisor: SupervisorProtocol | None = None  # set by caller if enabled
 
     # ------------------------------------------------------------------
     # Public interface
@@ -90,7 +90,7 @@ class MarathonDaemon:
             If no state file exists for *project_id*.
         """
         import json  # noqa: PLC0415
-        from .persistence import PersistenceManager  # noqa: PLC0415
+
 
         state_dir = pathlib.Path.home() / ".claude-runner" / "state"
         state_path = state_dir / f"{project_id}.json"
@@ -241,7 +241,7 @@ class MarathonDaemon:
 
             # Load persisted last_message_id.
             state = _load_ntfy_state()
-            since_id: Optional[str] = state.get("last_message_id")
+            since_id: str | None = state.get("last_message_id")
 
             messages = client.poll("cmd", since_id)
             for msg in messages:
@@ -262,7 +262,7 @@ class MarathonDaemon:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to publish to out channel: %s", exc)
 
-    def _get_ntfy_client(self) -> Optional[object]:
+    def _get_ntfy_client(self) -> object | None:
         """Lazily initialise and return NtfyClient."""
         if self._ntfy_client is None:
             try:
@@ -298,7 +298,7 @@ def _remove_pid_file() -> None:
         logger.warning("Failed to remove PID file: %s", exc)
 
 
-def read_daemon_pid() -> Optional[int]:
+def read_daemon_pid() -> int | None:
     """Read the daemon PID from the PID file.  Returns None if not found."""
     try:
         if _PID_FILE.exists():

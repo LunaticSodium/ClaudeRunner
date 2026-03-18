@@ -20,13 +20,12 @@ import logging
 import re
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .config import ConfigError
-
 
 # ---------------------------------------------------------------------------
 # Custom YAML loader — YAML 1.2-style booleans only
@@ -334,7 +333,7 @@ class SandboxConfig(BaseModel):
             "'native' (runs on host, no container), or 'auto' (docker if available)."
         ),
     )
-    working_dir: Optional[Path] = Field(
+    working_dir: Path | None = Field(
         default=None,
         description=(
             "Host-side working directory for the task.  When omitted, claude-runner "
@@ -363,12 +362,12 @@ class SandboxConfig(BaseModel):
 
     @field_validator("working_dir", mode="before")
     @classmethod
-    def coerce_working_dir(cls, v: Any) -> Optional[Path]:
+    def coerce_working_dir(cls, v: Any) -> Path | None:
         return Path(v) if v is not None else None
 
     @field_validator("working_dir")
     @classmethod
-    def working_dir_must_be_dir(cls, v: Optional[Path]) -> Optional[Path]:
+    def working_dir_must_be_dir(cls, v: Path | None) -> Path | None:
         """If working_dir is set, validate it is (or can become) a directory."""
         if v is None:
             return None
@@ -501,7 +500,7 @@ class ExecutionConfig(BaseModel):
     )
     context: ContextConfig = Field(default_factory=ContextConfig)
     milestones: list[Milestone] = Field(default_factory=list)
-    silence_timeout_minutes: Optional[int] = Field(
+    silence_timeout_minutes: int | None = Field(
         default=None,
         ge=1,
         description=(
@@ -607,7 +606,7 @@ class NotifyChannel(BaseModel):
     url: str | None = Field(default=None, description="Endpoint URL for webhook channels.")
 
     @model_validator(mode="after")
-    def validate_channel_fields(self) -> "NotifyChannel":
+    def validate_channel_fields(self) -> NotifyChannel:
         if self.type == "email" and not self.to:
             raise ValueError("notify channel of type 'email' requires a 'to' address.")
         if self.type == "webhook" and not self.url:
@@ -638,7 +637,7 @@ class NotifyConfig(BaseModel):
     channels: list[NotifyChannel] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def channels_required_when_events_set(self) -> "NotifyConfig":
+    def channels_required_when_events_set(self) -> NotifyConfig:
         if self.on and not self.channels:
             logger.warning(
                 "notify.on lists events %s but no channels are configured — "
@@ -754,12 +753,12 @@ class AcceptanceCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["file_exists", "file_contains", "command", "llm_judge"]
-    path: Optional[str] = None
-    pattern: Optional[str] = None
-    run: Optional[str] = None
-    expect_exit: Optional[int] = 0
-    prompt: Optional[str] = None
-    expect: Optional[Literal["pass", "fail"]] = "pass"
+    path: str | None = None
+    pattern: str | None = None
+    run: str | None = None
+    expect_exit: int | None = 0
+    prompt: str | None = None
+    expect: Literal["pass", "fail"] | None = "pass"
 
 
 class AcceptanceCriteria(BaseModel):
@@ -875,7 +874,7 @@ class ProjectBook(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
-    acceptance_criteria: Optional[AcceptanceCriteria] = Field(
+    acceptance_criteria: AcceptanceCriteria | None = Field(
         default=None,
         description=(
             "Optional post-completion acceptance gate.  When set, claude-runner "
@@ -883,7 +882,7 @@ class ProjectBook(BaseModel):
             "On failure the task is retried, notified, or failed per on_failure."
         ),
     )
-    preflight: Optional[PreflightConfig] = Field(
+    preflight: PreflightConfig | None = Field(
         default=None,
         description=(
             "Optional pre-flight checks evaluated before Claude Code is spawned.  "
@@ -906,7 +905,7 @@ class ProjectBook(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_supervisor_cccs_exclusive(self) -> "ProjectBook":
+    def validate_supervisor_cccs_exclusive(self) -> ProjectBook:
         """Raise ConfigError if both supervisor_protocol and cccs are enabled."""
         cccs_enabled = self.cccs is not None and self.cccs.enabled
         sp_enabled = self.supervisor_protocol.enabled
@@ -918,7 +917,7 @@ class ProjectBook(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def resolve_skip_permissions(self) -> "ProjectBook":
+    def resolve_skip_permissions(self) -> ProjectBook:
         """Resolve skip_permissions to a concrete bool based on sandbox mode.
 
         - Docker sandbox present → default True (safe inside container)
@@ -930,7 +929,7 @@ class ProjectBook(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def warn_skip_permissions_without_docker(self) -> "ProjectBook":
+    def warn_skip_permissions_without_docker(self) -> ProjectBook:
         """Emit a log warning (not an error) when skip_permissions is enabled
         without the Docker sandbox, because this grants Claude unrestricted
         access to the host filesystem without any containment boundary."""
@@ -944,7 +943,7 @@ class ProjectBook(BaseModel):
         return self
 
     @classmethod
-    def from_yaml(cls, path) -> "ProjectBook":
+    def from_yaml(cls, path) -> ProjectBook:
         """Load and validate a project book from a YAML file.
 
         Convenience classmethod that delegates to :func:`load_project_book`.

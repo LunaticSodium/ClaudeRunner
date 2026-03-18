@@ -59,7 +59,7 @@ _KNOWN_ALIASES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
-def resolve_model_ids(project: "ProjectBook") -> tuple["ProjectBook", list[str]]:
+def resolve_model_ids(project: ProjectBook) -> tuple[ProjectBook, list[str]]:
     """Resolve stale model IDs in *project*'s model schedule.
 
     Returns a **copy** of the project book with any substitutions applied and
@@ -129,7 +129,7 @@ def resolve_model_ids(project: "ProjectBook") -> tuple["ProjectBook", list[str]]
 # ---------------------------------------------------------------------------
 
 
-def _copy_project(project: "ProjectBook") -> "ProjectBook":
+def _copy_project(project: ProjectBook) -> ProjectBook:
     """Return a deep copy of *project* suitable for mutation.
 
     Uses ``model_copy(deep=True)`` for Pydantic v2 models; falls back to

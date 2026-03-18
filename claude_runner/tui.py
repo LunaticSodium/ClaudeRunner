@@ -36,8 +36,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime, timedelta
-from typing import Deque, Optional
+from datetime import datetime
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Layout constants
@@ -157,13 +156,13 @@ class TUIManager:
         # Mutable display state
         self._state: str                  = "starting"
         self._start_time: float           = time.monotonic()
-        self._output_lines: Deque[str]    = deque(maxlen=OUTPUT_BUFFER_SIZE)
-        self._notifications: Deque[str]   = deque(maxlen=NOTIFICATION_BUFFER_SIZE)
+        self._output_lines: deque[str]    = deque(maxlen=OUTPUT_BUFFER_SIZE)
+        self._notifications: deque[str]   = deque(maxlen=NOTIFICATION_BUFFER_SIZE)
         self._token_estimated: int        = 0
         self._token_threshold: int        = 150_000
         self._checkpoints: int            = 0
         self._rate_limit_waits: int       = 0
-        self._rate_limit_end: Optional[float] = None  # monotonic end timestamp
+        self._rate_limit_end: float | None = None  # monotonic end timestamp
         self._context_anchors_active: bool = False
         self._docker_status: str          = "unknown"
         self._disk_usage_mb: float        = 0.0
@@ -173,7 +172,7 @@ class TUIManager:
         self._spinner_idx   = 0
         self._active        = False
         self._stop_evt      = threading.Event()
-        self._refresh_thread: Optional[threading.Thread] = None
+        self._refresh_thread: threading.Thread | None = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 

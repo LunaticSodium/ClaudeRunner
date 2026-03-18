@@ -21,9 +21,8 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 _OAUTH_SENTINEL: str = "__claude_oauth__"
 
@@ -90,8 +89,8 @@ class NativeSandbox:
         self._extra_env: dict = _cfg_get(sandbox_cfg, "extra_env", {})
 
         # Runtime state ------------------------------------------------
-        self._env: Optional[dict] = None
-        self._process: Optional[object] = None
+        self._env: dict | None = None
+        self._process: object | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -176,7 +175,7 @@ class NativeSandbox:
         prompt: str,
         on_line: Callable[[str], None],
         on_exit: Callable[[int], None],
-        model_id: Optional[str] = None,
+        model_id: str | None = None,
     ) -> object:
         """
         Launch Claude Code as a local subprocess using ConPTY (via ClaudeProcess).

@@ -18,13 +18,13 @@ from __future__ import annotations
 import datetime
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING
 
 import yaml
 from pydantic import ValidationError
 
-from .project import ProjectBook
 from .ntfy_client import NtfyMessage
+from .project import ProjectBook
 
 if TYPE_CHECKING:
     from .daemon import MarathonDaemon
@@ -73,15 +73,15 @@ class Pipeline:
 
     # A2: valid branch-ref patterns for the 'fetch' command.
     import re as _re
-    _FETCH_BRANCH_PATTERN: "_re.Pattern" = _re.compile(  # type: ignore[assignment]
+    _FETCH_BRANCH_PATTERN: _re.Pattern = _re.compile(  # type: ignore[assignment]
         r"^(?:task/[A-Za-z0-9_.-]+|inbox/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$"
     )
     MAX_INLINE_YAML_BYTES: int = 4096
 
     def __init__(
         self,
-        daemon: "MarathonDaemon",
-        ntfy_client: "NtfyClient",
+        daemon: MarathonDaemon,
+        ntfy_client: NtfyClient,
     ) -> None:
         self._daemon = daemon
         self._ntfy = ntfy_client
@@ -130,7 +130,7 @@ class Pipeline:
     # Stage 2: PARSE
     # ------------------------------------------------------------------
 
-    def _parse(self, message: NtfyMessage) -> Union[_ControlCommand, _InlineYaml]:
+    def _parse(self, message: NtfyMessage) -> _ControlCommand | _InlineYaml:
         """
         Exact keyword match (case-insensitive, stripped) against CONTROL_COMMANDS.
 
@@ -162,7 +162,7 @@ class Pipeline:
     # Stage 3: CONVERT (inline YAML only)
     # ------------------------------------------------------------------
 
-    def _convert(self, body: str, original_message: NtfyMessage) -> Optional[pathlib.Path]:
+    def _convert(self, body: str, original_message: NtfyMessage) -> pathlib.Path | None:
         """
         Parse and validate inline YAML, write to inbox directory.
 
@@ -322,7 +322,6 @@ class Pipeline:
             self._trash("RUN", "run command requires a project name.", original_message.message)
             return
 
-        import os  # noqa: PLC0415
 
         # Search for <name>.yaml in:
         #   1. projects/ relative to cwd
@@ -331,7 +330,7 @@ class Pipeline:
             pathlib.Path.cwd() / "projects",
             _INBOX_DIR,
         ]
-        found: Optional[pathlib.Path] = None
+        found: pathlib.Path | None = None
         for d in search_dirs:
             candidate = d / f"{name}.yaml"
             if candidate.exists():

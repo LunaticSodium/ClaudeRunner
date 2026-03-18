@@ -17,7 +17,6 @@ import json
 import logging
 import pathlib
 from dataclasses import dataclass
-from typing import List, Optional
 
 import requests
 
@@ -59,8 +58,8 @@ class NtfyClient:
     """
 
     def __init__(self) -> None:
-        self._out_channel: Optional[str] = _get_channel_from_keyring(_KEYRING_SERVICE_OUT)
-        self._cmd_channel: Optional[str] = _get_channel_from_keyring(_KEYRING_SERVICE_CMD)
+        self._out_channel: str | None = _get_channel_from_keyring(_KEYRING_SERVICE_OUT)
+        self._cmd_channel: str | None = _get_channel_from_keyring(_KEYRING_SERVICE_CMD)
 
         if not self._out_channel:
             logger.warning(
@@ -106,7 +105,7 @@ class NtfyClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("ntfy publish to %r failed: %s", channel_name, exc)
 
-    def poll(self, channel: str, since_id: Optional[str] = None) -> List[NtfyMessage]:
+    def poll(self, channel: str, since_id: str | None = None) -> list[NtfyMessage]:
         """Fetch new messages from the ntfy channel since *since_id*.
 
         Returns a list of :class:`NtfyMessage` objects (may be empty).
@@ -137,12 +136,12 @@ class NtfyClient:
             logger.warning("ntfy poll from %r failed: %s", channel_name, exc)
             return []
 
-        messages: List[NtfyMessage] = []
+        messages: list[NtfyMessage] = []
         raw_text = response.text.strip()
         if not raw_text:
             return []
 
-        last_id: Optional[str] = None
+        last_id: str | None = None
         for line in raw_text.splitlines():
             line = line.strip()
             if not line:
@@ -176,7 +175,7 @@ class NtfyClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _resolve_channel(self, logical: str) -> Optional[str]:
+    def _resolve_channel(self, logical: str) -> str | None:
         """Map logical channel name ('out', 'cmd') to the actual ntfy channel name."""
         if logical == "out":
             return self._out_channel
@@ -191,7 +190,7 @@ class NtfyClient:
 # ---------------------------------------------------------------------------
 
 
-def _get_channel_from_keyring(service: str) -> Optional[str]:
+def _get_channel_from_keyring(service: str) -> str | None:
     """Retrieve a channel name from Windows Credential Manager.
 
     Returns ``None`` if keyring is unavailable or the credential is not set.

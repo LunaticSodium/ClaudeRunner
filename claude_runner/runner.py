@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -42,13 +41,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable
 
 from .context_manager import (
-    CHECKPOINT_PROMPT,
     STRATEGY_CONTINUE,
-    STRATEGY_RESTATE,
-    STRATEGY_SUMMARIZE,
     ContextManager,
 )
 
@@ -189,7 +185,7 @@ class TaskResult:
     change_summary: str   # git diff --stat or filesystem snapshot diff
     progress_log: str     # contents of .claude-runner/progress.log at end of run
     fault_log: list[str] = field(default_factory=list)
-    error_message: Optional[str] = None
+    error_message: str | None = None
 
     # ------------------------------------------------------------------
     # Derived properties
@@ -248,14 +244,14 @@ class TaskRunner:
 
     def __init__(
         self,
-        project_book: "ProjectBook",
-        config: "Config",
+        project_book: ProjectBook,
+        config: Config,
         api_key: str,
-        tui_callback: Optional[Callable[[str, dict], None]] = None,
+        tui_callback: Callable[[str, dict], None] | None = None,
         sandbox=None,
         tui=None,
         resume: bool = False,
-        project_book_path: Optional[str] = None,
+        project_book_path: str | None = None,
         show_claude: bool = False,
         skip_preflight: bool = False,
     ) -> None:
@@ -266,7 +262,7 @@ class TaskRunner:
         self._tui = tui
         self._resume = resume
         self._show_claude = show_claude
-        self._book_path: Optional[Path] = Path(project_book_path) if project_book_path else None
+        self._book_path: Path | None = Path(project_book_path) if project_book_path else None
         # Unique filesystem identifier derived from the YAML filename stem.
         # Keying off the filename (not book.name) prevents collisions when two
         # project books share the same name: field but live in the same folder.
@@ -280,36 +276,36 @@ class TaskRunner:
 
         # Resolved lazily once run() begins.
         self._sandbox = sandbox  # may be pre-provided; if None, created in _initialise()
-        self._notifier: Optional["NotificationManager"] = None
-        self._persistence: Optional["PersistenceManager"] = None
-        self._rate_detector: Optional["RateLimitDetector"] = None
-        self._rate_waiter: Optional["RateLimitWaiter"] = None
-        self._context_manager: Optional[ContextManager] = None
+        self._notifier: NotificationManager | None = None
+        self._persistence: PersistenceManager | None = None
+        self._rate_detector: RateLimitDetector | None = None
+        self._rate_waiter: RateLimitWaiter | None = None
+        self._context_manager: ContextManager | None = None
 
         # Runtime state
-        self._start_time: Optional[datetime] = None
+        self._start_time: datetime | None = None
         self._rate_limit_cycles: int = 0
         self._fault_log: list[str] = []
         self._process = None           # the live ClaudeProcess (or equivalent)
         self._output_lines: list[str] = []  # all stripped output collected
 
         # asyncio.Event used to signal a detected rate-limit from the detector callback.
-        self._rate_limit_event: Optional[asyncio.Event] = None
-        self._rate_limit_reset_time: Optional[datetime] = None
+        self._rate_limit_event: asyncio.Event | None = None
+        self._rate_limit_reset_time: datetime | None = None
 
         # asyncio.Events for runner protocol markers (##RUNNER:COMPLETE## / ##RUNNER:ERROR##).
         # Initialised in _initialise() once an event loop is available (NOT here).
-        self._runner_complete_event: Optional[asyncio.Event] = None
-        self._runner_error_event: Optional[asyncio.Event] = None
-        self._runner_error_message: Optional[str] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner_complete_event: asyncio.Event | None = None
+        self._runner_error_event: asyncio.Event | None = None
+        self._runner_error_message: str | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Acceptance-criteria retry counter.
         self._acceptance_retries: int = 0
 
         # Silence watchdog: tracks last output time and the background task.
         self._last_output_time: float = time.monotonic()
-        self._silence_watchdog_task: Optional[asyncio.Task] = None
+        self._silence_watchdog_task: asyncio.Task | None = None
 
         # Filesystem snapshot taken at task start (fallback when git unavailable).
         self._fs_snapshot_start: dict[str, tuple[int, float]] = {}  # path → (size, mtime)
@@ -321,20 +317,20 @@ class TaskRunner:
         self._milestones_fired: set[str] = set()
 
         # Set by _state_checkpoint_loop to allow cancellation.
-        self._checkpoint_task: Optional[asyncio.Task] = None
+        self._checkpoint_task: asyncio.Task | None = None
 
         # CLAUDE.md content read from <working_dir>/.claude/CLAUDE.md at task start.
         # None means no file was found or it was empty.
-        self._claude_md_content: Optional[str] = None
+        self._claude_md_content: str | None = None
 
         # Phase-aware model switching state.
         # _model_override is set by the ModelWatchdog apply_fn and consumed on the
         # next launch_claude() call.  None means "use the default model".
-        self._model_override: Optional[str] = None
+        self._model_override: str | None = None
         self._model_watchdog = None  # ModelWatchdog instance, started in _run_inner
         # asyncio events for model switch — initialised in _initialise().
-        self._model_switch_event: Optional[asyncio.Event] = None
-        self._model_switch_reason: Optional[str] = None
+        self._model_switch_event: asyncio.Event | None = None
+        self._model_switch_reason: str | None = None
 
         # Pause/resume flag — set by request_pause(); checked in main loop.
         self._pause_requested: bool = False
@@ -461,7 +457,7 @@ class TaskRunner:
         """Set up all helper objects and the sandbox."""
         # Deferred imports to avoid circular dependencies at module load time.
         from .notify import NotificationManager  # noqa: PLC0415
-        from .persistence import PersistenceManager, TaskState  # noqa: PLC0415
+        from .persistence import PersistenceManager  # noqa: PLC0415
         from .preflight import PreflightError, run_preflight  # noqa: PLC0415
         from .rate_limit import RateLimitDetector  # noqa: PLC0415
         from .sandbox import create_sandbox, resolve_working_dir  # noqa: PLC0415
@@ -575,7 +571,7 @@ class TaskRunner:
         # background thread) when a rule fires.  Handled in the main loop by
         # stopping the current Claude process and re-launching with the new model.
         self._model_switch_event = asyncio.Event()
-        self._model_switch_reason: Optional[str] = None
+        self._model_switch_reason: str | None = None
 
         self._loop = asyncio.get_event_loop()
 
@@ -892,7 +888,7 @@ class TaskRunner:
         reset_time: datetime,
         max_rl_waits: int,
         resume_strategy: str,
-    ) -> Optional[TaskResult]:
+    ) -> TaskResult | None:
         """
         Handle a single rate-limit cycle.
 
@@ -980,7 +976,7 @@ class TaskRunner:
     # Model-switch handler
     # ------------------------------------------------------------------
 
-    async def _handle_model_switch(self, resume_strategy: str) -> Optional[TaskResult]:
+    async def _handle_model_switch(self, resume_strategy: str) -> TaskResult | None:
         """
         Handle a model-switch event fired by the ModelWatchdog.
 
@@ -1131,7 +1127,7 @@ class TaskRunner:
     # Completion handler
     # ------------------------------------------------------------------
 
-    async def _complete_or_retry(self) -> Optional[TaskResult]:
+    async def _complete_or_retry(self) -> TaskResult | None:
         """
         Run acceptance checks (if configured); complete or retry accordingly.
 
@@ -1265,7 +1261,6 @@ class TaskRunner:
         ntfy_completion_message: str | None = None
         if self._notifier is not None:
             try:
-                from .notify import extract_completion_summary  # noqa: PLC0415
                 ntfy_completion_message = self._notifier.build_completion_ntfy_message(
                     task_name=self._book.name,
                     duration_str=duration_str,
@@ -1918,7 +1913,7 @@ class TaskRunner:
         except OSError as exc:
             logger.warning("Could not write CCCS fragment to CLAUDE.md: %s", exc)
 
-    def _read_claude_md(self) -> Optional[str]:
+    def _read_claude_md(self) -> str | None:
         """
         Read <working_dir>/.claude/CLAUDE.md if it exists and is non-empty.
 
@@ -1991,7 +1986,7 @@ class TaskRunner:
 
         lines = [
             "=" * 72,
-            f"claude-runner — Task Report",
+            "claude-runner — Task Report",
             "=" * 72,
             f"Task:              {result.task_name}",
             f"Status:            {result.status.upper()}",
@@ -2325,7 +2320,7 @@ class TaskRunner:
         """Return the absolute path to progress.log inside the working directory."""
         return self._working_dir() / _RUNNER_DIR / _PROGRESS_LOG_NAME
 
-    def _host_log_dir(self) -> Optional[Path]:
+    def _host_log_dir(self) -> Path | None:
         """Return the host-side log directory, creating it if necessary."""
         output_cfg = getattr(self._book, "output", None)
         log_dir_str = getattr(output_cfg, "log_dir", None)
@@ -2367,7 +2362,7 @@ class TaskRunner:
     # State factory
     # ------------------------------------------------------------------
 
-    def _make_state(self, phase: str, **kwargs) -> "TaskState":  # type: ignore[name-defined]
+    def _make_state(self, phase: str, **kwargs) -> TaskState:  # type: ignore[name-defined]
         """
         Build a TaskState for the given phase, incorporating current runtime state.
 
@@ -2413,7 +2408,7 @@ class TaskRunner:
     def _make_result(
         self,
         status: str,
-        error_message: Optional[str] = None,
+        error_message: str | None = None,
     ) -> TaskResult:
         """Build a TaskResult from current runner state."""
         end_time = datetime.now(tz=timezone.utc)
