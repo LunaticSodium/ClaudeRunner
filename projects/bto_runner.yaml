@@ -1,0 +1,504 @@
+name: bto-runner
+description: >-
+  BTO Simulation Runner — Python optimisation layer that extends the existing
+  BTO_Modulators_Simulator with a typed mixed-parameter space, three auto-selected
+  search strategies (Hill Climbing / Bayesian-TPE / CMA-ES), budget/PID management,
+  an inverse solver, parametric geometry, and a Tkinter GUI. Wraps either the
+  existing ML surrogate or a real simulator subprocess as the evaluation back-end.
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
+
+prompt: |
+  # BTO Runner — Development Session
+
+  ## Project overview
+
+  You are extending the BTO_Modulators_Simulator repository (branch: clauded)
+  with a new Python sub-package `bto_runner/`. The existing code optimises BTO
+  electro-optic devices using pre-trained ML surrogate models (LGBM / XGBoost /
+  TF) via `Advanced_BTO_Optimizer_ML.py`. Do NOT move or rename any existing file.
+
+  ### Target architecture
+
+  ```
+  (existing files — untouched)
+  Advanced_BTO_Optimizer_ML.py
+  requirements.txt
+  ...
+
+  bto_runner/
+    __init__.py
+    params/
+      types.py       # BaseParam, ConstantParam, ScanParam, RangeParam, MaterialParam
+      space.py       # ParameterSpace, SpaceType, strategy_for_space()
+      material.py    # MaterialLibrary, MaterialEntry, materials.yaml
+    budget/
+      complexity.py  # ComplexityBudget
+      pid.py         # PIDEstimator
+    strategies/
+      base.py        # AbstractStrategy (ABC)
+      hill.py        # HillClimbingStrategy
+      bayesian.py    # BayesianStrategy (Optuna TPE)
+      cmaes.py       # CMAESStrategy (cma library)
+      registry.py    # STRATEGIES dict, auto_select()
+    inverse/
+      solver.py      # InverseSolver, InverseResult
+    geometry/
+      shapes.py      # Rectangle
+      builder.py     # ParametricGeometry
+    runner/
+      executor.py    # SimulationExecutor (subprocess | surrogate)
+      scheduler.py   # RunScheduler
+      logger.py      # RunLogger (JSONL)
+    gui/
+      app.py         # Tkinter GUI, six panels
+    cli.py           # Click CLI entry point
+  simulator/
+    mock_sim.py      # Deterministic multi-peaked mock, --seed, --delay
+  tests/
+    test_params.py
+    test_budget.py
+    test_executor.py
+    test_strategies.py
+    test_inverse.py
+    test_scheduler.py
+  ```
+
+  ### Strategy auto-selection rules
+
+  Auto-selection is based on the parameter space composition:
+
+  | Space type                          | Strategy   | Rationale                        |
+  |-------------------------------------|------------|----------------------------------|
+  | Any MaterialParam present           | TPE        | Native categorical support       |
+  | Pure continuous, dims < 15          | Bayesian   | Best eval efficiency             |
+  | Pure continuous, dims >= 15         | CMA-ES     | Scales better at high dims       |
+  | Any space (fallback / debug)        | Hill       | Always available                 |
+
+  `BayesianStrategy` and `tpe` both map to the same class (Optuna TPE sampler).
+  The sampler handles categoricals natively via `suggest_categorical`.
+
+  ### Simulation objectives (from existing code)
+  - Minimise switching voltage V_π (V)
+  - Minimise propagation loss (dB/cm)
+  - Maximise effective refractive index change Δn_eff
+  - Scalar score: `score = -w1*v_pi - w2*loss + w3*delta_n`
+    (weights configurable, default 1.0 each, normalised to [-1, 1])
+
+  ### Active parameter space (LHS fast solver, for reference)
+  | Parameter           | Range        | Type      |
+  |---------------------|--------------|-----------|
+  | bto_thickness_um    | [0.05, 0.5]  | RangeParam|
+  | width_um            | [0.5, 2.0]   | RangeParam|
+  | height_um           | [0.05, 0.35] | RangeParam|
+  | electrode_gap_um    | [2.5, 7.0]   | RangeParam|
+  | electrode_height_um | [0.1, 1.0]   | RangeParam|
+  | ridge_angle_deg     | [0.0, 35.0]  | RangeParam|
+  | crystal_angle_deg   | [0.0, 90.0]  | RangeParam|
+  | wavelength_um       | 1.55         | ConstantParam|
+
+  ## Your task
+
+  Review the full repository and implement bto_runner/ phase by phase.
+  Prefix every milestone commit with `PHASE-N:`.
+
+  ### PHASE 1 — Audit
+  - `find . -name "*.py" | sort`
+  - Read README and Advanced_BTO_Optimizer_ML.py entry point.
+  - Identify: parameter definition style, ML model load/call interface,
+    existing output format, any material values (n_optical, eps_r, tan_delta).
+  - Write AUDIT.md:
+      ## What exists
+      ## What is missing
+      ## Surrogate integration interface (how to call the existing model eval)
+      ## Material values found
+      ## Risk notes
+  - Commit: `PHASE-1: audit complete, AUDIT.md written`
+
+  ### PHASE 2 — Parameter types and space
+  Implement `bto_runner/params/` and `simulator/mock_sim.py`.
+
+  `BaseParam` (ABC): name, degrees_of_freedom(), sample(rng)
+  `ConstantParam`: value, dof=0, sample always returns value
+  `ScanParam`: start/step/stop, grid_values() -> np.arange, treated as discrete
+  `RangeParam`: low/high, linspace(n), one continuous dim
+  `MaterialParam`: allowed list of str keys, min_count/max_count, sample random
+
+  `ParameterSpace`:
+  - continuous_dims(), has_categoricals(), degrees_of_freedom()
+  - to_optuna_trial(trial) -> dict
+      RangeParam    -> suggest_float
+      ScanParam     -> suggest_int mapped to index into grid_values()
+      MaterialParam -> suggest_categorical
+      ConstantParam -> always returns value, no Optuna call
+  - materialise(optuna_params) -> flat JSON-serialisable dict
+
+  `SpaceType` enum + `strategy_for_space(space) -> str` per table above.
+
+  `MaterialLibrary`: loads from materials.yaml; fallback hardcoded defaults.
+  Check AUDIT.md "Material values found" first — use existing values for BTO/SiO2/Si.
+  Defaults if not found:
+    BTO:  n_optical=2.30, eps_r=1000.0, tan_delta=0.02
+    SiO2: n_optical=1.44, eps_r=3.9,    tan_delta=0.0001
+    Si:   n_optical=3.48, eps_r=11.7,   tan_delta=0.001
+    ITO:  n_optical=1.80, eps_r=9.0,    tan_delta=0.05
+    Au:   n_optical=0.18, eps_r=-10.0,  tan_delta=2.0
+    SiN:  n_optical=2.00, eps_r=7.5,    tan_delta=0.001
+
+  `mock_sim.py`:
+  - Reads JSON params from sys.argv[1]
+  - Multi-peaked landscape (PEAKS defined below); normalises RangeParam to [0,1]
+    PEAKS = [(0.78,0.22,10,0.035),(0.22,0.78,8,0.04),(0.18,0.18,6,0.04),
+             (0.72,0.72,5.5,0.04),(0.50,0.30,4,0.05),(0.35,0.62,3.5,0.05)]
+    score = sum(h*exp(-((x-cx)**2+(y-cy)**2)/(2*s**2))) + rng.normal(0,0.05)
+  - MaterialParam: score *= (1 + 0.1*(n_optical - 2.0))
+  - Accepts --seed INT (default 42), --delay FLOAT (default 5.0)
+  - Prints {"score": float, "duration_s": float, "seed": int}
+  - Same seed + same params MUST produce same score (determinism requirement)
+
+  Also create `tests/fixtures/` with two fixture files used by Phase 7 V&V:
+    tests/fixtures/space_continuous.yaml  — pure RangeParam space (7 dims, matches
+      the LHS fast solver table above); triggers Bayesian auto-select
+    tests/fixtures/space_mixed.yaml       — same dims + one MaterialParam
+      (material: [BTO, SiO2, Si]); triggers TPE auto-select
+
+  - Commit: `PHASE-2: param types, space, material library, mock sim`
+
+  ### PHASE 3 — Budget, PID, executor, logger
+  `ComplexityBudget`:
+  - total_hours=10.0
+  - n_evals(sim_time_minutes) = max(1, int((total_hours*60)/sim_time_minutes))
+    Note: the max(1,...) guard is mandatory — a single real sandwich sweep can
+    take 240–1440 min; without it n_evals returns 0 and the scheduler loop,
+    resolution calculation, and any downstream division all break silently
+  - range_resolution(n_dims) = max(3, int(n_evals(1.0)**(1/n_dims)))
+    Note: when n_evals==1 (budget < 1 eval), resolution falls to the floor of
+    3 — this is the correct graceful degradation: run at coarsest resolution
+    rather than crashing
+
+  `PIDEstimator`:
+  - Kp=0.4, Ki=0.1, Kd=0.05, setpoint=60s, clamp=[5, 86400]
+  - update(measured_seconds), reset(), estimated_seconds property
+  - Note: clamp upper bound is 86 400 s (24 h) — a single real sandwich sweep
+    can legitimately take up to 24 hours; clamping lower would permanently
+    corrupt the ETA and budget accounting
+
+  `SimResult` dataclass:
+    params, score, raw, duration_s, success, error, seed
+
+  `SimulationExecutor`:
+  - Backend "subprocess": serialise params to temp JSON, spawn sim_cmd,
+    parse stdout as JSON, no timeout (block until process exits naturally)
+  - Backend "surrogate": wrap existing ML model eval from AUDIT.md findings,
+    score = -w1*v_pi - w2*loss + w3*delta_n, normalised
+  - On non-zero exit or unparseable stdout: SimResult(success=False)
+  - If the process is still running when RunScheduler fires stop_event,
+    send SIGTERM and wait up to 5 s before SIGKILL (graceful shutdown only)
+  - Hard ceiling: if a single eval exceeds 86 400 s (24 h), send SIGTERM/SIGKILL,
+    return SimResult(success=False, error="EVAL_EXCEEDED_24H — human review required"),
+    print a clearly visible warning to stderr:
+      "⚠ EVAL EXCEEDED 24 H — simulation may be diverging or stalled.
+         Params logged to output/exceeded_24h.jsonl. Human review required."
+    append the params + timestamp to output/exceeded_24h.jsonl,
+    then HALT the RunScheduler (do not continue to next eval).
+    This is not an automatic retry condition — it requires a human decision.
+
+  `RunLogger`: JSONL, tail(n), best(k), statistics() -> {mean,std,min,max,count}
+
+  Commit: `PHASE-3: budget, PID, executor, logger`
+
+  ### PHASE 4 — Strategies and scheduler
+  `HillClimbingStrategy`:
+  - n_restarts=3, step_scale=0.12, max_no_improve=6
+  - Multi-start; 4 random neighbours per step; shrink step 0.82x on failure
+  - Ignores MaterialParam dims (holds at initial sampled value)
+
+  `BayesianStrategy`:
+  - optuna.create_study(direction="maximize", sampler=TPESampler())
+  - ask(n): study.ask() x n, store trial refs for tell()
+  - tell(params, score): study.tell(trial, score)
+
+  `CMAESStrategy`:
+  - cma library; normalise dims to [0,1]; initial sigma=0.3
+  - ask(n): es.ask() up to n candidates, de-normalise
+  - tell(batch, scores): es.tell(candidates, [-s for s in scores])
+  - Raises ValueError on mixed space (has MaterialParam)
+
+  `registry.py`:
+  - STRATEGIES = {"hill": ..., "bayesian": ..., "tpe": ..., "cmaes": ...}
+  - auto_select(space, override=None) -> AbstractStrategy instance
+
+  `RunScheduler`:
+  - Loop: ask(1) -> run -> log -> tell -> pid.update -> emit progress to stderr
+  - ETA = remaining_budget / pid.estimated_seconds
+  - Respects stop_event; finishes current sim before exiting
+
+  Commit: `PHASE-4: all strategies, auto-select, scheduler`
+
+  ### PHASE 5 — Inverse solver and geometry
+  `InverseResult`: free_param, target_score, best_value, best_score,
+    scan_values, scan_scores, interpolated_crossing
+
+  `InverseSolver`:
+  - solve(base_params, target_score, free_param, n_samples=40)
+  - solve_all(base_params, target_score) sorted by abs(best_score - target_score)
+
+  `Rectangle`: name, material, width (Range|Constant), height (Range|Constant)
+  `ParametricGeometry`:
+  - to_space(), validate_material_constraints(), render() -> Figure
+
+  Commit: `PHASE-5: inverse solver, parametric geometry`
+
+  ### PHASE 6 — GUI
+  Tkinter + ttk, notebook, six panels, all long ops in daemon threads + queue.Queue.
+
+  Panel 1 — Parameters: per-type widgets, Load/Save YAML,
+    "Auto-select strategy" label that updates on param change.
+  Panel 2 — Budget: hours spinbox, live PID estimate label, n_evals label,
+    strategy combobox [auto/hill/bayesian/tpe/cmaes], backend combobox,
+    subprocess cmd entry.
+  Panel 3 — Run: [Run]/[Abort], progress bar, scrolling log (30 lines),
+    current best score label.
+  Panel 4 — Results: Treeview (rank/score/strategy/duration/params),
+    [Show inverse] button, [Export CSV].
+  Panel 5 — Geometry: shape slots, validate, preview canvas, export to params.
+  Panel 6 — Legacy: wrap Advanced_BTO_Optimizer_ML.py with its CLI args,
+    stream stdout to Text widget.
+  InverseDialog: modal, free param dropdown, compute thread, results treeview,
+    embedded score-vs-value plot.
+
+  Commit: `PHASE-6: GUI all panels functional`
+
+  ### PHASE 7 — CLI, pyproject, README, V&V gate
+  `bto-runner` Click CLI:
+    run     --space YAML --budget HOURS [--strategy NAME] [--sim-cmd CMD]
+            [--log FILE] [--seed INT]
+            (create parent directories for --log automatically if missing)
+    gui     [--space YAML]
+    inverse --space YAML --log JSONL --target SCORE [--param NAME]
+    validate --space YAML  (prints SpaceType + auto-selected strategy, exits 0/1)
+    legacy  [-- ARGS...]
+
+  pyproject.toml (preserve all requirements.txt entries):
+    dependencies: numpy>=1.26, scipy>=1.12, optuna>=3.6, cma>=3.3,
+                  click>=8.1, pyyaml>=6.0, matplotlib>=3.8, pydantic>=2.6
+    dev: pytest>=7.0, pytest-cov, ruff, mypy
+
+  Update README: add "bto_runner extension" section at top, preserve existing.
+
+  V&V gate (all must pass before final commit):
+  - pytest tests/ (all green)
+  - ruff check bto_runner/
+  - mypy bto_runner/ --strict
+  - python -m bto_runner.cli validate --space tests/fixtures/space_continuous.yaml
+  - python -m bto_runner.cli validate --space tests/fixtures/space_mixed.yaml
+
+  Do NOT print `##RUNNER:COMPLETE##` after Phase 7. Proceed to Phase 8.
+  Commit: `PHASE-7: CLI, pyproject, README, all V&V gates passing`
+
+  ### PHASE 8 — Sustained 10-hour simulation run
+
+  CRITICAL BLOCKING REQUIREMENT: You must launch the simulation as a
+  foreground blocking process. Do NOT use `&`, `nohup`, `start /B`, or any
+  background/detach mechanism. Execute synchronously and wait for the process
+  to return before doing anything else. The run will take approximately
+  10 hours — this is expected and correct.
+
+  Step 1 — Smoke-test (verify ~36 evals complete cleanly in ~3 min):
+    mkdir -p output
+    python -m bto_runner.cli run \
+      --space tests/fixtures/space_continuous.yaml \
+      --budget 0.05 \
+      --sim-cmd "python simulator/mock_sim.py --delay 5.0 --seed 42" \
+      --log output/phase8_smoke.jsonl --seed 42
+  Verify output/phase8_smoke.jsonl has at least 5 lines.
+  If this exits non-zero or produces fewer than 5 evals, fix the issue
+  before proceeding to Step 2.
+
+  Step 2 — Full 10-hour blocking run:
+    Before launching, check if output/phase8_run.jsonl already exists and
+    has ≥ 6 500 lines (a prior interrupted run may have completed enough).
+    If so, skip directly to Step 4.
+
+    Otherwise record wall-clock time and run (BLOCKING — no &):
+      import time; t0 = time.time()   # pseudocode — use shell: SECONDS=$SECONDS
+      python -m bto_runner.cli run \
+        --space tests/fixtures/space_continuous.yaml \
+        --budget 10.0 \
+        --sim-cmd "python simulator/mock_sim.py --delay 5.0 --seed 42" \
+        --log output/phase8_run.jsonl --seed 42
+      elapsed_s = time.time() - t0    # measure after the command returns
+
+  Wait for this command to exit. Do not proceed until it does.
+  Expected duration: ~10 hours (budget=10.0 h × 5 s/eval = 7 200 evals).
+  The scheduler emits progress to stderr every eval — this is normal.
+
+  Step 3 — Verify and escalate if too fast:
+    Read output/phase8_run.jsonl and compute:
+      n_evals = number of lines in the JSONL file
+      Use the elapsed_s measured around the subprocess call (wall-clock),
+      NOT the cumsum of per-entry duration_s (that excludes scheduling overhead).
+    If n_evals < 6 500 or elapsed_s < 35 000:
+      Resolution escalation: the sim ran faster than expected.
+      Re-run with doubled delay (10.0 s/eval) to guarantee ≥10 h:
+        python -m bto_runner.cli run \
+          --space tests/fixtures/space_continuous.yaml \
+          --budget 10.0 \
+          --sim-cmd "python simulator/mock_sim.py --delay 10.0 --seed 42" \
+          --log output/phase8_run_escalated.jsonl --seed 42
+      Wait for this command to exit as well.
+
+  Step 4 — Report:
+    Print a summary to stdout:
+      - Total evals completed
+      - Best score achieved
+      - Wall-clock time (seconds)
+      - Log file path
+    Then print `##RUNNER:COMPLETE##`.
+
+  Commit: `PHASE-8: 10-hour simulation run complete`
+
+# ── Context anchors ───────────────────────────────────────────────────────────
+
+context_anchors: |
+  Repo: BTO_Modulators_Simulator, branch clauded
+  New sub-package: bto_runner/ (do NOT touch existing files)
+  Python: 3.11+, type annotations required, mypy --strict on bto_runner/
+  Key libs: optuna>=3.6, cma>=3.3, numpy, scipy, matplotlib, pydantic>=2.6
+  Strategy auto-select: MaterialParam -> TPE | d<15 -> Bayesian | d>=15 -> CMA-ES
+  Score: -w1*v_pi - w2*loss + w3*delta_n (surrogate backend)
+  Mock sim: deterministic given same seed; PEAKS defined in PHASE-2; default --delay 5.0 s
+  ComplexityBudget.total_hours = 10.0 → ~7200 evals at 5 s/eval = 10 h wall-clock
+  Real sandwich sweeper eval time: 4–24 h per run — do NOT assume fast evals.
+  PID clamp upper = 86400 s (24 h); n_evals uses max(1,...) guard — both mandatory.
+  PHASE-8 BLOCKING: run CLI command foreground, wait for exit, do NOT background.
+  If Phase 8 run < 6500 evals, escalate: re-run with --delay 10.0 s.
+  Commit style: PHASE-N: <short description>
+  Do NOT commit with failing tests or ruff/mypy errors.
+  SciSim standards: all random ops accept explicit seed, 64-bit floats,
+    normalise all output, log run metadata to JSONL.
+
+# ── Protocol ──────────────────────────────────────────────────────────────────
+
+cccs:
+  preset: cccs-v1.0
+  profile: scisim
+
+marathon_mode: false
+
+# ── Model schedule ────────────────────────────────────────────────────────────
+
+model_schedule:
+  poll_interval_seconds: 30
+  rules:
+    - triggers:
+        - phase_gte: 1
+          phase_lte: 1
+      action:
+        model_id: claude-haiku-4-5-20251001
+        message: "Haiku for audit — reading only, no generation"
+
+    - triggers:
+        - phase_gte: 2
+          phase_lte: 3
+      action:
+        model_id: claude-opus-4-6
+        message: "Opus for core architecture (params, budget, executor)"
+
+    - triggers:
+        - phase_gte: 4
+      action:
+        model_id: claude-sonnet-4-6
+        message: "Sonnet for strategies, GUI, CLI, tests"
+
+    - triggers:
+        - token_pct_gte: 0.80
+      action:
+        model_id: claude-sonnet-4-6
+        message: "Context near limit — maintaining Sonnet"
+
+# ── Sandbox ───────────────────────────────────────────────────────────────────
+
+sandbox:
+  backend: native
+  working_dir: C:/Local_Projects/BTO_Modulators_Simulatior_runner/workspace
+
+# ── Execution ─────────────────────────────────────────────────────────────────
+
+execution:
+  timeout_hours: 12
+  max_rate_limit_waits: 20
+  skip_permissions: false
+  resume_strategy: restate
+  silence_timeout_minutes: 660
+
+  milestones:
+    - pattern: "PHASE-1:"
+      message: "Phase 1 committed — audit complete"
+    - pattern: "PHASE-2:"
+      message: "Phase 2 committed — param types, space, mock sim"
+    - pattern: "PHASE-3:"
+      message: "Phase 3 committed — budget, PID, executor, logger"
+    - pattern: "PHASE-4:"
+      message: "Phase 4 committed — strategies, scheduler"
+    - pattern: "PHASE-5:"
+      message: "Phase 5 committed — inverse solver, geometry"
+    - pattern: "PHASE-6:"
+      message: "Phase 6 committed — GUI"
+    - pattern: "PHASE-7:"
+      message: "Phase 7 committed — CLI, V&V gates passing"
+    - pattern: "PHASE-8:"
+      message: "Phase 8 committed — 10-hour simulation run complete"
+
+  context:
+    checkpoint_threshold_tokens: 80000
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+output:
+  git:
+    enabled: true
+    auto_push: false
+    remote_url: https://github.com/LunaticSodium/BTO_Modulators_Simulator.git
+    branch_prefix: clauded-runner/
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+notify:
+  on: [start, complete, error, rate_limit, model_switch]
+  channels:
+    - type: desktop
+
+# ── Acceptance criteria ───────────────────────────────────────────────────────
+
+acceptance_criteria:
+  on_failure: retry
+  max_retries: 2
+  checks:
+    - type: command
+      run: pytest tests/ -q
+      expect_exit: 0
+    - type: command
+      run: ruff check bto_runner/
+      expect_exit: 0
+    - type: command
+      run: mypy bto_runner/ --strict
+      expect_exit: 0
+    - type: command
+      run: python -m bto_runner.cli validate --space tests/fixtures/space_continuous.yaml
+      expect_exit: 0
+    - type: command
+      run: python -m bto_runner.cli validate --space tests/fixtures/space_mixed.yaml
+      expect_exit: 0
+    - type: file_exists
+      path: output/phase8_run.jsonl
+    - type: command
+      run: >-
+        python -c "
+        import json, sys;
+        lines=[json.loads(l) for l in open('output/phase8_run.jsonl') if l.strip()];
+        n=len(lines);
+        print(f'Evals: {n}');
+        sys.exit(0 if n>=6500 else 1)
+        "
+      expect_exit: 0

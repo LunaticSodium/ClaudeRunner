@@ -26,7 +26,7 @@ DIST_DIR = PROJECT_ROOT / "dist"
 BUILD_DIR = PROJECT_ROOT / "build"
 SPEC_FILE = PROJECT_ROOT / "claude-runner.spec"
 EXE_NAME = "claude-runner"
-VERSION = "0.1.0"
+VERSION = "1.1.0"
 
 # Submodules that PyInstaller may not detect automatically via static analysis
 HIDDEN_IMPORTS = [

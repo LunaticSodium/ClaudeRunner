@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['D:\\ClaudeCodeProject\\ClaudeRunner\\claude-runner\\claude_runner\\main.py'],
+    ['C:\\Local_Projects\\BTO_Modulators_Simulatior_runner\\ClaudeRunner\\claude_runner\\main.py'],
     pathex=[],
     binaries=[],
-    datas=[('docker/Dockerfile', 'docker/'), ('projects/*.yaml', 'projects/'), ('C:\\Users\\20894\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages\\apprise', 'apprise')],
+    datas=[('docker/Dockerfile', 'docker/'), ('projects/*.yaml', 'projects/'), ('C:\\Local_Projects\\BTO_Modulators_Simulatior_runner\\runner_build_venv\\Lib\\site-packages\\apprise', 'apprise')],
     hiddenimports=['claude_runner', 'claude_runner.main', 'claude_runner.runner', 'claude_runner.config', 'claude_runner.project', 'claude_runner.notify', 'claude_runner.persistence', 'claude_runner.process', 'claude_runner.rate_limit', 'claude_runner.tui', 'claude_runner.context_manager', 'claude_runner.sandbox', 'claude_runner.sandbox.docker_sandbox', 'claude_runner.sandbox.native_sandbox', 'click', 'yaml', 'pydantic', 'pydantic.v1', 'rich', 'rich.console', 'rich.table', 'rich.progress', 'rich.logging', 'apprise', 'keyring', 'keyring.backends', 'winpty', 'docker'],
     hookspath=[],
     hooksconfig={},
