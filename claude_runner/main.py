@@ -614,6 +614,173 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude:
         sys.exit(1)
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# pause
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("pause")
+@click.argument("project")
+def pause_cmd(project: str) -> None:
+    """Request a graceful pause of a running session.
+
+    PROJECT is the project ID (YAML filename stem) of the running task.
+    The runner will pause at the next safe point and write state to disk.
+    Resume with: claude-runner resume PROJECT
+    """
+    _ensure_initialized()
+
+    state_path = _DEFAULT_STATE_DIR / f"{project}.json"
+    if not state_path.exists():
+        _abort(
+            f"No running session found for project {project!r}.  "
+            f"(Looked for: {state_path})"
+        )
+
+    # Write pause_requested flag into the state file so the runner picks it up
+    # on its next heartbeat check.
+    try:
+        import json as _json  # noqa: PLC0415
+        with state_path.open("r", encoding="utf-8") as fh:
+            state_data = _json.load(fh)
+
+        if state_data.get("current_phase") in ("complete", "failed", "paused"):
+            _warn(
+                f"Session for {project!r} is already in phase "
+                f"'{state_data['current_phase']}' — nothing to pause."
+            )
+            return
+
+        state_data["pause_requested"] = True
+        with state_path.open("w", encoding="utf-8") as fh:
+            _json.dump(state_data, fh, indent=2)
+
+        _ok(
+            f"Pause requested for {project!r}.  "
+            "The runner will pause at the next safe point."
+        )
+        _info(f"Resume with:  claude-runner resume {project}")
+    except Exception as exc:
+        _abort(f"Could not update state file for {project!r}: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# resume
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("resume")
+@click.argument("project")
+@click.option("--tui/--no-tui", default=True, help="Show the Rich terminal UI.")
+@click.option(
+    "--skip-preflight",
+    is_flag=True,
+    default=False,
+    help="Skip pre-flight checks.",
+)
+def resume_cmd(project: str, tui: bool, skip_preflight: bool) -> None:
+    """Resume a paused session.
+
+    PROJECT is the project ID (YAML filename stem) of the paused task.
+    """
+    _ensure_initialized()
+
+    state_path = _DEFAULT_STATE_DIR / f"{project}.json"
+    if not state_path.exists():
+        _abort(
+            f"No paused session found for project {project!r}.  "
+            f"(Looked for: {state_path})"
+        )
+
+    try:
+        import json as _json  # noqa: PLC0415
+        with state_path.open("r", encoding="utf-8") as fh:
+            state_data = _json.load(fh)
+    except Exception as exc:
+        _abort(f"Could not read state file for {project!r}: {exc}")
+        return
+
+    if state_data.get("current_phase") != "paused":
+        _warn(
+            f"Session for {project!r} is not paused "
+            f"(phase={state_data.get('current_phase')!r}).  "
+            "Use 'claude-runner run' to start a fresh session."
+        )
+        return
+
+    # Load the project book path from the state file.
+    project_book_path = state_data.get("project_book_path")
+    if not project_book_path:
+        _abort(f"State file for {project!r} does not contain a project_book_path.")
+        return
+
+    pb = _load_project_book(project_book_path)
+    config = _load_global_config()
+    api_key = _resolve_api_key()
+    if not api_key:
+        _abort("ANTHROPIC_API_KEY not found.")
+        return
+
+    tui_manager = None
+    if tui:
+        try:
+            from claude_runner.tui import TUIManager  # type: ignore[import]
+            timeout_hours = getattr(pb.execution, "timeout_hours", 4.0)
+            tui_manager = TUIManager(
+                task_name=pb.name,
+                project_book_path=project_book_path,
+                timeout_hours=float(timeout_hours),
+            )
+            tui_manager.start()
+        except ImportError:
+            _warn("TUI unavailable. Continuing without TUI.")
+            tui_manager = None
+
+    _info(f"Resuming paused session for {project!r} …")
+
+    # Mark state as running again before handing control to the runner.
+    try:
+        state_data["current_phase"] = "resuming"
+        state_data["paused"] = False
+        state_data["pause_requested"] = False
+        with state_path.open("w", encoding="utf-8") as fh:
+            import json as _json2  # noqa: PLC0415
+            _json2.dump(state_data, fh, indent=2)
+    except Exception as exc:
+        _warn(f"Could not update state before resume: {exc}")
+
+    try:
+        from claude_runner.runner import ClaudeRunner  # type: ignore[import]
+        runner = ClaudeRunner(
+            project_book=pb,
+            config=config,
+            tui=tui_manager,
+            api_key=api_key,
+            resume=True,
+            project_book_path=project_book_path,
+            skip_preflight=skip_preflight,
+        )
+        result = asyncio.run(runner.run())
+    except KeyboardInterrupt:
+        _warn("Interrupted by user.")
+        sys.exit(130)
+    except Exception as exc:
+        if tui_manager:
+            tui_manager.stop()
+        _abort(f"Runner error: {exc}")
+        return
+    finally:
+        if tui_manager:
+            tui_manager.stop()
+
+    if result.status == "complete":
+        _ok(f"Task '{pb.name}' completed successfully after resume.")
+    else:
+        msg = result.error_message or result.status
+        _err_console.print(f"[bold red][FAIL][/bold red] Task '{pb.name}': {msg}")
+        sys.exit(1)
+
+
 def _render_project_book_summary(pb) -> Table:
     """Render a summary of a parsed project book for --dry-run output."""
     t = Table.grid(padding=(0, 2))

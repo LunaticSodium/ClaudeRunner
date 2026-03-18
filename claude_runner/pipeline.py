@@ -69,7 +69,7 @@ class Pipeline:
     RECEIVE → PARSE → CONVERT → LAUNCH → TRASH (on any failure)
     """
 
-    CONTROL_COMMANDS: frozenset = frozenset({"run", "abort", "status", "stop", "fetch"})
+    CONTROL_COMMANDS: frozenset = frozenset({"run", "abort", "status", "stop", "fetch", "pause", "resume"})
 
     # A2: valid branch-ref patterns for the 'fetch' command.
     import re as _re
@@ -294,6 +294,10 @@ class Pipeline:
             self._cmd_stop(original_message)
         elif cmd.keyword == "fetch":
             self._cmd_fetch(cmd.args.strip(), original_message)
+        elif cmd.keyword == "pause":
+            self._cmd_pause(cmd.args.strip(), original_message)
+        elif cmd.keyword == "resume":
+            self._cmd_resume(cmd.args.strip(), original_message)
 
     def _cmd_run(self, name: str, original_message: NtfyMessage) -> None:
         """Find and launch a named project book from the projects/ search path."""
@@ -349,6 +353,36 @@ class Pipeline:
             self._daemon.stop()
         except Exception as exc:  # noqa: BLE001
             logger.warning("daemon.stop() failed: %s", exc)
+
+    def _cmd_pause(self, args: str, original_message: NtfyMessage) -> None:
+        """Request a graceful pause of a named running project."""
+        project_id = args.strip()
+        if not project_id:
+            self._trash("PAUSE", "pause command requires a project ID.", original_message.message)
+            return
+        msg = f"Pause requested for project: {project_id!r}"
+        logger.info(msg)
+        try:
+            self._daemon.pause_project(project_id)
+            self._ntfy.publish("out", msg, title="claude-runner")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daemon.pause_project(%r) failed: %s", project_id, exc)
+            self._ntfy.publish("out", f"[PAUSE] error: {exc}", title="claude-runner")
+
+    def _cmd_resume(self, args: str, original_message: NtfyMessage) -> None:
+        """Resume a paused project."""
+        project_id = args.strip()
+        if not project_id:
+            self._trash("RESUME", "resume command requires a project ID.", original_message.message)
+            return
+        msg = f"Resume requested for project: {project_id!r}"
+        logger.info(msg)
+        try:
+            self._daemon.resume_project(project_id)
+            self._ntfy.publish("out", msg, title="claude-runner")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daemon.resume_project(%r) failed: %s", project_id, exc)
+            self._ntfy.publish("out", f"[RESUME] error: {exc}", title="claude-runner")
 
     def _cmd_fetch(self, branch_ref: str, original_message: NtfyMessage) -> None:
         """

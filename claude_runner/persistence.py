@@ -79,7 +79,7 @@ class TaskState:
     task_name: str
     project_book_path: str
     start_time: str                      # ISO 8601
-    current_phase: str                   # running | waiting | resuming | complete | failed
+    current_phase: str                   # running | waiting | resuming | complete | failed | paused
     rate_limit_wait_count: int = 0
     last_output_timestamp: str | None = None
     last_reset_time: str | None = None   # ISO 8601 of last rate-limit reset
@@ -88,6 +88,8 @@ class TaskState:
     progress_log_path: str | None = None
     fault_log: list[str] = field(default_factory=list)
     last_summary: str | None = None      # For the summarize resume strategy
+    paused: bool = False                 # True when the session is paused by request
+    pause_requested: bool = False        # True while a pause is pending (not yet persisted)
 
     # ------------------------------------------------------------------
     # Serialisation helpers
@@ -283,3 +285,34 @@ class PersistenceManager:
     def get_state_path(self) -> Path:
         """Return the absolute ``Path`` of the state file."""
         return self._state_path
+
+    # ------------------------------------------------------------------
+    # Pause/resume helpers
+    # ------------------------------------------------------------------
+
+    def write_paused_state(self, state: "TaskState") -> None:
+        """Persist *state* with ``current_phase="paused"`` and ``paused=True``.
+
+        This is a convenience wrapper around :meth:`save` that ensures the
+        phase and flag are set correctly before writing.
+
+        Parameters
+        ----------
+        state:
+            The current task state to be written as paused.
+        """
+        state.current_phase = "paused"
+        state.paused = True
+        state.pause_requested = False
+        self.save(state)
+        logger.info("Paused state written for task %r.", self._task_name)
+
+    def read_state(self, project_id: str | None = None) -> "TaskState | None":  # noqa: ARG002
+        """Load and return the persisted :class:`TaskState` (alias for :meth:`load`).
+
+        The *project_id* parameter is accepted for API symmetry but ignored —
+        this manager is already scoped to a single task.
+
+        Returns ``None`` if no state file exists.
+        """
+        return self.load()

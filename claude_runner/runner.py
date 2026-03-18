@@ -336,6 +336,9 @@ class TaskRunner:
         self._model_switch_event: Optional[asyncio.Event] = None
         self._model_switch_reason: Optional[str] = None
 
+        # Pause/resume flag — set by request_pause(); checked in main loop.
+        self._pause_requested: bool = False
+
     # ------------------------------------------------------------------
     # Secrets config loader
     # ------------------------------------------------------------------
@@ -380,6 +383,28 @@ class TaskRunner:
         self._fault_log.append(message)
         if self._persistence:
             self._persistence.append_fault(message)
+
+    # ------------------------------------------------------------------
+    # Pause/resume
+    # ------------------------------------------------------------------
+
+    def request_pause(self) -> None:
+        """Request a graceful pause of the running session.
+
+        Sets an internal flag that is checked after the current work unit
+        (main-loop iteration) completes.  The runner will:
+          1. Write the paused state to disk.
+          2. Fire a "paused" ntfy notification.
+          3. Return a ``TaskResult`` with ``status="aborted"`` and a
+             ``pause`` annotation so the caller can detect the pause.
+
+        Thread-safe: may be called from any thread.
+        """
+        self._pause_requested = True
+        logger.info(
+            "[PAUSE] Pause requested for task %r.  Will pause at next safe point.",
+            self._project_id,
+        )
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -660,6 +685,10 @@ class TaskRunner:
         #
 
         while True:
+            # --- Pause check (before deadline check) -----------------------
+            if self._pause_requested:
+                return await self._handle_pause()
+
             # Check overall deadline.
             now = datetime.now(tz=timezone.utc)
             if now >= deadline:
@@ -799,6 +828,60 @@ class TaskRunner:
                 # Timeout on wait — loop back to recheck deadline and state.
                 logger.debug("Monitor poll timeout; rechecking deadline.")
                 self._checkpoint_state()
+
+    # ------------------------------------------------------------------
+    # Pause handling
+    # ------------------------------------------------------------------
+
+    async def _handle_pause(self) -> TaskResult:
+        """Respond to a ``request_pause()`` call.
+
+        1. Stop the Claude Code subprocess gracefully (best effort).
+        2. Write paused state to disk.
+        3. Fire an ntfy notification: "[PAUSED] {project_id} — resume with: …".
+        4. Return a TaskResult with status "aborted" and an error_message that
+           indicates this was a requested pause (not a real error).
+        """
+        logger.info("[PAUSE] Pausing session for task %r.", self._project_id)
+
+        # Stop the running process gracefully.
+        if self._process is not None:
+            try:
+                if hasattr(self._process, "stop"):
+                    self._process.stop(timeout=5.0)
+                elif hasattr(self._process, "terminate"):
+                    self._process.terminate()
+            except Exception as exc:
+                logger.warning("[PAUSE] Could not stop process: %s", exc)
+
+        # Write paused state.
+        if self._persistence is not None:
+            try:
+                state = self._make_state(
+                    "paused",
+                    rate_limit_wait_count=self._rate_limit_cycles,
+                    token_estimate=(
+                        self._context_manager.estimated_tokens
+                        if self._context_manager else 0
+                    ),
+                )
+                self._persistence.write_paused_state(state)
+            except Exception as exc:
+                logger.warning("[PAUSE] Could not write paused state: %s", exc)
+
+        # Fire ntfy notification.
+        resume_cmd = f"claude-runner resume {self._project_id}"
+        pause_msg = f"[PAUSED] {self._project_id} — resume with: {resume_cmd}"
+        try:
+            await self._dispatch("complete", {"task": self._book.name, "pause_msg": pause_msg})
+        except Exception as exc:
+            logger.warning("[PAUSE] Notification dispatch failed: %s", exc)
+
+        logger.info("[PAUSE] Session paused. %s", pause_msg)
+        return self._make_result(
+            "aborted",
+            error_message=f"Session paused by request. {resume_cmd}",
+        )
 
     # ------------------------------------------------------------------
     # Rate-limit handling

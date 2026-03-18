@@ -70,6 +70,95 @@ class MarathonDaemon:
         """Signal the daemon to exit after the current poll completes."""
         self._shutdown.set()
 
+    def pause_project(self, project_id: str) -> None:
+        """Request a graceful pause of a named running project.
+
+        Writes ``pause_requested=True`` into the project's state file so the
+        running :class:`~claude_runner.runner.TaskRunner` picks it up on its
+        next main-loop iteration.
+
+        Parameters
+        ----------
+        project_id:
+            The project identifier (YAML filename stem) of the running task.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no state file exists for *project_id*.
+        """
+        import json  # noqa: PLC0415
+        from .persistence import PersistenceManager  # noqa: PLC0415
+
+        state_dir = pathlib.Path.home() / ".claude-runner" / "state"
+        state_path = state_dir / f"{project_id}.json"
+        if not state_path.exists():
+            raise FileNotFoundError(
+                f"No state file for project {project_id!r} — is it running?"
+            )
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        data["pause_requested"] = True
+        state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        logger.info("pause_project: set pause_requested=True for %r", project_id)
+
+    def resume_project(self, project_id: str) -> None:
+        """Resume a paused project by launching it again with resume=True.
+
+        Rewrites the state file phase to "resuming" and spawns a new
+        ``claude-runner run`` subprocess.
+
+        Parameters
+        ----------
+        project_id:
+            The project identifier of the paused task.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no state file exists for *project_id*.
+        ValueError
+            If the state file exists but the task is not paused.
+        """
+        import json  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        state_dir = pathlib.Path.home() / ".claude-runner" / "state"
+        state_path = state_dir / f"{project_id}.json"
+        if not state_path.exists():
+            raise FileNotFoundError(
+                f"No state file for project {project_id!r}."
+            )
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if data.get("current_phase") != "paused":
+            raise ValueError(
+                f"Project {project_id!r} is not paused "
+                f"(phase={data.get('current_phase')!r})."
+            )
+
+        project_book_path = data.get("project_book_path")
+        if not project_book_path:
+            raise ValueError(
+                f"State file for {project_id!r} has no project_book_path."
+            )
+
+        # Mark as resuming so the runner knows.
+        data["current_phase"] = "resuming"
+        data["paused"] = False
+        data["pause_requested"] = False
+        state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        # Spawn a detached resume process.
+        cmd = [sys.executable, "-m", "claude_runner", "resume", project_id]
+        subprocess.Popen(
+            cmd,
+            stdin=None,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x00000008 if hasattr(subprocess, "DETACHED_PROCESS") else 0,
+        )
+        logger.info("resume_project: spawned resume process for %r", project_id)
+
     def status(self) -> dict:
         """Return daemon uptime, active task name, and shutdown state."""
         now = datetime.now(timezone.utc)
