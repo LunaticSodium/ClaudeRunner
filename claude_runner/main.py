@@ -424,7 +424,13 @@ def cli() -> None:
     default=False,
     help="Open Claude Code in a visible console window. Implies --verbose. For diagnosing process communication issues only.",
 )
-def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude: bool) -> None:
+@click.option(
+    "--skip-preflight",
+    is_flag=True,
+    default=False,
+    help="Skip all pre-flight checks (working_dir, env vars, ntfy reachability, …).",
+)
+def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude: bool, skip_preflight: bool) -> None:
     """Run a claude-runner project book.
 
     PROJECT_BOOK is the path to a .yaml project book file.  A bare filename
@@ -536,6 +542,7 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude:
             resume=resume_session,
             project_book_path=project_book,
             show_claude=show_claude,
+            skip_preflight=skip_preflight,
         )
 
         # ── Register cleanup handlers ──────────────────────────────────────

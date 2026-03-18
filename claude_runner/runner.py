@@ -257,6 +257,7 @@ class TaskRunner:
         resume: bool = False,
         project_book_path: Optional[str] = None,
         show_claude: bool = False,
+        skip_preflight: bool = False,
     ) -> None:
         self._book = project_book
         self._config = config
@@ -275,6 +276,7 @@ class TaskRunner:
             else _safe_name(self._book.name)
         )
         self._secrets_config = self._load_secrets_config()
+        self._skip_preflight = skip_preflight
 
         # Resolved lazily once run() begins.
         self._sandbox = sandbox  # may be pre-provided; if None, created in _initialise()
@@ -435,8 +437,22 @@ class TaskRunner:
         # Deferred imports to avoid circular dependencies at module load time.
         from .notify import NotificationManager  # noqa: PLC0415
         from .persistence import PersistenceManager, TaskState  # noqa: PLC0415
+        from .preflight import PreflightError, run_preflight  # noqa: PLC0415
         from .rate_limit import RateLimitDetector  # noqa: PLC0415
-        from .sandbox import create_sandbox  # noqa: PLC0415
+        from .sandbox import create_sandbox, resolve_working_dir  # noqa: PLC0415
+
+        # --- Preflight checks (before sandbox setup) ----------------------
+        try:
+            working_dir_for_preflight = resolve_working_dir(self._book, book_path=self._book_path)
+            preflight_warnings = run_preflight(
+                self._book,
+                working_dir_for_preflight,
+                skip=self._skip_preflight,
+            )
+            for w in preflight_warnings:
+                logger.warning("[PREFLIGHT] %s", w)
+        except PreflightError as exc:
+            raise RuntimeError(f"Pre-flight check failed: {exc}") from exc
 
         # --- Sandbox -------------------------------------------------------
         if self._sandbox is None:

@@ -625,6 +625,30 @@ class NotifyConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Preflight sub-model
+# ---------------------------------------------------------------------------
+
+
+class PreflightConfig(BaseModel):
+    """Optional pre-flight checks run before Claude Code subprocess is spawned.
+
+    Attributes
+    ----------
+    required_env:
+        List of environment variable names that must be set.  A missing
+        variable causes a hard ``PreflightError`` before Claude is launched.
+    skip:
+        When ``True`` all preflight checks are skipped for this project book.
+        Equivalent to passing ``--skip-preflight`` on the CLI.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    required_env: list[str] = Field(default_factory=list)
+    skip: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Acceptance criteria sub-models
 # ---------------------------------------------------------------------------
 
@@ -786,6 +810,13 @@ class ProjectBook(BaseModel):
             "Optional post-completion acceptance gate.  When set, claude-runner "
             "evaluates all checks after ##RUNNER:COMPLETE## is detected.  "
             "On failure the task is retried, notified, or failed per on_failure."
+        ),
+    )
+    preflight: Optional[PreflightConfig] = Field(
+        default=None,
+        description=(
+            "Optional pre-flight checks evaluated before Claude Code is spawned.  "
+            "Fails hard on missing required_env variables; warns on other issues."
         ),
     )
 
