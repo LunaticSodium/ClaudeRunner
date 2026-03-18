@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from .project import AcceptanceCriteria, AcceptanceCheck
+    from .project import AcceptanceCriteria, AcceptanceCheck, ImplementationConstraint
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +219,7 @@ def run_checks(
     criteria: "AcceptanceCriteria",
     working_dir: Path,
     api_key: str = "",
+    implementation_constraints: "Optional[list[ImplementationConstraint]]" = None,
 ) -> CheckResult:
     """
     Evaluate every check in *criteria* against *working_dir*.
@@ -265,6 +266,21 @@ def run_checks(
         else:
             logger.info("Acceptance check PASSED: %s", label)
             detail_lines.append(f"  PASS {label}")
+
+    # --- Implementation constraints (run only when acceptance checks pass) ---
+    if len(failed) == 0 and implementation_constraints:
+        from .constraint_checker import check_all_constraints  # noqa: PLC0415
+        constraint_results = check_all_constraints(implementation_constraints, working_dir, api_key)
+        for cr in constraint_results:
+            label = f"[constraint/{cr.id}]"
+            if cr.passed:
+                logger.info("Implementation constraint PASSED: %s", label)
+                detail_lines.append(f"  PASS {label}: {cr.reason}")
+            else:
+                msg = f"{label}: {cr.reason}"
+                logger.warning("Implementation constraint FAILED: %s", msg)
+                failed.append(msg)
+                detail_lines.append(f"  FAIL {label}: {cr.reason}")
 
     passed = len(failed) == 0
     details = "\n".join(detail_lines)

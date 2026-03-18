@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import re
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -625,6 +626,53 @@ class NotifyConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Implementation constraints sub-models
+# ---------------------------------------------------------------------------
+
+
+class ConstraintVerifyBackend(str, Enum):
+    """Backend used to verify an implementation constraint."""
+
+    file_contains = "file_contains"
+    llm_judge = "llm_judge"
+
+
+class ImplementationConstraint(BaseModel):
+    """A verifiable algorithmic requirement for the task output.
+
+    Attributes
+    ----------
+    id:
+        Short unique identifier for this constraint (e.g. ``"use-redis"``).
+    description:
+        Human-readable description injected into the initial prompt and
+        visible in reports.
+    verify_with:
+        Verification backend.  ``file_contains`` runs a regex/grep search;
+        ``llm_judge`` asks a lightweight model to confirm compliance.
+    file:
+        Relative path (from working directory) of the file to inspect.
+        Required for ``file_contains``; optional for ``llm_judge``.
+    pattern:
+        Python regex pattern searched in *file*.  Required for
+        ``file_contains``.
+    prompt:
+        Instruction sent to the LLM judge.  Required for ``llm_judge``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    verify_with: ConstraintVerifyBackend
+    # file_contains fields
+    file: str | None = None
+    pattern: str | None = None
+    # llm_judge fields
+    prompt: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Preflight sub-model
 # ---------------------------------------------------------------------------
 
@@ -817,6 +865,13 @@ class ProjectBook(BaseModel):
         description=(
             "Optional pre-flight checks evaluated before Claude Code is spawned.  "
             "Fails hard on missing required_env variables; warns on other issues."
+        ),
+    )
+    implementation_constraints: list[ImplementationConstraint] = Field(
+        default_factory=list,
+        description=(
+            "Verifiable algorithmic requirements injected into the initial prompt and "
+            "verified automatically after acceptance checks complete."
         ),
     )
 

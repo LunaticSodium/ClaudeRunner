@@ -1063,17 +1063,33 @@ class TaskRunner:
         from .acceptance_runner import run_checks  # noqa: PLC0415
 
         criteria = getattr(self._book, "acceptance_criteria", None)
-        if criteria is None or not criteria.checks:
-            # No acceptance gate configured — complete immediately.
+        impl_constraints = getattr(self._book, "implementation_constraints", []) or []
+
+        if (criteria is None or not criteria.checks) and not impl_constraints:
+            # No acceptance gate and no constraints configured — complete immediately.
             return await self._handle_completion()
 
         working_dir = self._working_dir()
+        n_checks = len(criteria.checks) if criteria and criteria.checks else 0
         logger.info(
-            "[ACCEPTANCE] Running %d check(s) in %s …",
-            len(criteria.checks),
+            "[ACCEPTANCE] Running %d check(s) + %d constraint(s) in %s …",
+            n_checks,
+            len(impl_constraints),
             working_dir,
         )
-        check_result = run_checks(criteria, working_dir, api_key=self._api_key)
+
+        # When there is no acceptance criteria but there are constraints, create
+        # a minimal stub criteria so run_checks can run.
+        if criteria is None or not criteria.checks:
+            from .project import AcceptanceCriteria  # noqa: PLC0415
+            criteria = AcceptanceCriteria()
+
+        check_result = run_checks(
+            criteria,
+            working_dir,
+            api_key=self._api_key,
+            implementation_constraints=impl_constraints or None,
+        )
 
         if check_result.passed:
             logger.info("[ACCEPTANCE] All checks passed.")
@@ -1578,6 +1594,20 @@ class TaskRunner:
                 + "\n--- End of project context ---"
             )
             task_prompt = claude_md_block + "\n\n" + task_prompt
+
+        # Inject implementation_constraints section if any are configured.
+        constraints = getattr(self._book, "implementation_constraints", []) or []
+        if constraints:
+            constraint_lines = "\n".join(
+                f"- [{c.id}] {c.description}" for c in constraints
+            )
+            constraints_block = (
+                "\n\n## Implementation Requirements (MANDATORY)\n"
+                "The following algorithmic constraints MUST be implemented exactly as specified:\n"
+                f"{constraint_lines}\n"
+                "These will be verified automatically after acceptance checks complete."
+            )
+            task_prompt = task_prompt + constraints_block
 
         # Apply RUNNER_PROTOCOL + context_anchors via ContextManager so the
         # ordering is always: runner protocol → anchors → CLAUDE.md → task.
