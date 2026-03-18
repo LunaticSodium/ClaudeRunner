@@ -89,8 +89,8 @@ def run_preflight(
         )
         logger.debug("[preflight] no .git in working_dir — warned.")
 
-    # ── Check 3: model_id format (warn if stale alias detected) ───────────
-    _check_model_ids(project, warnings)
+    # ── Check 3: model_id alias resolution + format (warn if stale) ──────
+    _check_and_resolve_model_ids(project, warnings)
 
     # ── Check 4: required_env (hard fail if any missing) ──────────────────
     _check_required_env(project, warnings)
@@ -112,8 +112,21 @@ def run_preflight(
 # ---------------------------------------------------------------------------
 
 
-def _check_model_ids(project: "ProjectBook", warnings: list[str]) -> None:
-    """Warn if any model_id in the schedule looks like a stale alias."""
+def _check_and_resolve_model_ids(project: "ProjectBook", warnings: list[str]) -> None:
+    """Run alias resolution and warn about any unknown/stale model IDs."""
+    try:
+        from .model_resolver import resolve_model_ids  # noqa: PLC0415
+        _, resolver_msgs = resolve_model_ids(project)
+        for msg in resolver_msgs:
+            warnings.append(f"preflight: {msg}")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[preflight] model_resolver raised: %s", exc)
+        # Fall back to format-only check.
+        _check_model_ids_format(project, warnings)
+
+
+def _check_model_ids_format(project: "ProjectBook", warnings: list[str]) -> None:
+    """Warn if any model_id in the schedule looks like a stale alias (format check only)."""
     schedule = getattr(project, "model_schedule", None)
     if schedule is None:
         return
