@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .config import Config as GlobalConfig
+    from .supervisor_protocol import SupervisorProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class MarathonDaemon:
         self.active_task: Optional[str] = None  # task name string
         self._shutdown = threading.Event()
         self._ntfy_client: Optional[object] = None  # NtfyClient, set lazily
+        self._supervisor: Optional["SupervisorProtocol"] = None  # set by caller if enabled
 
     # ------------------------------------------------------------------
     # Public interface
@@ -158,6 +160,57 @@ class MarathonDaemon:
             creationflags=0x00000008 if hasattr(subprocess, "DETACHED_PROCESS") else 0,
         )
         logger.info("resume_project: spawned resume process for %r", project_id)
+
+    def on_dash_complete(self, dash_n: int) -> None:
+        """Called after each Dash task completes.
+
+        If the supervisor protocol is enabled, triggers the post-Dash
+        self-check.
+
+        Parameters
+        ----------
+        dash_n:
+            The Dash number that just completed (1-based).
+        """
+        if self._supervisor is not None:
+            try:
+                self._supervisor.trigger_self_check(dash_n)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on_dash_complete: supervisor self-check failed: %s", exc)
+
+    def supervisor_confirm(self, intent_message: str) -> bool:
+        """Gate an intent through the supervisor confirm loop.
+
+        If supervisor protocol is not enabled, always returns True.
+
+        Parameters
+        ----------
+        intent_message:
+            Description of the intended action.
+
+        Returns
+        -------
+        bool
+            ``True`` if the action should proceed, ``False`` if it should be
+            skipped (timeout or not confirmed).
+        """
+        if self._supervisor is None:
+            return True
+        try:
+            confirmed = self._supervisor.wait_for_confirm(intent_message)
+            if not confirmed:
+                logger.info(
+                    "supervisor_confirm: intent not confirmed (timeout) — action skipped: %s",
+                    intent_message,
+                )
+                self._supervisor.log_event(
+                    "ACTION_SKIPPED",
+                    f"not confirmed within timeout: {intent_message!r}",
+                )
+            return confirmed
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("supervisor_confirm failed: %s", exc)
+            return True  # fail-open so daemon doesn't deadlock
 
     def status(self) -> dict:
         """Return daemon uptime, active task name, and shutdown state."""

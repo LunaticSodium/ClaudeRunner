@@ -25,6 +25,8 @@ from typing import Any, Literal, Optional
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .config import ConfigError
+
 
 # ---------------------------------------------------------------------------
 # Custom YAML loader — YAML 1.2-style booleans only
@@ -221,6 +223,27 @@ class CccsConfig(BaseModel):
             "When None the preset's default_profile is used."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Supervisor protocol config
+# ---------------------------------------------------------------------------
+
+
+class SupervisorProtocolConfig(BaseModel):
+    """Hardcoded behavioral layer for Marathon.
+
+    Once enabled, all mechanisms are mandatory and cannot be disabled,
+    overridden, or bypassed by Claude Code, any Dash agent, or any internal
+    script.  Mutually exclusive with ``cccs``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    self_check_limit: int = Field(default=10, ge=1)
+    confirm_timeout_minutes: int = Field(default=5, ge=1)
+    audit_dir: str = "audit/"
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +897,25 @@ class ProjectBook(BaseModel):
             "verified automatically after acceptance checks complete."
         ),
     )
+    supervisor_protocol: SupervisorProtocolConfig = Field(
+        default_factory=SupervisorProtocolConfig,
+        description=(
+            "Supervisor protocol configuration.  When enabled=true, activates the "
+            "hardcoded marathon behavioral layer.  Mutually exclusive with cccs."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_supervisor_cccs_exclusive(self) -> "ProjectBook":
+        """Raise ConfigError if both supervisor_protocol and cccs are enabled."""
+        cccs_enabled = self.cccs is not None and self.cccs.enabled
+        sp_enabled = self.supervisor_protocol.enabled
+        if sp_enabled and cccs_enabled:
+            raise ConfigError(
+                "supervisor_protocol and cccs cannot both be enabled — "
+                "they are mutually exclusive protocol layers."
+            )
+        return self
 
     @model_validator(mode="after")
     def resolve_skip_permissions(self) -> "ProjectBook":

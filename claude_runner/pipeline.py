@@ -299,6 +299,23 @@ class Pipeline:
         elif cmd.keyword == "resume":
             self._cmd_resume(cmd.args.strip(), original_message)
 
+    def _require_confirm(self, intent_message: str, original_message: NtfyMessage) -> bool:
+        """Gate an action through the supervisor confirm loop (if enabled).
+
+        Returns ``True`` if the action should proceed, ``False`` if it
+        should be skipped.  When the supervisor protocol is not enabled,
+        or when the daemon does not support supervisor_confirm, always
+        returns ``True`` (fail-open).
+        """
+        supervisor_confirm = getattr(self._daemon, "supervisor_confirm", None)
+        if supervisor_confirm is None:
+            return True
+        try:
+            return supervisor_confirm(intent_message)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_require_confirm: supervisor_confirm raised: %s — proceeding.", exc)
+            return True
+
     def _cmd_run(self, name: str, original_message: NtfyMessage) -> None:
         """Find and launch a named project book from the projects/ search path."""
         if not name:
@@ -325,10 +342,21 @@ class Pipeline:
             self._trash("RUN", f"Project {name!r} not found in search path.", original_message.message)
             return
 
+        if not self._require_confirm(
+            f"Intent: launch project {name!r} from {found}.",
+            original_message,
+        ):
+            logger.info("_cmd_run: action skipped — not confirmed by supervisor.")
+            return
+
         self._launch(found, original_message)
 
     def _cmd_abort(self, name: str, original_message: NtfyMessage) -> None:
         """Abort a named running task (best-effort)."""
+        intent = f"Intent: abort task {name!r}." if name else "Intent: abort current task."
+        if not self._require_confirm(intent, original_message):
+            logger.info("_cmd_abort: action skipped — not confirmed by supervisor.")
+            return
         msg = f"Abort requested for task: {name!r}" if name else "Abort requested."
         logger.info(msg)
         self._ntfy.publish("out", msg, title="claude-runner")
@@ -348,6 +376,9 @@ class Pipeline:
 
     def _cmd_stop(self, original_message: NtfyMessage) -> None:
         """Signal daemon to stop."""
+        if not self._require_confirm("Intent: stop the Marathon daemon.", original_message):
+            logger.info("_cmd_stop: action skipped — not confirmed by supervisor.")
+            return
         self._ntfy.publish("out", "Daemon stop requested.", title="claude-runner")
         try:
             self._daemon.stop()
@@ -359,6 +390,12 @@ class Pipeline:
         project_id = args.strip()
         if not project_id:
             self._trash("PAUSE", "pause command requires a project ID.", original_message.message)
+            return
+        if not self._require_confirm(
+            f"Intent: pause project {project_id!r} at next natural point.",
+            original_message,
+        ):
+            logger.info("_cmd_pause: action skipped — not confirmed by supervisor.")
             return
         msg = f"Pause requested for project: {project_id!r}"
         logger.info(msg)
@@ -374,6 +411,12 @@ class Pipeline:
         project_id = args.strip()
         if not project_id:
             self._trash("RESUME", "resume command requires a project ID.", original_message.message)
+            return
+        if not self._require_confirm(
+            f"Intent: resume paused project {project_id!r}.",
+            original_message,
+        ):
+            logger.info("_cmd_resume: action skipped — not confirmed by supervisor.")
             return
         msg = f"Resume requested for project: {project_id!r}"
         logger.info(msg)
@@ -401,6 +444,13 @@ class Pipeline:
                 "(task/<name> or inbox/<iso-timestamp>)."
             )
             self._trash("FETCH", reason, original_message.message)
+            return
+
+        if not self._require_confirm(
+            f"Intent: fetch branch {branch_ref!r} and enqueue project books.",
+            original_message,
+        ):
+            logger.info("_cmd_fetch: action skipped — not confirmed by supervisor.")
             return
 
         self._ntfy.publish(
