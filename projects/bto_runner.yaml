@@ -358,6 +358,146 @@ prompt: |
 
   Commit: `PHASE-8: 10-hour simulation run complete`
 
+  ### PHASE 9 — Scientific EO device characterisation plots
+
+  STARTUP: run `git log --oneline` first. If PHASE-1 through PHASE-8 commits
+  exist, skip those phases entirely and begin here immediately.
+
+  ENVIRONMENT: the workspace Python is Anaconda (C:/Apps/Anaconda3/python.exe).
+  This is correct — it has all required packages. Run `pip install -e .` once
+  if bto_runner is not yet installed (check with `python -c "import bto_runner"`).
+
+  Physics solver import (copy this exactly):
+    import sys
+    sys.path.insert(0, 'bto-sim/py/solvers')
+    from BTO_Sandwich_Flat import CombinedBTOFlatThinFilmSolver
+
+  TASK: generate parametric sweep plots of EO device metrics for 7 material
+  configurations. All output goes to output/plots/ (create it with mkdir -p).
+
+  ── Material configurations (literature values, lambda=1550 nm) ──────────────
+
+  Define as a list of dicts. MINIMUM 7 entries:
+
+    1. BTO optimal (crystal angle phi=0):
+       r33=923 pm/V, n=2.30, eps_r=1000
+       Ref: Eltes et al., APL 116, 161101 (2019)
+
+    2. BTO misaligned phi=45 deg:
+       r33_eff = 923 * cos(pi/4)**2 = 461 pm/V, same geometry
+
+    3. BTO misaligned phi=90 deg:
+       r33_eff ~ 1 pm/V (near-zero for plotting), same geometry
+
+    4. BTO high-quality domain-switched:
+       r33=1340 pm/V, n=2.30, eps_r=1000
+       Ref: Eltes et al., Nature Materials 19, 1164 (2020)
+
+    5. LiNbO3 thin film on insulator (LNOI):
+       r33=27 pm/V, n_e=2.14, eps_r=28
+       Ref: Weis & Gaylord, Appl. Phys. A 37, 191-203 (1985)
+       Use analytical VpiL (no BTO solver for LiNbO3)
+
+    6. AlN (aluminium nitride):
+       r33=1 pm/V, n=2.12, eps_r=9
+       Ref: Xiong et al., Opt. Lett. 37, 3681 (2012)
+       Use analytical VpiL
+
+    7. Si-organic hybrid (SOH) polymer cladding:
+       r33=150 pm/V, n_clad=1.65, eps_r=2.5
+       Gamma=0.45 (high overlap via slot mode)
+       Ref: Lauermann et al., Optica 3, 1164 (2016)
+       Use analytical VpiL
+
+  Add more materials (TFLN variants, BTO-on-Si, III-V EO) if time allows.
+
+  ── VpiL formula for analytical materials ────────────────────────────────────
+
+    VpiL_Vcm = (pi * 1.55 * g_um) / (n_eff**3 * r33_pm_per_V * 1e-12 * Gamma * 1e4)
+
+  where g_um is electrode gap in microns, Gamma ~ 0.35 for strip WG.
+  For BTO configs, obtain VpiL from solver.extract_key_metrics() v_pi field,
+  or compute as: VpiL = pi * g_um / (n_eff**3 * r33 * 1e-12 * Gamma * 1e4).
+
+  ── Dimension sweeps (5 x-axis parameters, one plot set per parameter) ────────
+
+    a. BTO layer thickness d_BTO: linspace(0.05, 0.50, 20) um
+       Fixed: w=1.0 um, g=4.4 um, V=5.0 V
+
+    b. Waveguide width w: linspace(0.5, 2.0, 20) um
+       Fixed: d_BTO=0.15 um, g=4.4 um, V=5.0 V
+
+    c. Electrode gap g: linspace(2.5, 10.0, 16) um
+       Fixed: d_BTO=0.15 um, w=1.0 um, V=5.0 V
+       Note: VpiL scales linearly with g (physics of field enhancement)
+
+    d. Crystal angle phi: linspace(0, 90, 19) deg
+       r33_eff(phi) = r33 * cos(phi_rad)**2  [for BTO materials only]
+       Fixed: d_BTO=0.15 um, w=1.0 um, g=4.4 um
+
+    e. Applied voltage V: linspace(1, 15, 15) V
+       Plot delta_neff = n**3 * r33 * V / (2 * g_um * 1e-6) / 2 [approximate]
+       VpiL itself does not depend on V -- plot delta_neff here instead
+
+  ── Metrics to plot ───────────────────────────────────────────────────────────
+
+    - VpiL [V.cm]: lower is better; y-axis log scale
+    - Loss alpha [dB/cm]: from solver for BTO; approximate for others
+    - n_eff (real part): from solver for BTO; literature value for others
+    - delta_neff: electro-optic index shift (sweep e above)
+
+  ── Step 1: Write output/generate_plots.py ───────────────────────────────────
+
+  The script must:
+  - Define the 7+ material dicts
+  - For BTO configs: call CombinedBTOFlatThinFilmSolver.extract_key_metrics()
+    Wrap EVERY solver call in try/except; on error store np.nan and log
+  - For non-BTO: compute VpiL analytically, set loss/n_eff to literature values
+    or np.nan where not applicable
+  - For each of the 5 dimension sweeps, produce these plots:
+      vpiL_vs_{param}.png   -- all 7 materials, log-y scale
+      loss_vs_{param}.png   -- BTO configs + any analytical approximation
+      neff_vs_{param}.png   -- BTO configs + literature dots for others
+  - Plus delta_neff_vs_voltage.png
+  - Minimum: 10 PNG files in output/plots/
+  - Each figure: figsize=(10,6), dpi=150, plt.tight_layout()
+  - Legend: material name + r33 value + reference year
+  - Axis labels with units (um, V.cm, dB/cm)
+  - Title: "{metric} vs {parameter} -- EO waveguide comparison"
+  - Cite references in figure suptitle or caption text
+  - Save log to output/plots/generate_log.txt
+
+  Example solver call for BTO thickness sweep:
+    solver = CombinedBTOFlatThinFilmSolver(wavelength_um=1.55, verbose=False)
+    solver.sin_rib_width = 1.0
+    solver.electrode_gap = 4.4
+    for d in np.linspace(0.05, 0.50, 20):
+        solver.bto_thickness = d
+        try:
+            m = solver.extract_key_metrics(voltage=5.0, n_modes=4)
+            vpiL = m.get('v_pi_cm_V', np.nan)
+            loss = m.get('loss_base_db_cm', np.nan)
+            neff = m.get('n_eff_base', np.nan)
+        except Exception as exc:
+            print(f'  [ERROR] d={d}: {exc}', file=log_fh)
+            vpiL = loss = neff = np.nan
+
+  ── Step 2: Run the script ───────────────────────────────────────────────────
+
+    mkdir -p output/plots
+    python output/generate_plots.py 2>&1 | tee output/plots/generate_log.txt
+
+  Expected runtime: 1-6 hours (physics solver sweeps).
+  Do NOT background this — run blocking. Check log for errors after completion.
+
+  ── Step 3: Commit and complete ──────────────────────────────────────────────
+
+  After all plots generated (count PNGs: ls output/plots/*.png | wc -l >= 10):
+    git add output/plots/ output/generate_plots.py
+    git commit -m "PHASE-9: scientific characterisation plots, 7 materials x 5 dimensions"
+
+  Then print `##RUNNER:COMPLETE##` and stop.
+
 # ── Context anchors ───────────────────────────────────────────────────────────
 
 context_anchors: |
@@ -426,11 +566,11 @@ sandbox:
 # ── Execution ─────────────────────────────────────────────────────────────────
 
 execution:
-  timeout_hours: 12
-  max_rate_limit_waits: 20
+  timeout_hours: 96
+  max_rate_limit_waits: 50
   skip_permissions: false
   resume_strategy: restate
-  silence_timeout_minutes: 660
+  silence_timeout_minutes: 2880
 
   milestones:
     - pattern: "PHASE-1:"
@@ -449,6 +589,8 @@ execution:
       message: "Phase 7 committed — CLI, V&V gates passing"
     - pattern: "PHASE-8:"
       message: "Phase 8 committed — 10-hour simulation run complete"
+    - pattern: "PHASE-9:"
+      message: "Phase 9 committed — scientific characterisation plots complete"
 
   context:
     checkpoint_threshold_tokens: 80000
@@ -473,7 +615,7 @@ notify:
 
 acceptance_criteria:
   on_failure: retry
-  max_retries: 2
+  max_retries: 3
   checks:
     - type: command
       run: pytest tests/ -q
@@ -494,4 +636,7 @@ acceptance_criteria:
       path: output/phase8_run.jsonl
     - type: command
       run: "python -c \"import json,sys; n=sum(1 for l in open('output/phase8_run.jsonl') if l.strip()); print(f'Evals: {n}'); sys.exit(0 if n>=6500 else 1)\""
+      expect_exit: 0
+    - type: command
+      run: "python -c \"import pathlib; d=pathlib.Path('output/plots'); pngs=list(d.glob('*.png')) if d.exists() else []; n=len(pngs); print('Plots:', n); [print(' ', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=10 else 1)\""
       expect_exit: 0
