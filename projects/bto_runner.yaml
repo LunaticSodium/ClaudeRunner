@@ -638,5 +638,5 @@ acceptance_criteria:
       run: "python -c \"import json,sys; n=sum(1 for l in open('output/phase8_run.jsonl') if l.strip()); print(f'Evals: {n}'); sys.exit(0 if n>=6500 else 1)\""
       expect_exit: 0
     - type: command
-      run: "python -c \"import pathlib; d=pathlib.Path('output/plots'); pngs=list(d.glob('*.png')) if d.exists() else []; n=len(pngs); print('Plots:', n); [print(' ', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=10 else 1)\""
+      run: "python -c \"import pathlib,sys; d=pathlib.Path('output/plots'); pngs=list(d.glob('*.png')) if d.exists() else []; n=len(pngs); print('Plots:', n); [print(' ', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=10 else 1)\""
       expect_exit: 0
