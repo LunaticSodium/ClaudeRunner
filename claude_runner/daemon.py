@@ -5,13 +5,20 @@ Persistent marathon daemon that polls the ntfy cmd channel and dispatches tasks.
 
 Launched when `claude-runner` is invoked with no arguments in marathon mode,
 or explicitly via `claude-runner marathon`.
+
+v2.0: Multi-worker management. Supervisor dispatches workers by writing
+project books — NEVER executes worker scripts directly. Workers are always
+dash mode, never marathon. Destructive actions cost budget points.
 """
 from __future__ import annotations
 
 import logging
 import os
 import pathlib
+import subprocess
+import sys
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -40,6 +47,9 @@ class MarathonDaemon:
         self._shutdown = threading.Event()
         self._ntfy_client: object | None = None  # NtfyClient, set lazily
         self._supervisor: SupervisorProtocol | None = None  # set by caller if enabled
+        # v2.0: Multi-worker registry
+        self._workers: dict[str, WorkerHandle] = {}
+        self._worker_counter: int = 0
 
     # ------------------------------------------------------------------
     # Public interface
@@ -271,6 +281,120 @@ class MarathonDaemon:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("NtfyClient init failed: %s — daemon continues without ntfy.", exc)
         return self._ntfy_client
+
+    # ------------------------------------------------------------------
+    # v2.0: Multi-worker dispatch
+    # ------------------------------------------------------------------
+
+    def dispatch_worker(self, project_book_path: str) -> str:
+        """Launch a new Dash worker for a project book.
+
+        The supervisor dispatches workers by writing project books and
+        launching sub-runners — it NEVER executes worker scripts directly.
+        Workers always run in dash mode, never marathon.
+
+        Parameters
+        ----------
+        project_book_path:
+            Path to the worker's project book YAML.
+
+        Returns
+        -------
+        str
+            The worker ID assigned (e.g. "D1").
+        """
+        self._worker_counter += 1
+        worker_id = f"D{self._worker_counter}"
+
+        handle = WorkerHandle(
+            worker_id=worker_id,
+            project_book_path=project_book_path,
+            started_at=datetime.now(timezone.utc),
+        )
+
+        # Launch the worker as a detached subprocess
+        cmd = [sys.executable, "-m", "claude_runner", "run", project_book_path]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=None,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x00000008 if hasattr(subprocess, "DETACHED_PROCESS") else 0,
+            )
+            handle.process_pid = proc.pid
+            logger.info("dispatch_worker: launched %s (PID=%d) for %s", worker_id, proc.pid, project_book_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("dispatch_worker: failed to launch %s: %s", worker_id, exc)
+            handle.completed = True
+
+        self._workers[worker_id] = handle
+        self._notify_out(f"Worker {worker_id} dispatched: {project_book_path}")
+        return worker_id
+
+    def terminate_worker(self, worker_id: str, reason: str = "") -> bool:
+        """Terminate a worker and mark as completed.
+
+        WARNING: This is a destructive intervention — costs budget points.
+
+        Parameters
+        ----------
+        worker_id:
+            The worker to terminate.
+        reason:
+            Why the worker is being terminated.
+
+        Returns
+        -------
+        bool
+            True if terminated successfully.
+        """
+        handle = self._workers.get(worker_id)
+        if handle is None:
+            logger.warning("terminate_worker: unknown worker %s", worker_id)
+            return False
+
+        if handle.process_pid is not None:
+            try:
+                import signal  # noqa: PLC0415
+                os.kill(handle.process_pid, signal.SIGTERM)
+                logger.info("terminate_worker: sent SIGTERM to %s (PID=%d)", worker_id, handle.process_pid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("terminate_worker: kill failed for %s: %s", worker_id, exc)
+
+        handle.completed = True
+        handle.completed_at = datetime.now(timezone.utc)
+        self._notify_out(f"Worker {worker_id} terminated. Reason: {reason}")
+        return True
+
+    def list_workers(self) -> dict[str, dict]:
+        """Return status of all workers."""
+        result = {}
+        for wid, handle in self._workers.items():
+            result[wid] = {
+                "project_book": handle.project_book_path,
+                "started_at": handle.started_at.isoformat(),
+                "completed": handle.completed,
+                "pid": handle.process_pid,
+            }
+        return result
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Worker handle
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorkerHandle:
+    """Tracks a single dispatched Dash worker."""
+
+    worker_id: str
+    project_book_path: str
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    completed: bool = False
+    completed_at: datetime | None = None
+    process_pid: int | None = None
 
 
 # ---------------------------------------------------------------------------

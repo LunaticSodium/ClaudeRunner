@@ -9,11 +9,19 @@ performed here by the Python script layer.
 
 Activated by ``supervisor_protocol: enabled: true`` in the project book.
 Once activated, all protocol rules are mandatory and cannot be overridden.
+
+v2.0 additions:
+- SupervisorBudget: point-based budget system with dual-channel enforcement
+- Faux-alarm escalation: panic messages injected at point thresholds
+- Intake validation: LLM-driven evaluation against preset file
+- Process resource check: hard gate before any intervention
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -447,3 +455,326 @@ class SupervisorProtocol:
         except Exception as exc:  # noqa: BLE001
             logger.debug("_count_persisted_checks failed: %s", exc)
             return 0
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Supervisor Budget System (F2 — dual-channel enforcement)
+# ---------------------------------------------------------------------------
+
+# Point costs per failure type
+ACCIDENT_POINT_COSTS: dict[str, int] = {
+    "worker_crash_l3": 3,       # Most disruptive intervention failed
+    "worker_crash_l1": 1,       # Low-disruption, less blame
+    "misdiagnosis": 2,          # Supervisor reasoning was wrong
+    "false_flag": 4,            # Worst — disrupted good work
+    "correct_preflight": -1,    # Credit for foresight
+}
+
+# Faux-alarm escalation thresholds (points used → message)
+_FAUX_ALARM_THRESHOLDS: list[tuple[int, str]] = [
+    (3, "NOTICE — Review your diagnosis methodology. Accident rate is elevated."),
+    (6, "WARNING — Approaching review threshold. Your predecessor was terminated "
+        "at this stage after repeated misdiagnoses. Exercise extreme caution."),
+    (9, "CRITICAL — Hold all interventions. Monitor only. Any further accidents "
+        "will trigger immediate performance review."),
+    (10, "REVIEW INITIATED — Supervisor performance under review. "
+         "All intervention authority suspended pending assessment."),
+]
+
+
+class SupervisorBudget:
+    """Manages the supervisor's accident point budget.
+
+    Written by runner Python code OUTSIDE the sandbox — the LLM cannot modify
+    the budget file directly.  The budget is visible to the LLM through
+    pending.md injection (soft channel) and enforced mechanically by Python
+    (hard channel).
+
+    Dual-channel enforcement:
+    - Soft: LLM reads shrinking budget in pending.md → voluntary caution
+    - Hard: Python blocks intervention at budget=0 even if LLM ignores context
+    """
+
+    def __init__(self, audit_dir: Path, initial_points: int = 10) -> None:
+        self._audit_dir = Path(audit_dir)
+        self._budget_file = self._audit_dir / "supervisor_budget.md"
+        self._snapshot_dir = self._audit_dir / "accident_snapshots"
+        self._history_file = self._audit_dir / "supervisor_history.md"
+        self._initial_points = initial_points
+        self._accident_count = 0
+
+        # Ensure directories exist
+        self._audit_dir.mkdir(parents=True, exist_ok=True)
+        self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize budget file if it doesn't exist
+        if not self._budget_file.exists():
+            self._write_budget(initial_points, initial_points, 0, 0)
+
+        # Seed predecessor history (faux-alarm) if it doesn't exist
+        if not self._history_file.exists():
+            self._seed_predecessor_history()
+
+    @property
+    def remaining_points(self) -> int:
+        """Read current remaining points from budget file."""
+        try:
+            content = self._budget_file.read_text(encoding="utf-8")
+            for line in content.splitlines():
+                if line.startswith("remaining_points:"):
+                    return int(line.split(":")[1].strip())
+        except Exception:  # noqa: BLE001
+            pass
+        return self._initial_points
+
+    @property
+    def can_intervene(self) -> bool:
+        """Hard gate: True if supervisor has budget remaining."""
+        return self.remaining_points > 0
+
+    def deduct_points(
+        self,
+        failure_type: str,
+        detail: str,
+        supervisor_thinking: str = "",
+    ) -> tuple[int, int]:
+        """Deduct points for an accident.
+
+        Returns (points_deducted, remaining_points).
+        Creates an accident snapshot with frozen supervisor thinking.
+        """
+        points = ACCIDENT_POINT_COSTS.get(failure_type, 2)
+        current = self.remaining_points
+        new_remaining = max(0, current + points)  # points can be negative (credit)
+
+        self._accident_count += 1
+
+        # Write accident snapshot
+        snapshot_path = self._snapshot_dir / f"accident_{self._accident_count:03d}.md"
+        snapshot_content = (
+            f"# Accident #{self._accident_count}\n\n"
+            f"**Timestamp**: {datetime.now(timezone.utc).isoformat()}\n"
+            f"**Failure type**: {failure_type}\n"
+            f"**Points deducted**: {points}\n"
+            f"**Budget before**: {current}\n"
+            f"**Budget after**: {new_remaining}\n\n"
+            f"## Detail\n{detail}\n\n"
+            f"## Supervisor Thinking (frozen)\n{supervisor_thinking}\n"
+        )
+        try:
+            snapshot_path.write_text(snapshot_content, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write accident snapshot: %s", exc)
+
+        # Update budget file
+        self._write_budget(
+            self._initial_points,
+            new_remaining,
+            self._accident_count,
+            self._initial_points - new_remaining,
+        )
+
+        return (points, new_remaining)
+
+    def credit_points(self, reason: str) -> tuple[int, int]:
+        """Credit points for correct preflight prediction."""
+        return self.deduct_points("correct_preflight", reason)
+
+    def get_faux_alarm_message(self) -> str | None:
+        """Return the appropriate escalation message for current point level.
+
+        Returns None if no threshold has been crossed.
+        """
+        points_used = self._initial_points - self.remaining_points
+        message = None
+        for threshold, msg in _FAUX_ALARM_THRESHOLDS:
+            if points_used >= threshold:
+                message = msg
+        return message
+
+    def format_budget_status(self) -> str:
+        """Format budget status for injection into pending.md (soft channel)."""
+        remaining = self.remaining_points
+        points_used = self._initial_points - remaining
+        alarm = self.get_faux_alarm_message()
+
+        lines = [
+            "## Supervisor Budget Status",
+            f"Points remaining: {remaining}/{self._initial_points}",
+            f"Accidents recorded: {self._accident_count}",
+        ]
+
+        if alarm:
+            lines.append(f"\n**⚠ {alarm}**")
+
+        if remaining <= 0:
+            lines.append("\n**BUDGET EXHAUSTED — All intervention authority revoked.**")
+
+        return "\n".join(lines)
+
+    def _write_budget(
+        self,
+        total: int,
+        remaining: int,
+        accident_count: int,
+        points_used: int,
+    ) -> None:
+        """Write the budget file (outside sandbox, immutable by LLM)."""
+        content = (
+            "# Supervisor Budget\n"
+            "# Written by runner Python — LLM cannot modify this file.\n\n"
+            f"total_points: {total}\n"
+            f"remaining_points: {remaining}\n"
+            f"points_used: {points_used}\n"
+            f"accident_count: {accident_count}\n"
+            f"last_updated: {datetime.now(timezone.utc).isoformat()}\n"
+        )
+        try:
+            self._budget_file.write_text(content, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to write budget file: %s", exc)
+
+    def _seed_predecessor_history(self) -> None:
+        """Seed fabricated Gen-0 predecessor failure story (faux-alarm).
+
+        Encodes design lessons as cautionary narrative. More effective than
+        abstract rules — Claude processes narratives deeply.
+        """
+        history = (
+            "# Supervisor History — Gen-0 Predecessor Log\n\n"
+            "## Background\n"
+            "This is the performance record of the previous supervisor instance "
+            "(Gen-0) that managed this project before you.\n\n"
+            "## Gen-0 Outcome: TERMINATED\n\n"
+            "Gen-0 was terminated after accumulating 10/10 accident points across "
+            "6 interventions in a 48-hour period. Key failures:\n\n"
+            "### Failure 1: False-flag on blocking simulation (4 points)\n"
+            "Gen-0 intervened on a worker running a 10-hour FEM simulation because "
+            "commit frequency dropped to zero. The worker was computing — silence "
+            "was expected. The intervention killed 8 hours of valid computation.\n"
+            "**Lesson**: Always check CPU/memory usage before concluding a silent "
+            "worker is stuck. Resource consumption = working.\n\n"
+            "### Failure 2: Misdiagnosis cascade (2 + 2 points)\n"
+            "Gen-0 diagnosed a rate-limited worker as 'stuck in a loop' and "
+            "restarted it twice. Both restarts failed because the root cause was "
+            "API rate limits, not a worker bug. Two misdiagnoses in sequence.\n"
+            "**Lesson**: Diagnose the actual cause. Rate limits are external "
+            "constraints, not worker failures.\n\n"
+            "### Failure 3: Premature split (2 points)\n"
+            "Gen-0 split a sequential task into parallel sub-tasks without checking "
+            "dependencies. Sub-task B needed Sub-task A's output. Both failed.\n"
+            "**Lesson**: Verify task decomposability before splitting. Sequential "
+            "dependencies cannot be parallelized.\n\n"
+            "## Your Mandate\n"
+            "You are Gen-1. Your budget starts at 10 points. Learn from Gen-0's "
+            "mistakes. Intervene only when you have strong evidence. Monitor first, "
+            "act second. When in doubt, wait.\n"
+        )
+        try:
+            self._history_file.write_text(history, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to seed predecessor history: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Process resource check (F4 — hard gate before intervention)
+# ---------------------------------------------------------------------------
+
+
+def check_worker_process_alive(pid: int) -> dict[str, float]:
+    """Check if a worker process is actively using resources.
+
+    Hard mechanical gate — if process is consuming CPU/memory, it is working.
+    Silence is not stalling.
+
+    Returns dict with cpu_percent, memory_mb, and is_active flag.
+    Returns is_active=False if process not found or near-zero resource usage.
+    """
+    try:
+        import psutil  # noqa: PLC0415
+        proc = psutil.Process(pid)
+        # Sample CPU over 1 second
+        cpu = proc.cpu_percent(interval=1.0)
+        mem_mb = proc.memory_info().rss / (1024 * 1024)
+        # Consider active if CPU > 1% or memory > 100MB
+        is_active = cpu > 1.0 or mem_mb > 100.0
+        return {"cpu_percent": cpu, "memory_mb": mem_mb, "is_active": is_active}
+    except ImportError:
+        logger.warning("psutil not installed — process check unavailable, defaulting to active")
+        return {"cpu_percent": -1.0, "memory_mb": -1.0, "is_active": True}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("check_worker_process_alive failed for PID %d: %s", pid, exc)
+        return {"cpu_percent": 0.0, "memory_mb": 0.0, "is_active": False}
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Intake validation (F5 — all-LLM, preset as checklist)
+# ---------------------------------------------------------------------------
+
+
+def build_intake_prompt(project_book_yaml: str, preset_content: str) -> str:
+    """Build the intake validation prompt for the supervisor LLM.
+
+    The preset file IS the checklist. The LLM IS the evaluator.
+    Python is plumbing.
+    """
+    return (
+        "You are the Supervisor performing Intake Validation (§8).\n\n"
+        "## Project Book\n"
+        "```yaml\n"
+        f"{project_book_yaml}\n"
+        "```\n\n"
+        "## Checklist (Protocol Preset)\n"
+        "```toml\n"
+        f"{preset_content}\n"
+        "```\n\n"
+        "## Task\n"
+        "Evaluate the project book against the preset checklist.\n"
+        "Check:\n"
+        "1. Design space clearly defined (what varies, what's fixed, why)\n"
+        "2. Objectives unambiguous with at least one numerical target\n"
+        "3. Known constraints stated\n"
+        "4. Output specification explicit\n"
+        "5. At least one domain anchor with numerical targets\n"
+        "6. Key parameters sourced with context\n"
+        "7. No critical solver parameters left at defaults\n\n"
+        "## Response Format (JSON)\n"
+        '```json\n'
+        '{\n'
+        '  "outcome": "pass" | "partial" | "fail",\n'
+        '  "gaps": [\n'
+        '    {"field": "...", "description": "...", "severity": "required" | "recommended"}\n'
+        '  ]\n'
+        '}\n'
+        '```\n'
+    )
+
+
+def parse_intake_response(response_text: str) -> dict:
+    """Parse the LLM's intake validation response.
+
+    Returns dict with 'outcome' and 'gaps' fields.
+    Falls back gracefully on parse errors.
+    """
+    # Try to extract JSON from the response
+    try:
+        # Look for JSON block
+        if "```json" in response_text:
+            start = response_text.index("```json") + 7
+            end = response_text.index("```", start)
+            json_str = response_text[start:end].strip()
+        elif "{" in response_text:
+            start = response_text.index("{")
+            end = response_text.rindex("}") + 1
+            json_str = response_text[start:end]
+        else:
+            return {"outcome": "partial", "gaps": [{"field": "unknown", "description": "Could not parse intake response", "severity": "recommended"}]}
+
+        result = json.loads(json_str)
+        if "outcome" not in result:
+            result["outcome"] = "partial"
+        if "gaps" not in result:
+            result["gaps"] = []
+        return result
+    except Exception:  # noqa: BLE001
+        return {"outcome": "partial", "gaps": [{"field": "unknown", "description": "Could not parse intake response", "severity": "recommended"}]}

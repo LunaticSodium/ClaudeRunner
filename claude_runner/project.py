@@ -63,7 +63,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ResumeStrategy = Literal["continue", "restate", "summarize"]
-NotifyEvent = Literal["start", "rate_limit", "resume", "complete", "error", "model_switch"]
+NotifyEvent = Literal[
+    "start", "rate_limit", "resume", "complete", "error", "model_switch",
+    "supervisor_accident", "intake_pass", "intake_partial", "intake_fail",
+    "preflight_finding", "preflight_action", "kpi_warning", "intervention",
+    "escalate_to_human",
+]
 
 # ---------------------------------------------------------------------------
 # Model-schedule sub-models
@@ -235,14 +240,108 @@ class SupervisorProtocolConfig(BaseModel):
     Once enabled, all mechanisms are mandatory and cannot be disabled,
     overridden, or bypassed by Claude Code, any Dash agent, or any internal
     script.  Mutually exclusive with ``cccs``.
+
+    v2.0 additions: supervisor_model, intervention limits, budget system.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    supervisor_model: str = Field(
+        default="",
+        description=(
+            "Model ID for supervisor reasoning (intake, preflight, thinking manual). "
+            "e.g. 'claude-opus-4-6'. If empty, resolved to best available at bootup. "
+            "Supervisor thinks deeply but briefly — needs reasoning power, not token endurance."
+        ),
+    )
     self_check_limit: int = Field(default=10, ge=1)
     confirm_timeout_minutes: int = Field(default=5, ge=1)
+    intervention_limit: int = Field(
+        default=3, ge=1,
+        description="Max autonomous interventions per worker before escalating to human.",
+    )
+    intervention_cooldown_min: int = Field(
+        default=30, ge=1,
+        description="Minimum minutes between interventions on the same worker.",
+    )
+    initial_budget_points: int = Field(
+        default=10, ge=1,
+        description="Starting accident point budget for the supervisor.",
+    )
     audit_dir: str = "audit/"
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Domain anchors and physics constraints
+# ---------------------------------------------------------------------------
+
+
+class DomainAnchor(BaseModel):
+    """A published reference result for validation (Element 5).
+
+    Declared in project book, compared against worker output during supervision.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(..., description="Paper/report citation.")
+    configuration: str = Field(..., description="What was measured.")
+    metric: str = Field(..., description="What the number represents.")
+    value: float = Field(..., description="The numerical target.")
+    unit: str = Field(..., description="Unit of measurement.")
+    tolerance_pct: float = Field(
+        default=50.0,
+        description="How far off (%) before flagging.",
+    )
+
+
+class PhysicsConstraint(BaseModel):
+    """A hard physical invariant that no output may violate (Element 6).
+
+    Declared in project book — NO hardcoded domain constants in runner code.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., description="Short identifier (e.g. 'positive_vpiL').")
+    check: str = Field(
+        ...,
+        description="Expression from project book (e.g. '0 < vpiL < 100').",
+    )
+    message: str = Field(..., description="Explanation if violated.")
+
+
+class IntakeSpec(BaseModel):
+    """Optional section for intake validation hints (§8).
+
+    All fields are optional — the LLM evaluates completeness against the
+    preset file, not against this schema.  This just provides structured hints.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    design_space_description: str | None = None
+    objectives: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    output_spec: str | None = None
+    domain_anchors: list[DomainAnchor] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Worker handle for multi-worker dispatch
+# ---------------------------------------------------------------------------
+
+
+class WorkerConfig(BaseModel):
+    """Configuration for a single Dash worker dispatched by the supervisor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: str = Field(..., description="Unique worker identifier (e.g. 'D1').")
+    project_book_path: str = Field(..., description="Path to this worker's project book YAML.")
+    working_dir: str = Field(..., description="Path to this worker's working directory.")
+    model_id: str = Field(default="", description="Model for this worker (empty = default).")
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1000,22 @@ class ProjectBook(BaseModel):
         description=(
             "Supervisor protocol configuration.  When enabled=true, activates the "
             "hardcoded marathon behavioral layer.  Mutually exclusive with cccs."
+        ),
+    )
+    intake: IntakeSpec | None = Field(
+        default=None,
+        description=(
+            "Optional intake validation hints (§8). Domain anchors, objectives, "
+            "constraints, design space description. LLM evaluates project book "
+            "against the preset file using these as structured hints."
+        ),
+    )
+    physics_constraints: list[PhysicsConstraint] = Field(
+        default_factory=list,
+        description=(
+            "Hard physical invariants that no output may violate (Element 6). "
+            "Declared here, not hardcoded in the runner. The runner provides the "
+            "evaluation engine; the project book provides the constraints."
         ),
     )
 

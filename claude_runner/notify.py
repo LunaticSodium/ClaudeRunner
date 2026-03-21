@@ -38,13 +38,79 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_EVENTS: frozenset[str] = frozenset(
-    {"start", "rate_limit", "resume", "complete", "error", "milestone"}
+    {"start", "rate_limit", "resume", "complete", "error", "milestone",
+     "supervisor_accident", "intake_pass", "intake_partial", "intake_fail",
+     "preflight_finding", "preflight_action", "kpi_warning", "intervention",
+     "escalate_to_human"}
 )
 
 # Events that must NOT trigger email (desktop + webhook only).
 EMAIL_EXCLUDED_EVENTS: frozenset[str] = frozenset(
-    {"start", "rate_limit", "resume", "milestone"}
+    {"start", "rate_limit", "resume", "milestone",
+     "intake_pass", "preflight_finding", "preflight_action",
+     "kpi_warning", "intervention"}
 )
+
+# ---------------------------------------------------------------------------
+# Supervisor v2.0 message formatters
+# ---------------------------------------------------------------------------
+
+ACCIDENT_POINT_COSTS: dict[str, int] = {
+    "worker_crash_l3": 3,       # Most disruptive intervention failed
+    "worker_crash_l1": 1,       # Low-disruption, less blame
+    "misdiagnosis": 2,          # Supervisor reasoning was wrong
+    "false_flag": 4,            # Worst — disrupted good work
+    "correct_preflight": -1,    # Credit for foresight
+}
+
+
+def format_supervisor_accident(
+    problem_type: str,
+    points_deducted: int,
+    remaining_budget: int,
+    snapshot_path: str,
+    detail: str = "",
+) -> str:
+    """Format a supervisor accident notification message."""
+    lines = [
+        f"SUPERVISOR ACCIDENT — {problem_type}",
+        f"Points deducted: {points_deducted}",
+        f"Remaining budget: {remaining_budget}/10",
+        f"Snapshot: {snapshot_path}",
+    ]
+    if detail:
+        lines.append(f"Detail: {detail}")
+    return "\n".join(lines)
+
+
+def format_preflight_finding(
+    risk: str,
+    source: str,
+    severity: str,
+    blocks_launch: bool,
+) -> str:
+    """Format a pre-flight finding notification."""
+    block_str = "BLOCKS LAUNCH" if blocks_launch else "non-blocking"
+    return (
+        f"PRE-FLIGHT FINDING [{severity.upper()}] ({block_str})\n"
+        f"Risk: {risk}\n"
+        f"Source: {source}"
+    )
+
+
+def format_intervention(
+    worker_id: str,
+    level: int,
+    cause: str,
+    action: str,
+) -> str:
+    """Format an intervention notification."""
+    level_names = {1: "Re-describe", 2: "Split", 3: "Restart+reconfig"}
+    return (
+        f"INTERVENTION L{level} ({level_names.get(level, 'Unknown')}) — Worker {worker_id}\n"
+        f"Cause: {cause}\n"
+        f"Action: {action}"
+    )
 
 EMAIL_GUARD_MINUTES: int = 300  # 5 hours — not configurable
 

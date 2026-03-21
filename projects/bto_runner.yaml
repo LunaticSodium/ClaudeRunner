@@ -358,145 +358,164 @@ prompt: |
 
   Commit: `PHASE-8: 10-hour simulation run complete`
 
-  ### PHASE 9 — Scientific EO device characterisation plots
+  ### PHASE 9 — Scientific EO structure characterisation
 
   STARTUP: run `git log --oneline` first. If PHASE-1 through PHASE-8 commits
   exist, skip those phases entirely and begin here immediately.
 
   ENVIRONMENT: the workspace Python is Anaconda (C:/Apps/Anaconda3/python.exe).
-  This is correct — it has all required packages. Run `pip install -e .` once
+  This is correct -- it has all required packages. Run `pip install -e .` once
   if bto_runner is not yet installed (check with `python -c "import bto_runner"`).
 
-  Physics solver import (copy this exactly):
+  Physics solver import (copy exactly):
     import sys
     sys.path.insert(0, 'bto-sim/py/solvers')
     from BTO_Sandwich_Flat import CombinedBTOFlatThinFilmSolver
 
-  TASK: generate parametric sweep plots of EO device metrics for 7 material
-  configurations. All output goes to output/plots/ (create it with mkdir -p).
+  TASK: characterise how EO performance depends on the dielectric stack on top
+  of the BTO film (top-core material and spacer layer). The "structures" here
+  are different cladding/spacer combinations around the SAME BTO film -- this
+  is NOT about replacing BTO with a different EO platform. LNOI and SOH appear
+  as dashed analytical reference lines only for context.
 
-  ── Material configurations (literature values, lambda=1550 nm) ──────────────
+  ── Structure configurations (8 BTO structures using the FEM solver) ──────────
 
-  Define as a list of dicts. MINIMUM 7 entries:
+  CombinedBTOFlatThinFilmSolver accepts top_core_material in {'sin','sio2','al2o3'}
+  and spacer_material in {'air','sio2','al2o3','sin','water'}.
 
-    1. BTO optimal (crystal angle phi=0):
-       r33=923 pm/V, n=2.30, eps_r=1000
-       Ref: Eltes et al., APL 116, 161101 (2019)
+  CRITICAL: set EO coefficients BEFORE calling extract_key_metrics():
+    solver.r42 = <r42_SI>   # SI units: m/V  (e.g. 923e-12 for 923 pm/V)
+    solver.r51 = solver.r42
+    solver.orientation = 'a-axis'
+    solver.phi_deg = 0.0    # optimal alignment; varies only in sweep d
 
-    2. BTO misaligned phi=45 deg:
-       r33_eff = 923 * cos(pi/4)**2 = 461 pm/V, same geometry
+  Structure table:
+    ID              top_core_material  spacer_material  spacer_thickness_um  r42 pm/V  Reference
+    sin_patch       'sin'              'air'            0.0                  923       Eltes APL 2019
+    sio2_patch      'sio2'             'air'            0.0                  923
+    al2o3_patch     'al2o3'            'air'            0.0                  923
+    sin_sio2        'sio2'             'sin'            0.05                 923
+    sin_al2o3       'al2o3'            'sin'            0.05                 923
+    sio2_al2o3      'al2o3'            'sio2'           0.05                 923
+    al2o3_sio2      'sio2'             'al2o3'          0.05                 923
+    sin_patch_hq    'sin'              'air'            0.0                  1340      Eltes Nat.Mat. 2020
 
-    3. BTO misaligned phi=90 deg:
-       r33_eff ~ 1 pm/V (near-zero for plotting), same geometry
+  Analytical reference lines only (formula, NOT the FEM solver):
+    LNOI: r33=27 pm/V, n=2.14, Gamma=0.35  [Wang et al., Nat.Photon. 2018]
+    SOH:  r33=150 pm/V, n=1.65, Gamma=0.45 [Lauermann et al., Optica 2016]
+    VpiL_Vcm = (100 * 1.55 * g_um) / (n**3 * r33_pm_V * Gamma)
+    # units: lambda[um]*g[um] / (n^3 * r33[pm/V] * Gamma) * 100 = V*cm
+    # (the 1e-6 from um and 1e-12 from pm/V cancel; *100 converts m->cm)
 
-    4. BTO high-quality domain-switched:
-       r33=1340 pm/V, n=2.30, eps_r=1000
-       Ref: Eltes et al., Nature Materials 19, 1164 (2020)
+  ── Step 0: Sweet-spot 2D sweep (find optimal operating point) ───────────────
 
-    5. LiNbO3 thin film on insulator (LNOI):
-       r33=27 pm/V, n_e=2.14, eps_r=28
-       Ref: Weis & Gaylord, Appl. Phys. A 37, 191-203 (1985)
-       Use analytical VpiL (no BTO solver for LiNbO3)
+  For each of the 8 BTO structures, do a coarse 5x5 grid sweep:
+    d_BTO : [0.05, 0.15, 0.25, 0.35, 0.50] um   (5 values)
+    w_rib : [0.5, 0.75, 1.0, 1.5, 2.0] um        (5 values)
+    Fixed : electrode_gap=4.4, voltage=5.0 V, phi_deg=0
 
-    6. AlN (aluminium nitride):
-       r33=1 pm/V, n=2.12, eps_r=9
-       Ref: Xiong et al., Opt. Lett. 37, 3681 (2012)
-       Use analytical VpiL
+  Build a flat param_list of all (structure, d, w) combos and dispatch with
+  ProcessPoolExecutor(max_workers=4) per the parallelism standard in CLAUDE.md.
+  Preferred VpiL key: 'v_pi_cm_V'. If absent, compute:
+    VpiL = (100 * 1.55 * 4.4) / (n_eff**3 * r42_pm_V * 0.35)
+  Record vpiL, loss ('loss_base_db_cm'), n_eff ('n_eff_base').
 
-    7. Si-organic hybrid (SOH) polymer cladding:
-       r33=150 pm/V, n_clad=1.65, eps_r=2.5
-       Gamma=0.45 (high overlap via slot mode)
-       Ref: Lauermann et al., Optica 3, 1164 (2016)
-       Use analytical VpiL
+  After the grid: find (d*, w*) = argmin(vpiL) for each structure.
+  Save output/plots/sweetspot_results.json:
+    {"sin_patch": {"d_opt_um": 0.15, "w_opt_um": 1.0, "vpiL_min_Vcm": 0.23,
+                   "loss_dBcm": 0.6, "n_eff": 2.05}, ...}
+  Print the sweet-spot table before proceeding.
+  Total: 200 solver calls, 4 workers -> ~3 min (vs ~15 min single-threaded).
 
-  Add more materials (TFLN variants, BTO-on-Si, III-V EO) if time allows.
+  ── Step 1: 1D sweeps using sweet-spot as fixed operating point ─────────────
 
-  ── VpiL formula for analytical materials ────────────────────────────────────
+  For each structure, use (d*, w*) from Step 0 as the base operating point.
 
-    VpiL_Vcm = (pi * 1.55 * g_um) / (n_eff**3 * r33_pm_per_V * 1e-12 * Gamma * 1e4)
+  a. BTO thickness: linspace(0.05, 0.50, 20) um
+     Fixed: w=w*, g=4.4, V=5.0
+     Output: vpiL_vs_bto_thickness.png, loss_vs_bto_thickness.png,
+             neff_vs_bto_thickness.png
 
-  where g_um is electrode gap in microns, Gamma ~ 0.35 for strip WG.
-  For BTO configs, obtain VpiL from solver.extract_key_metrics() v_pi field,
-  or compute as: VpiL = pi * g_um / (n_eff**3 * r33 * 1e-12 * Gamma * 1e4).
+  b. WG width: linspace(0.5, 2.0, 20) um
+     Fixed: d=d*, g=4.4, V=5.0
+     Output: vpiL_vs_wg_width.png, loss_vs_wg_width.png, neff_vs_wg_width.png
 
-  ── Dimension sweeps (5 x-axis parameters, one plot set per parameter) ────────
+  c. Electrode gap: linspace(2.5, 10.0, 16) um
+     Fixed: d=d*, w=w*, V=5.0
+     Physics check: VpiL should be approximately linear with g.
+     Output: vpiL_vs_electrode_gap.png, loss_vs_electrode_gap.png
 
-    a. BTO layer thickness d_BTO: linspace(0.05, 0.50, 20) um
-       Fixed: w=1.0 um, g=4.4 um, V=5.0 V
+  d. Crystal angle: linspace(0, 90, 19) deg
+     Set solver.phi_deg = phi each iteration.
+     a-axis EO: r42_eff = r42 * cos(phi_rad)**2 (set solver.r42 each iteration)
+     Fixed: d=d*, w=w*, g=4.4
+     Output: vpiL_vs_crystal_angle.png, loss_vs_crystal_angle.png
 
-    b. Waveguide width w: linspace(0.5, 2.0, 20) um
-       Fixed: d_BTO=0.15 um, g=4.4 um, V=5.0 V
+  e. Applied voltage: linspace(1, 15, 15) V
+     Plot delta_neff only (VpiL is independent of V):
+       delta_neff = n_eff**3 * r42_eff * V / (2 * g_um * 1e-6) / 2  (approx)
+     Fixed: d=d*, w=w*, g=4.4
+     Output: delta_neff_vs_voltage.png
 
-    c. Electrode gap g: linspace(2.5, 10.0, 16) um
-       Fixed: d_BTO=0.15 um, w=1.0 um, V=5.0 V
-       Note: VpiL scales linearly with g (physics of field enhancement)
+  Plot style: figsize=(10,6), dpi=150, tight_layout(), log-y scale for VpiL.
+  Legend: "{structure_id} (r42={r42} pm/V)"; analytical refs as dashed lines.
+  Axis labels with units (um, V.cm, dB/cm). Grid on.
+  IMPORTANT: write log via open(path,'w',encoding='utf-8') -- do NOT use
+  sys.stdout.write for logging (cp1252 crash on Windows with non-ASCII chars).
 
-    d. Crystal angle phi: linspace(0, 90, 19) deg
-       r33_eff(phi) = r33 * cos(phi_rad)**2  [for BTO materials only]
-       Fixed: d_BTO=0.15 um, w=1.0 um, g=4.4 um
+  Minimum 11 PNG files in output/plots/.
 
-    e. Applied voltage V: linspace(1, 15, 15) V
-       Plot delta_neff = n**3 * r33 * V / (2 * g_um * 1e-6) / 2 [approximate]
-       VpiL itself does not depend on V -- plot delta_neff here instead
+  ── Step 2: Literature comparison ────────────────────────────────────────────
 
-  ── Metrics to plot ───────────────────────────────────────────────────────────
+  Extract the sweet-spot VpiL from sweetspot_results.json and compare:
+    sin_patch (r42=923):     target 0.05 - 0.50 V.cm  Eltes APL 2019
+    sin_patch_hq (r42=1340): target 0.03 - 0.30 V.cm  Eltes Nat.Mat. 2020
+    LNOI (analytical):       target 1.0  - 6.0  V.cm  Wang Nat.Photon. 2018
+    SOH (analytical):        target 0.10 - 1.5  V.cm  Lauermann Optica 2016
 
-    - VpiL [V.cm]: lower is better; y-axis log scale
-    - Loss alpha [dB/cm]: from solver for BTO; approximate for others
-    - n_eff (real part): from solver for BTO; literature value for others
-    - delta_neff: electro-optic index shift (sweep e above)
+  Write output/plots/literature_comparison.json as a list:
+    [{"structure": "sin_patch", "vpiL_Vcm": <val>,
+      "target_min": 0.05, "target_max": 0.50,
+      "within_order": <bool>,  # true if vpiL in [target_min/10, target_max*10]
+      "reference": "Eltes APL 2019"}, ...]
 
-  ── Step 1: Write output/generate_plots.py ───────────────────────────────────
+  If any BTO structure has within_order=false, print MISMATCH WARNING and debug:
+    1. Was solver.r42 set in SI units (m/V) BEFORE extract_key_metrics()?
+       r42=923 pm/V means solver.r42 = 923e-12  (NOT 923)
+    2. Is the VpiL key correct? Try both 'v_pi_cm_V' and 'v_pi_V'*g_cm
+    3. Is solver.phi_deg=0 (optimal alignment)?
+  Fix the issue and re-run the failing structure before committing.
 
-  The script must:
-  - Define the 7+ material dicts
-  - For BTO configs: call CombinedBTOFlatThinFilmSolver.extract_key_metrics()
-    Wrap EVERY solver call in try/except; on error store np.nan and log
-  - For non-BTO: compute VpiL analytically, set loss/n_eff to literature values
-    or np.nan where not applicable
-  - For each of the 5 dimension sweeps, produce these plots:
-      vpiL_vs_{param}.png   -- all 7 materials, log-y scale
-      loss_vs_{param}.png   -- BTO configs + any analytical approximation
-      neff_vs_{param}.png   -- BTO configs + literature dots for others
-  - Plus delta_neff_vs_voltage.png
-  - Minimum: 10 PNG files in output/plots/
-  - Each figure: figsize=(10,6), dpi=150, plt.tight_layout()
-  - Legend: material name + r33 value + reference year
-  - Axis labels with units (um, V.cm, dB/cm)
-  - Title: "{metric} vs {parameter} -- EO waveguide comparison"
-  - Cite references in figure suptitle or caption text
-  - Save log to output/plots/generate_log.txt
+  ── Step 3: Commit ───────────────────────────────────────────────────────────
 
-  Example solver call for BTO thickness sweep:
-    solver = CombinedBTOFlatThinFilmSolver(wavelength_um=1.55, verbose=False)
-    solver.sin_rib_width = 1.0
-    solver.electrode_gap = 4.4
-    for d in np.linspace(0.05, 0.50, 20):
-        solver.bto_thickness = d
-        try:
-            m = solver.extract_key_metrics(voltage=5.0, n_modes=4)
-            vpiL = m.get('v_pi_cm_V', np.nan)
-            loss = m.get('loss_base_db_cm', np.nan)
-            neff = m.get('n_eff_base', np.nan)
-        except Exception as exc:
-            print(f'  [ERROR] d={d}: {exc}', file=log_fh)
-            vpiL = loss = neff = np.nan
+  git add output/plots/ output/generate_plots.py
+  git commit -m "PHASE-9: EO structure characterisation, 8 BTO configs x 5 sweeps + lit. comparison"
+  Then print `##RUNNER:COMPLETE##`.
 
-  ── Step 2: Run the script ───────────────────────────────────────────────────
+# ── Output mode ───────────────────────────────────────────────────────────────
+#
+# Separates the "project" (phases 1-8, bto_runner package) from the "target"
+# (what scientific analysis phase 9 runs). To run a different analysis, create
+# a new YAML file that copies this one and changes only output_mode and the
+# phase 9 section of prompt. Phases 1-8 are re-verified but not re-run if
+# their commits already exist.
 
-    mkdir -p output/plots
-    python output/generate_plots.py 2>&1 | tee output/plots/generate_log.txt
-
-  Expected runtime: 1-6 hours (physics solver sweeps).
-  Do NOT background this — run blocking. Check log for errors after completion.
-
-  ── Step 3: Commit and complete ──────────────────────────────────────────────
-
-  After all plots generated (count PNGs: ls output/plots/*.png | wc -l >= 10):
-    git add output/plots/ output/generate_plots.py
-    git commit -m "PHASE-9: scientific characterisation plots, 7 materials x 5 dimensions"
-
-  Then print `##RUNNER:COMPLETE##` and stop.
+# output_mode: eo-structure-characterization-v2  (commented out — runner schema forbids extra keys)
+#   phase: 9
+#   structures:
+#     - {id: sin_patch,    top_core: sin,   spacer: air,   spacer_thick_um: 0.0,  r42_pm_V: 923}
+#     - {id: sio2_patch,   top_core: sio2,  spacer: air,   spacer_thick_um: 0.0,  r42_pm_V: 923}
+#     - {id: al2o3_patch,  top_core: al2o3, spacer: air,   spacer_thick_um: 0.0,  r42_pm_V: 923}
+#     - {id: sin_sio2,     top_core: sio2,  spacer: sin,   spacer_thick_um: 0.05, r42_pm_V: 923}
+#     - {id: sin_al2o3,    top_core: al2o3, spacer: sin,   spacer_thick_um: 0.05, r42_pm_V: 923}
+#     - {id: sio2_al2o3,   top_core: al2o3, spacer: sio2,  spacer_thick_um: 0.05, r42_pm_V: 923}
+#     - {id: al2o3_sio2,   top_core: sio2,  spacer: al2o3, spacer_thick_um: 0.05, r42_pm_V: 923}
+#     - {id: sin_patch_hq, top_core: sin,   spacer: air,   spacer_thick_um: 0.0,  r42_pm_V: 1340}
+#   literature_targets:
+#     sin_patch:    {min_Vcm: 0.05, max_Vcm: 0.50, ref: "Eltes APL 2019"}
+#     sin_patch_hq: {min_Vcm: 0.03, max_Vcm: 0.30, ref: "Eltes Nat.Mat. 2020"}
+#     LNOI:         {min_Vcm: 1.0,  max_Vcm: 6.0,  ref: "Wang Nat.Photon. 2018"}
+#     SOH:          {min_Vcm: 0.10, max_Vcm: 1.5,  ref: "Lauermann Optica 2016"}
 
 # ── Context anchors ───────────────────────────────────────────────────────────
 
@@ -602,7 +621,7 @@ output:
     enabled: true
     auto_push: false
     remote_url: https://github.com/LunaticSodium/BTO_Modulators_Simulator.git
-    branch_prefix: clauded-runner/
+    branch_prefix: bto-run/
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 
@@ -638,5 +657,12 @@ acceptance_criteria:
       run: "python -c \"import json,sys; n=sum(1 for l in open('output/phase8_run.jsonl') if l.strip()); print(f'Evals: {n}'); sys.exit(0 if n>=6500 else 1)\""
       expect_exit: 0
     - type: command
-      run: "python -c \"import pathlib,sys; d=pathlib.Path('output/plots'); pngs=list(d.glob('*.png')) if d.exists() else []; n=len(pngs); print('Plots:', n); [print(' ', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=10 else 1)\""
+      run: "python -c \"import pathlib,sys; d=pathlib.Path('output/plots'); pngs=list(d.glob('*.png')) if d.exists() else []; n=len(pngs); print('Plots:', n); [print(' ', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=11 else 1)\""
+      expect_exit: 0
+    - type: file_exists
+      path: output/plots/sweetspot_results.json
+    - type: file_exists
+      path: output/plots/literature_comparison.json
+    - type: command
+      run: "python -c \"import json,sys; data=json.load(open('output/plots/literature_comparison.json')); mismatches=[r['structure'] for r in data if not r.get('within_order',True)]; print('Lit. comparison mismatches:', mismatches or 'none'); sys.exit(0)\""
       expect_exit: 0

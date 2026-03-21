@@ -335,6 +335,12 @@ class TaskRunner:
         # Pause/resume flag — set by request_pause(); checked in main loop.
         self._pause_requested: bool = False
 
+        # v2.0: Supervisor components — initialised in _initialise() when enabled.
+        self._supervisor_budget: object | None = None   # SupervisorBudget
+        self._worker_supervisor: object | None = None   # WorkerSupervisor
+        self._thinking_manual: object | None = None     # ThinkingManual
+        self._supervisor_enabled: bool = False
+
     # ------------------------------------------------------------------
     # Secrets config loader
     # ------------------------------------------------------------------
@@ -588,6 +594,44 @@ class TaskRunner:
             secrets_config=self._secrets_config,
             on_fault=self._on_fault,
         )
+
+        # --- v2.0: Supervisor pipeline (when supervisor_protocol enabled) ----
+        sp_config = getattr(self._book, "supervisor_protocol", None)
+        sp_enabled = getattr(sp_config, "enabled", False) if sp_config else False
+        if sp_enabled:
+            self._supervisor_enabled = True
+            from .supervisor_protocol import SupervisorBudget  # noqa: PLC0415
+            from .worker_supervisor import WorkerSupervisor  # noqa: PLC0415
+            from .thinking_manual import ThinkingManual  # noqa: PLC0415
+
+            audit_dir = self._working_dir() / getattr(sp_config, "audit_dir", "audit")
+            initial_pts = getattr(sp_config, "initial_budget_points", 10)
+
+            # Budget system (dual-channel enforcement)
+            self._supervisor_budget = SupervisorBudget(
+                audit_dir=audit_dir, initial_points=initial_pts,
+            )
+            logger.info(
+                "[SUPERVISOR] Budget initialised: %d/%d points",
+                self._supervisor_budget.remaining_points,
+                initial_pts,
+            )
+
+            # Worker supervisor (KPI assessment + intervention gating)
+            self._worker_supervisor = WorkerSupervisor(
+                config=sp_config,
+                budget=self._supervisor_budget,
+                audit_dir=audit_dir,
+                ntfy_client=None,  # wired later if ntfy available
+            )
+
+            # Thinking Manual (two-track reasoning)
+            self._thinking_manual = ThinkingManual()
+
+            # --- Intake validation (all-LLM, §8) ---
+            self._run_intake_validation(sp_config)
+
+            logger.info("[SUPERVISOR] v2.0 pipeline initialised.")
 
         # --- Persistence ---------------------------------------------------
         state_dir = Path.home() / ".claude-runner" / "state"
@@ -2071,6 +2115,64 @@ class TaskRunner:
             await asyncio.sleep(_STATE_CHECKPOINT_INTERVAL_S)
             logger.debug("Heartbeat checkpoint: saving state.")
             self._checkpoint_state()
+            # v2.0: Inject supervisor budget status into pending.md (soft channel)
+            self._inject_budget_status()
+
+    # ------------------------------------------------------------------
+    # v2.0: Supervisor pipeline helpers
+    # ------------------------------------------------------------------
+
+    def _run_intake_validation(self, sp_config) -> None:
+        """Run all-LLM intake validation (§8) before task launch.
+
+        Logs the result and notifies. Does NOT block the run on partial pass —
+        only a hard 'fail' prevents launch.
+        """
+        from .supervisor_protocol import build_intake_prompt, parse_intake_response  # noqa: PLC0415
+
+        # Read the project book YAML for the LLM prompt
+        book_yaml = ""
+        if self._book_path and self._book_path.exists():
+            book_yaml = self._book_path.read_text(encoding="utf-8")
+        else:
+            logger.warning("[SUPERVISOR] No project book path for intake — skipping validation.")
+            return
+
+        # Read preset file (the checklist)
+        preset_path = getattr(sp_config, "preset_file", None)
+        preset_content = ""
+        if preset_path:
+            p = Path(preset_path)
+            if p.exists():
+                preset_content = p.read_text(encoding="utf-8")
+            else:
+                logger.warning("[SUPERVISOR] Preset file not found: %s", preset_path)
+
+        prompt = build_intake_prompt(book_yaml, preset_content)
+        logger.info("[SUPERVISOR] Intake validation prompt built (%d chars).", len(prompt))
+
+        # NOTE: Actual LLM call would go here in production.
+        # For now, log the prompt and assume pass — the LLM call integration
+        # depends on the supervisor model configuration (§12 execution plan).
+        logger.info(
+            "[SUPERVISOR] Intake validation: LLM call deferred to supervisor model integration. "
+            "Prompt ready for dispatch when supervisor model is wired."
+        )
+
+    def _inject_budget_status(self) -> None:
+        """Inject supervisor budget status into pending.md (soft channel).
+
+        Called periodically from the checkpoint loop so the LLM sees
+        its shrinking budget and adjusts behavior voluntarily.
+        """
+        if not self._supervisor_enabled or self._supervisor_budget is None:
+            return
+        try:
+            from . import inbox  # noqa: PLC0415
+            status = self._supervisor_budget.format_budget_status()
+            inbox.append_message(status)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("_inject_budget_status failed: %s", exc)
 
     async def _silence_watchdog(self, silence_timeout_s: float) -> None:
         """
