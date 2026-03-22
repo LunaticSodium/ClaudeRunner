@@ -248,3 +248,126 @@ def _save_ntfy_state(last_message_id: str) -> None:
         _NTFY_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to save ntfy state: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# CLI interface — usable standalone or via claude-runner ntfy
+# ---------------------------------------------------------------------------
+
+
+def cli_send(channel: str, message: str, title: str = "") -> None:
+    """Send a message to an ntfy channel.  Callable from CLI or code."""
+    client = NtfyClient()
+    client.publish(channel, message, title=title)
+    print(f"Sent to {channel}: {message[:80]}")
+
+
+def cli_poll(channel: str = "cmd") -> list[NtfyMessage]:
+    """Poll an ntfy channel and print messages.  Returns the messages."""
+    client = NtfyClient()
+    state: dict = {}
+    if _NTFY_STATE_FILE.exists():
+        try:
+            state = json.loads(_NTFY_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+    since_id = state.get("last_message_id")
+    messages = client.poll(channel, since_id)
+    if not messages:
+        print(f"No new messages on {channel}.")
+    else:
+        for msg in messages:
+            print(f"[{msg.id}] {msg.message}")
+    return messages
+
+
+def cli_listen(channel: str = "cmd", interval_s: float = 10.0, stop_file: str = "") -> None:
+    """Long-poll an ntfy channel, printing messages as they arrive.
+
+    Runs until Ctrl-C or until *stop_file* exists (watchdog pattern).
+
+    Parameters
+    ----------
+    channel:
+        Logical channel name (``"cmd"`` or ``"out"``).
+    interval_s:
+        Seconds between polls.
+    stop_file:
+        Path to a sentinel file.  If it exists, exit cleanly.
+        Empty string disables sentinel check.
+    """
+    import time as _time  # noqa: PLC0415
+
+    client = NtfyClient()
+    sentinel = pathlib.Path(stop_file) if stop_file else None
+    print(f"Listening on {channel} (poll every {interval_s}s). Ctrl-C to stop.")
+    if sentinel:
+        print(f"Stop sentinel: {sentinel}")
+
+    try:
+        while True:
+            # Sentinel check
+            if sentinel and sentinel.exists():
+                print("Stop sentinel detected — exiting.")
+                try:
+                    sentinel.unlink()
+                except OSError:
+                    pass
+                break
+
+            # Poll
+            state: dict = {}
+            if _NTFY_STATE_FILE.exists():
+                try:
+                    state = json.loads(_NTFY_STATE_FILE.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    pass
+            since_id = state.get("last_message_id")
+            messages = client.poll(channel, since_id)
+            for msg in messages:
+                print(f"[{msg.id}] {msg.message}")
+
+            _time.sleep(interval_s)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+def main() -> None:
+    """Entry point for ``python -m claude_runner.ntfy_client``."""
+    import sys  # noqa: PLC0415
+
+    usage = (
+        "Usage: python -m claude_runner.ntfy_client <command> [args]\n"
+        "Commands:\n"
+        "  send <channel> <message> [title]  — publish a message\n"
+        "  poll [channel]                    — poll once (default: cmd)\n"
+        "  listen [channel] [interval_s]     — long-poll (default: cmd, 10s)\n"
+    )
+
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(usage)
+        sys.exit(0)
+
+    cmd = args[0]
+    if cmd == "send":
+        if len(args) < 3:
+            print("send requires: <channel> <message> [title]")
+            sys.exit(1)
+        title = args[3] if len(args) > 3 else ""
+        cli_send(args[1], args[2], title=title)
+    elif cmd == "poll":
+        channel = args[1] if len(args) > 1 else "cmd"
+        cli_poll(channel)
+    elif cmd == "listen":
+        channel = args[1] if len(args) > 1 else "cmd"
+        interval = float(args[2]) if len(args) > 2 else 10.0
+        stop = args[3] if len(args) > 3 else ""
+        cli_listen(channel, interval_s=interval, stop_file=stop)
+    else:
+        print(f"Unknown command: {cmd}\n{usage}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

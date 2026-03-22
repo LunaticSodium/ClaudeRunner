@@ -2190,6 +2190,54 @@ def stop_cmd() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ntfy
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.group("ntfy")
+def ntfy_group() -> None:
+    """Send, poll, or listen on ntfy channels.
+
+    \b
+    Used by the supervisor, the marathon daemon, and any Claude Code
+    instance that needs to communicate via ntfy.
+    """
+
+
+@ntfy_group.command("send")
+@click.argument("message")
+@click.option("-c", "--channel", default="out", help="Logical channel: 'out' or 'cmd' (default: out).")
+@click.option("-t", "--title", default="", help="Optional message title.")
+def ntfy_send_cmd(message: str, channel: str, title: str) -> None:
+    """Publish a message to an ntfy channel."""
+    from .ntfy_client import cli_send  # noqa: PLC0415
+    cli_send(channel, message, title=title)
+
+
+@ntfy_group.command("poll")
+@click.option("-c", "--channel", default="cmd", help="Logical channel (default: cmd).")
+def ntfy_poll_cmd(channel: str) -> None:
+    """Poll an ntfy channel once and print new messages."""
+    from .ntfy_client import cli_poll  # noqa: PLC0415
+    cli_poll(channel)
+
+
+@ntfy_group.command("listen")
+@click.option("-c", "--channel", default="cmd", help="Logical channel (default: cmd).")
+@click.option("-i", "--interval", default=10.0, type=float, help="Poll interval in seconds (default: 10).")
+@click.option("--stop-file", default="", help="Sentinel file path — exit when it exists.")
+def ntfy_listen_cmd(channel: str, interval: float, stop_file: str) -> None:
+    """Long-poll an ntfy channel, printing messages as they arrive.
+
+    \b
+    Runs until Ctrl-C or until the stop sentinel file exists.
+    Follows the watchdog safe-stop pattern.
+    """
+    from .ntfy_client import cli_listen  # noqa: PLC0415
+    cli_listen(channel, interval_s=interval, stop_file=stop_file)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
