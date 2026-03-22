@@ -595,6 +595,10 @@ class TaskRunner:
             on_fault=self._on_fault,
         )
 
+        # --- v2.0: Auto-forward pending.md responses to ntfy out --------------
+        from . import inbox  # noqa: PLC0415
+        inbox.set_response_callback(self._forward_response_to_ntfy)
+
         # --- v2.0: Supervisor pipeline (when supervisor_protocol enabled) ----
         sp_config = getattr(self._book, "supervisor_protocol", None)
         sp_enabled = getattr(sp_config, "enabled", False) if sp_config else False
@@ -1428,6 +1432,11 @@ class TaskRunner:
 
         # TUI update.
         self._tui_update("output_line", {"line": clean, "raw": line})
+
+        # v2.0: Feed response capture buffer (auto-forward pending.md responses).
+        if clean:
+            from . import inbox as _inbox  # noqa: PLC0415
+            _inbox.capture_line(clean)
 
         # Milestone detection — runs on every clean output line.
         if clean and self._milestone_patterns:
@@ -2274,6 +2283,27 @@ class TaskRunner:
             self._supervisor_budget.credit_points(
                 f"Pre-flight found {len(result.findings)} issue(s)"
             )
+
+    def _forward_response_to_ntfy(self, response_text: str) -> None:
+        """Auto-forward the LLM's response to a pending.md message via ntfy out.
+
+        Registered as the inbox response callback. Called automatically when
+        the LLM finishes responding to an injected pending.md message.
+        """
+        try:
+            from .ntfy_client import NtfyClient  # noqa: PLC0415
+            client = NtfyClient()
+            # Truncate very long responses for ntfy (4KB limit on free tier).
+            truncated = response_text[:4000]
+            if len(response_text) > 4000:
+                truncated += f"\n… (truncated, {len(response_text)} chars total)"
+            client.publish("out", truncated, title=f"claude-runner — {self._book.name}")
+            logger.info(
+                "[AUTOFORWARD] LLM response forwarded to ntfy out (%d chars).",
+                len(truncated),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[AUTOFORWARD] Failed to forward response to ntfy: %s", exc)
 
     def _inject_budget_status(self) -> None:
         """Inject supervisor budget status into pending.md (soft channel).
