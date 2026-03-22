@@ -109,7 +109,17 @@ This is the authoritative reference for supervisor capabilities.
 
 ---
 
-## 6. Supervisor Protocol (Channel Discipline)
+## 6. Supervisor LLM Call
+
+| Function | Module | What it does | When to use |
+|---|---|---|---|
+| `call_supervisor_llm(prompt, model_id, timeout_s, working_dir)` | supervisor_protocol.py | One-shot `claude -p` call | Intake, pre-flight, self-check, diagnosis |
+
+Uses the same `claude` CLI binary and API key as the worker runner. Synchronous — blocks until response. Model override via `ANTHROPIC_MODEL` env var. Default timeout 300s.
+
+---
+
+## 7. Supervisor Protocol (Channel Discipline)
 
 | Function | Module | What it does | When to use |
 |---|---|---|---|

@@ -631,6 +631,9 @@ class TaskRunner:
             # --- Intake validation (all-LLM, §8) ---
             self._run_intake_validation(sp_config)
 
+            # --- Analytical pre-flight (§9, Thinking Manual) ---
+            self._run_analytical_preflight(sp_config)
+
             logger.info("[SUPERVISOR] v2.0 pipeline initialised.")
 
         # --- Persistence ---------------------------------------------------
@@ -2128,7 +2131,11 @@ class TaskRunner:
         Logs the result and notifies. Does NOT block the run on partial pass —
         only a hard 'fail' prevents launch.
         """
-        from .supervisor_protocol import build_intake_prompt, parse_intake_response  # noqa: PLC0415
+        from .supervisor_protocol import (  # noqa: PLC0415
+            build_intake_prompt,
+            call_supervisor_llm,
+            parse_intake_response,
+        )
 
         # Read the project book YAML for the LLM prompt
         book_yaml = ""
@@ -2151,13 +2158,122 @@ class TaskRunner:
         prompt = build_intake_prompt(book_yaml, preset_content)
         logger.info("[SUPERVISOR] Intake validation prompt built (%d chars).", len(prompt))
 
-        # NOTE: Actual LLM call would go here in production.
-        # For now, log the prompt and assume pass — the LLM call integration
-        # depends on the supervisor model configuration (§12 execution plan).
+        # Call the supervisor LLM
+        supervisor_model = getattr(sp_config, "supervisor_model", None) or None
+        try:
+            response = call_supervisor_llm(
+                prompt=prompt,
+                model_id=supervisor_model,
+                timeout_s=300,
+                working_dir=self._working_dir(),
+            )
+        except RuntimeError as exc:
+            logger.error("[SUPERVISOR] Intake LLM call failed: %s", exc)
+            self._fault_log.append(f"[SUPERVISOR] Intake call failed: {exc}")
+            return  # fail-open: don't block the run
+
+        result = parse_intake_response(response)
+        outcome = result.get("outcome", "partial")
+        gaps = result.get("gaps", [])
+
         logger.info(
-            "[SUPERVISOR] Intake validation: LLM call deferred to supervisor model integration. "
-            "Prompt ready for dispatch when supervisor model is wired."
+            "[SUPERVISOR] Intake validation outcome=%s, gaps=%d",
+            outcome, len(gaps),
         )
+
+        # Log gaps
+        for gap in gaps:
+            logger.info(
+                "[SUPERVISOR] Intake gap: %s — %s [%s]",
+                gap.get("field", "?"),
+                gap.get("description", "?"),
+                gap.get("severity", "?"),
+            )
+
+        # Notify
+        if self._notifier:
+            event = f"intake_{outcome}"
+            detail = f"Intake validation: {outcome}, {len(gaps)} gap(s)"
+            try:
+                import asyncio  # noqa: PLC0415
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._dispatch(event, {"detail": detail, "gaps": gaps}))
+                else:
+                    loop.run_until_complete(self._dispatch(event, {"detail": detail, "gaps": gaps}))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[SUPERVISOR] Intake notification failed: %s", exc)
+
+        # Hard fail blocks launch
+        if outcome == "fail":
+            raise RuntimeError(
+                f"Intake validation FAILED — {len(gaps)} critical gap(s). "
+                "Fix the project book before launching."
+            )
+
+    def _run_analytical_preflight(self, sp_config) -> None:
+        """Run Thinking Manual pre-flight (§9) before worker launch.
+
+        Uses Track 1 (creative) + Track 2 (controlled) to surface risks.
+        Findings are logged to audit and notified but do not block launch.
+        """
+        if self._thinking_manual is None:
+            return
+
+        from .supervisor_protocol import call_supervisor_llm  # noqa: PLC0415
+
+        # Build context from project book
+        book_yaml = ""
+        if self._book_path and self._book_path.exists():
+            book_yaml = self._book_path.read_text(encoding="utf-8")
+
+        prompt = self._thinking_manual.build_prompt(
+            context=book_yaml,
+            stage="preflight",
+        )
+        logger.info("[SUPERVISOR] Pre-flight prompt built (%d chars).", len(prompt))
+
+        supervisor_model = getattr(sp_config, "supervisor_model", None) or None
+        try:
+            response = call_supervisor_llm(
+                prompt=prompt,
+                model_id=supervisor_model,
+                timeout_s=300,
+                working_dir=self._working_dir(),
+            )
+        except RuntimeError as exc:
+            logger.error("[SUPERVISOR] Pre-flight LLM call failed: %s", exc)
+            self._fault_log.append(f"[SUPERVISOR] Pre-flight call failed: {exc}")
+            return  # fail-open
+
+        result = self._thinking_manual.parse_response(response, "preflight")
+
+        # Log to audit
+        if self._supervisor_enabled:
+            audit_text = self._thinking_manual.format_for_audit(result)
+            audit_dir = self._working_dir() / getattr(sp_config, "audit_dir", "audit")
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            preflight_log = audit_dir / "preflight_findings.md"
+            try:
+                with preflight_log.open("a", encoding="utf-8") as f:
+                    f.write(f"\n{'=' * 60}\n")
+                    f.write(f"Run: {datetime.now(timezone.utc).isoformat()}\n\n")
+                    f.write(audit_text)
+                    f.write("\n")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[SUPERVISOR] Failed to write preflight log: %s", exc)
+
+        logger.info(
+            "[SUPERVISOR] Pre-flight complete: %d finding(s), top_priority=%s",
+            len(result.findings),
+            result.top_priority.severity if result.top_priority else "none",
+        )
+
+        # Credit budget for findings (correct preflight)
+        if result.has_findings and self._supervisor_budget is not None:
+            self._supervisor_budget.credit_points(
+                f"Pre-flight found {len(result.findings)} issue(s)"
+            )
 
     def _inject_budget_status(self) -> None:
         """Inject supervisor budget status into pending.md (soft channel).

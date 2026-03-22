@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -778,3 +780,87 @@ def parse_intake_response(response_text: str) -> dict:
         return result
     except Exception:  # noqa: BLE001
         return {"outcome": "partial", "gaps": [{"field": "unknown", "description": "Could not parse intake response", "severity": "recommended"}]}
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Supervisor LLM call — one-shot claude -p invocation
+# ---------------------------------------------------------------------------
+
+
+def call_supervisor_llm(
+    prompt: str,
+    model_id: str | None = None,
+    timeout_s: int = 300,
+    working_dir: str | Path | None = None,
+) -> str:
+    """Call the supervisor LLM via ``claude -p`` subprocess.
+
+    This is a synchronous, one-shot call — no PTY, no streaming.
+    Uses the same ``claude`` CLI binary and API key as the worker runner.
+
+    Parameters
+    ----------
+    prompt:
+        The full prompt text to send.
+    model_id:
+        Model to use (e.g. ``"claude-opus-4-6"``).  If None, uses the
+        CLI default.
+    timeout_s:
+        Maximum seconds to wait for a response.
+    working_dir:
+        Working directory for the subprocess.  If None, uses cwd.
+
+    Returns
+    -------
+    str
+        The raw text response from the LLM.
+
+    Raises
+    ------
+    RuntimeError
+        If the subprocess fails or times out.
+    """
+    cmd = ["claude", "--output-format", "text", "-p", prompt]
+
+    env = os.environ.copy()
+    if model_id:
+        env["ANTHROPIC_MODEL"] = model_id
+
+    cwd = str(working_dir) if working_dir else None
+
+    logger.info(
+        "[SUPERVISOR-LLM] Calling claude -p (model=%s, timeout=%ds, prompt=%d chars)",
+        model_id or "default",
+        timeout_s,
+        len(prompt),
+    )
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            cwd=cwd,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Supervisor LLM call timed out after {timeout_s}s"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "claude CLI not found — is Claude Code installed and on PATH?"
+        ) from exc
+
+    if result.returncode != 0:
+        stderr_preview = (result.stderr or "")[:500]
+        raise RuntimeError(
+            f"Supervisor LLM call failed (exit={result.returncode}): {stderr_preview}"
+        )
+
+    response = result.stdout.strip()
+    logger.info(
+        "[SUPERVISOR-LLM] Response received (%d chars).", len(response),
+    )
+    return response
