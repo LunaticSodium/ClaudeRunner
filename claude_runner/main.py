@@ -427,7 +427,41 @@ def cli() -> None:
     default=False,
     help="Skip all pre-flight checks (working_dir, env vars, ntfy reachability, …).",
 )
-def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude: bool, skip_preflight: bool) -> None:
+@click.option(
+    "--marathon",
+    is_flag=True,
+    default=False,
+    help="Enable marathon mode (survival: auto-restart, watchdog, long runtime).",
+)
+@click.option(
+    "--cccs",
+    is_flag=True,
+    default=False,
+    help="Enable CCCS protocol for this run.",
+)
+@click.option(
+    "--supervisor",
+    is_flag=True,
+    default=False,
+    help="Enable supervisor protocol (v2.0: budget, intake, pre-flight, KPI, ntfy).",
+)
+@click.option(
+    "--supervisor-model",
+    default=None,
+    help="Model for supervisor LLM calls (e.g. 'claude-opus-4-6'). Implies --supervisor.",
+)
+def run(
+    project_book: str,
+    tui: bool,
+    dry_run: bool,
+    verbose: bool,
+    show_claude: bool,
+    skip_preflight: bool,
+    marathon: bool,
+    cccs: bool,
+    supervisor: bool,
+    supervisor_model: str | None,
+) -> None:
     """Run a claude-runner project book.
 
     PROJECT_BOOK is the path to a .yaml project book file.  A bare filename
@@ -449,6 +483,32 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude:
     # ── Load project book ──────────────────────────────────────────────────────
     pb = _load_project_book(project_book)
     config = _load_global_config()
+
+    # ── Apply CLI launch flags (override project book) ─────────────────────────
+    if marathon:
+        pb.marathon_mode = True
+        _info("Marathon mode enabled (CLI flag).")
+    if cccs:
+        if hasattr(pb, "cccs") and pb.cccs is not None:
+            pb.cccs.enabled = True
+        _info("CCCS protocol enabled (CLI flag).")
+    if supervisor or supervisor_model:
+        # Build or override supervisor_protocol config from CLI
+        from .project import SupervisorProtocolConfig  # noqa: PLC0415
+        sp_existing = getattr(pb, "supervisor_protocol", None)
+        if sp_existing is not None:
+            sp_existing.enabled = True
+            if supervisor_model:
+                sp_existing.supervisor_model = supervisor_model
+        else:
+            pb.supervisor_protocol = SupervisorProtocolConfig(
+                enabled=True,
+                supervisor_model=supervisor_model or "",
+            )
+        _info(
+            f"Supervisor protocol enabled (CLI flag)."
+            + (f" Model: {supervisor_model}" if supervisor_model else "")
+        )
 
     # ── Dry run ────────────────────────────────────────────────────────────────
     if dry_run:
@@ -2265,6 +2325,45 @@ def ntfy_listen_cmd(channel: str, interval: float, stop_file: str) -> None:
     """
     from .ntfy_client import cli_listen  # noqa: PLC0415
     cli_listen(channel, interval_s=interval, stop_file=stop_file)
+
+
+@ntfy_group.command("set-channels")
+@click.option("--out", "out_channel", default=None, help="ntfy OUT channel name (supervisor → human).")
+@click.option("--cmd", "cmd_channel", default=None, help="ntfy CMD channel name (human → supervisor).")
+def ntfy_set_channels_cmd(out_channel: str | None, cmd_channel: str | None) -> None:
+    """Store ntfy channel names in Windows Credential Manager.
+
+    \b
+    Examples:
+      claude-runner ntfy set-channels --out claude-runner-honacoo --cmd claude-runner-honacoo-cmd
+      claude-runner ntfy set-channels --out my-project-out
+    """
+    from .ntfy_client import store_channel_in_keyring  # noqa: PLC0415
+
+    if not out_channel and not cmd_channel:
+        _warn("Provide at least one of --out or --cmd.")
+        return
+
+    try:
+        if out_channel:
+            store_channel_in_keyring("claude-runner-ntfy-out", out_channel)
+            _ok(f"OUT channel stored: {out_channel}")
+        if cmd_channel:
+            store_channel_in_keyring("claude-runner-ntfy-cmd", cmd_channel)
+            _ok(f"CMD channel stored: {cmd_channel}")
+    except RuntimeError as exc:
+        _abort(f"Failed to store channel: {exc}")
+
+
+@ntfy_group.command("show-channels")
+def ntfy_show_channels_cmd() -> None:
+    """Show currently configured ntfy channel names."""
+    from .ntfy_client import _get_channel_from_keyring  # noqa: PLC0415
+
+    out = _get_channel_from_keyring("claude-runner-ntfy-out")
+    cmd = _get_channel_from_keyring("claude-runner-ntfy-cmd")
+    _info(f"OUT channel: {out or '(not set)'}")
+    _info(f"CMD channel: {cmd or '(not set)'}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

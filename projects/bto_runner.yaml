@@ -545,19 +545,6 @@ cccs:
 
 marathon_mode: false
 
-# v2.0: Supervisor protocol — enable for adversarial two-tier supervision.
-# When enabled, the runner initialises budget system, intake validation,
-# thinking manual pre-flight, and auto-forward of LLM responses to ntfy.
-supervisor_protocol:
-  enabled: false          # Set true for supervised runs
-  audit_dir: audit
-  confirm_timeout_minutes: 5
-  self_check_limit: 3
-  supervisor_model: ""    # Empty = use CLI default; e.g. "claude-opus-4-6"
-  intervention_limit: 3
-  intervention_cooldown_min: 30
-  initial_budget_points: 10
-
 # ── Model schedule ────────────────────────────────────────────────────────────
 
 model_schedule:
