@@ -1498,6 +1498,36 @@ def configure() -> None:
     else:
         _info("Feature defaults unchanged (both off).")
 
+    # ── ntfy channels ─────────────────────────────────────────────────────────
+    _console.print(
+        "\n[bold]ntfy channels[/bold]\n"
+        "Two ntfy.sh channels for supervisor ↔ human communication.\n"
+        "Channel names are stored in Windows Credential Manager.\n"
+        "Leave blank to skip (ntfy features will be disabled).\n"
+    )
+    ntfy_out = click.prompt(
+        "  ntfy OUT channel (supervisor → human)",
+        default="", show_default=False,
+    ).strip()
+    ntfy_cmd = click.prompt(
+        "  ntfy CMD channel (human → supervisor)",
+        default="", show_default=False,
+    ).strip()
+
+    if ntfy_out or ntfy_cmd:
+        try:
+            from .ntfy_client import store_channel_in_keyring  # noqa: PLC0415
+            if ntfy_out:
+                store_channel_in_keyring("claude-runner-ntfy-out", ntfy_out)
+                _ok(f"ntfy OUT channel stored: {ntfy_out}")
+            if ntfy_cmd:
+                store_channel_in_keyring("claude-runner-ntfy-cmd", ntfy_cmd)
+                _ok(f"ntfy CMD channel stored: {ntfy_cmd}")
+        except RuntimeError as exc:
+            _warn(f"Could not store ntfy channels: {exc}")
+    else:
+        _info("ntfy channels skipped.")
+
     # ═══════════════════════════════════════════════════════════════════════════
     # Step C: Save credentials
     # ═══════════════════════════════════════════════════════════════════════════

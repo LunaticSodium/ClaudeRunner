@@ -178,12 +178,41 @@ Requires `psutil`. Falls back to `is_active=True` (safe default) if psutil unava
 
 ---
 
-## 10. ntfy Channels
+## 10. ntfy Channels & CLI
 
 | Channel | Direction | Purpose |
 |---|---|---|
 | `claude-runner-honacoo` | supervisor → human | Notifications, alerts, status updates |
 | `claude-runner-honacoo-cmd` | human → supervisor | Commands, responses, overrides |
+
+**CLI commands** (usable by any Claude Code instance or script):
+```bash
+# Send a message to human (out channel)
+claude-runner ntfy send "your message here"
+claude-runner ntfy send -c out -t "Title" "message body"
+
+# Poll for new inbound messages (cmd channel)
+claude-runner ntfy poll
+claude-runner ntfy poll -c cmd
+
+# Long-poll with auto-print (blocks until Ctrl-C or sentinel)
+claude-runner ntfy listen
+claude-runner ntfy listen -c cmd -i 10 --stop-file ./ntfy.stop
+
+# Standalone (no click, no runner install needed):
+python -m claude_runner.ntfy_client send out "message"
+python -m claude_runner.ntfy_client poll cmd
+python -m claude_runner.ntfy_client listen cmd 10
+```
+
+**Auto-forward (managed LLM inside runner):**
+- ntfy cmd message → `pending.md` → runner injects "read pending.md" into LLM
+- LLM responds → output captured → auto-forwarded to ntfy out → human reads
+- Two flags: `has_pending_messages` (unread content), `processing_pending_message` (capturing response)
+
+**Direct access (outsider Claude Code):**
+- Read: `cat ~/.claude-runner/inbox/pending.md`
+- Send: `claude-runner ntfy send "message"`
 
 ---
 
