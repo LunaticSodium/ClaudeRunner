@@ -9,12 +9,25 @@ points, without interrupting active tool use.
 
 Buffer file: ~/.claude-runner/inbox/pending.md  (append-only during accumulation)
 
+Lifecycle:
+  1. External source calls append_message(text)
+     → appends timestamped entry, sets has_pending_messages = True
+  2. Runner calls drain(process) at a natural pause
+     → injects "read pending.md" prompt into Claude Code stdin
+     → waits for acknowledgement (any output)
+     → sets has_pending_messages = False (LLM has consumed the content)
+  3. Next append_message() call runs trim_consumed() first
+     → if has_pending_messages is False AND file exceeds _MAX_BYTES,
+        deletes all entries older than the most recent entry separator
+     → prevents unbounded growth
+
 Module-level API
 ----------------
 append_message(text)      — append text with a timestamp header; sets flag
 drain(process, timeout_s) — inject pending messages into *process* stdin;
                             wait for acknowledgement; clear buffer and flag
 has_pending_messages      — bool (read-only via is_pending())
+trim_consumed()           — trim old entries if LLM has consumed them
 """
 from __future__ import annotations
 
@@ -29,7 +42,16 @@ _DEFAULT_HOME = pathlib.Path.home() / ".claude-runner"
 _PENDING_FILE = _DEFAULT_HOME / "inbox" / "pending.md"
 
 # Module-level pending flag.
+# True  = new content waiting for the LLM to read
+# False = LLM has consumed the content (drain completed), or no content
 has_pending_messages: bool = False
+
+# Hard limit: trim old entries when pending.md exceeds this size.
+_MAX_BYTES: int = 32_768  # 32 KB
+
+# Entry separator — every entry starts with this pattern.
+# Used by trim logic to split entries.
+_ENTRY_SEPARATOR = "\n---\n"
 
 # Prompt injected into Claude Code when draining the inbox.
 _INJECT_PROMPT = (
@@ -45,6 +67,9 @@ def append_message(text: str) -> None:
     """
     Append *text* to the pending inbox file with a timestamp header.
 
+    Before appending, trims consumed entries if the file is over the size
+    limit and the LLM has already read the previous content.
+
     Sets :data:`has_pending_messages` to ``True``.
     Does NOT interrupt Claude Code.
 
@@ -55,8 +80,11 @@ def append_message(text: str) -> None:
     """
     global has_pending_messages
 
+    # Trim old consumed entries before adding new content.
+    _trim_if_needed()
+
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    header = f"\n---\n**Received {ts}**\n\n"
+    header = f"{_ENTRY_SEPARATOR}**Received {ts}**\n\n"
     entry = header + text.strip() + "\n"
 
     try:
@@ -77,6 +105,10 @@ def drain(process, timeout_s: float = _DEFAULT_ACK_TIMEOUT_S) -> None:
 
     Called at natural pause points (after rate-limit resume, after context
     checkpoint, and on the silence-timeout probe path).
+
+    After successful drain:
+    - has_pending_messages is set to False
+    - pending.md is truncated (the LLM has consumed the content)
 
     If :data:`has_pending_messages` is ``False``, this is a no-op.
 
@@ -119,7 +151,7 @@ def drain(process, timeout_s: float = _DEFAULT_ACK_TIMEOUT_S) -> None:
             "inbox.drain: no acknowledgement within %.0f s — continuing anyway.", timeout_s
         )
 
-    # Truncate pending.md to zero bytes.
+    # Truncate pending.md — the LLM has consumed the content.
     try:
         _PENDING_FILE.write_text("", encoding="utf-8")
         logger.info("inbox.drain: pending.md truncated.")
@@ -132,6 +164,35 @@ def drain(process, timeout_s: float = _DEFAULT_ACK_TIMEOUT_S) -> None:
 def is_pending() -> bool:
     """Return True if there are pending messages waiting to be injected."""
     return has_pending_messages
+
+
+def trim_consumed() -> None:
+    """Trim old entries from pending.md if the LLM has consumed them.
+
+    Safe to call at any time.  Only trims when:
+    1. has_pending_messages is False (LLM has read the content), AND
+    2. The file still has content (leftover from before drain)
+
+    This is the manual entry point for external scripts that manage
+    the pending.md lifecycle independently of the runner process.
+    """
+    global has_pending_messages
+
+    if has_pending_messages:
+        # Content hasn't been consumed yet — don't trim.
+        return
+
+    try:
+        if not _PENDING_FILE.exists():
+            return
+        size = _PENDING_FILE.stat().st_size
+        if size == 0:
+            return
+        # LLM has consumed but file still has content — truncate.
+        _PENDING_FILE.write_text("", encoding="utf-8")
+        logger.info("inbox.trim_consumed: truncated %d bytes of consumed content.", size)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("inbox.trim_consumed failed: %s", exc)
 
 
 def reset() -> None:
@@ -150,6 +211,62 @@ def reset() -> None:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _trim_if_needed() -> None:
+    """Trim oldest entries if file exceeds _MAX_BYTES and content was consumed.
+
+    Called automatically before every append_message().
+
+    If has_pending_messages is False (LLM consumed prior content), the whole
+    file is truncated — old messages are no longer needed.
+
+    If has_pending_messages is True (content not yet consumed), trim the
+    oldest entries to keep the file under _MAX_BYTES, preserving the newest
+    messages that the LLM hasn't read yet.
+    """
+    global has_pending_messages
+
+    try:
+        if not _PENDING_FILE.exists():
+            return
+        size = _PENDING_FILE.stat().st_size
+        if size <= _MAX_BYTES:
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    # Case 1: LLM already consumed — safe to wipe everything.
+    if not has_pending_messages:
+        try:
+            _PENDING_FILE.write_text("", encoding="utf-8")
+            logger.info(
+                "inbox._trim_if_needed: cleared %d bytes of consumed content.", size,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("inbox._trim_if_needed: truncate failed: %s", exc)
+        return
+
+    # Case 2: LLM hasn't consumed yet — keep newest entries, drop oldest.
+    try:
+        content = _PENDING_FILE.read_text(encoding="utf-8")
+        # Split on entry separator, keep the newest half.
+        parts = content.split(_ENTRY_SEPARATOR)
+        if len(parts) <= 2:
+            # Only one or two entries — can't trim further.
+            return
+
+        # Keep the second half of entries (newest).
+        keep_from = len(parts) // 2
+        trimmed = _ENTRY_SEPARATOR + _ENTRY_SEPARATOR.join(parts[keep_from:])
+        _PENDING_FILE.write_text(trimmed, encoding="utf-8")
+        dropped = len(parts) - (len(parts) - keep_from)
+        logger.info(
+            "inbox._trim_if_needed: dropped %d oldest entries, kept %d (was %d bytes).",
+            dropped, len(parts) - keep_from, size,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("inbox._trim_if_needed: trim failed: %s", exc)
 
 
 def _wait_for_output(process, timeout_s: float) -> bool:
