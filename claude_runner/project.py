@@ -747,6 +747,32 @@ class NotifyConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# ntfy.sh channel configuration (v2.0a)
+# ---------------------------------------------------------------------------
+
+
+class NtfyChannelConfig(BaseModel):
+    """ntfy.sh channel names declared in the project book.
+
+    The project book is the primary source of truth for ntfy channels —
+    like a supervisor leaving their phone number in the project spec.
+    Channels declared here take priority over Windows Credential Manager
+    and hardcoded defaults.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    out_channel: str | None = Field(
+        default=None,
+        description="ntfy.sh channel name for outbound notifications (runner → human).",
+    )
+    cmd_channel: str | None = Field(
+        default=None,
+        description="ntfy.sh channel name for inbound commands (human → runner).",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Implementation constraints sub-models
 # ---------------------------------------------------------------------------
 
@@ -973,6 +999,13 @@ class ProjectBook(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
+    ntfy: NtfyChannelConfig | None = Field(
+        default=None,
+        description=(
+            "ntfy.sh channel names for push notifications and inbound commands.  "
+            "Takes priority over Windows Credential Manager and hardcoded defaults."
+        ),
+    )
     acceptance_criteria: AcceptanceCriteria | None = Field(
         default=None,
         description=(

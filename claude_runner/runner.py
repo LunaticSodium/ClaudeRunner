@@ -139,6 +139,14 @@ _PROGRESS_LOG_INSTRUCTION = textwrap.dedent(
     The progress log is the authoritative external record of this session.
     It will be read by claude-runner to recover context if execution is interrupted.
 
+    LONG-RUNNING COMMANDS
+    ---------------------
+    Never run a command that takes more than 5 minutes directly in your shell.
+    Instead, write a small Python/shell script that does the work and launch it
+    as a detached subprocess (e.g. subprocess.Popen with start_new_session=True).
+    Then poll its output or exit status in a loop with short sleeps.  This keeps
+    each shell invocation well within timeout limits.
+
     ========================================
     TASK
     ========================================
@@ -514,6 +522,12 @@ class TaskRunner:
         # to CLAUDE.md before Claude is launched.  This is entirely optional;
         # omitting the cccs key (or setting enabled: false) skips this step.
         self._inject_cccs_fragment()
+
+        # --- Context anchors → CLAUDE.md ----------------------------------
+        # v2.0a: context_anchors are already prepended to every prompt via
+        # ContextManager, but they don't survive context compaction.  Writing
+        # them to CLAUDE.md ensures they persist.
+        self._inject_context_anchors_to_claude_md()
 
         # --- CLAUDE.md injection -------------------------------------------
         self._claude_md_content = self._read_claude_md()
@@ -1912,6 +1926,76 @@ class TaskRunner:
         except OSError as exc:
             logger.warning("Could not write phase contract to CLAUDE.md: %s", exc)
 
+    # Context-anchors marker so we never double-inject across reruns.
+    _CONTEXT_ANCHORS_MARKER = "<!-- BEGIN claude-runner context-anchors"
+
+    def _inject_context_anchors_to_claude_md(self) -> None:
+        """
+        Append a lightweight context-anchors **reminder** to CLAUDE.md.
+
+        The full context_anchors text is already prepended to every prompt via
+        ContextManager.  This method does NOT duplicate it — it only writes a
+        short pointer so the LLM knows the anchors exist and should be respected
+        even after context compaction.  Keeps CLAUDE.md lean for smaller LLMs.
+
+        Silently skipped when:
+        - No ``context_anchors`` field in the project book.
+        - The marker is already present (idempotent — safe on resume).
+        - The working directory is unavailable.
+        """
+        context_anchors = getattr(self._book, "context_anchors", None)
+        if not context_anchors or not context_anchors.strip():
+            return
+
+        try:
+            wd = self._working_dir()
+        except Exception:
+            return
+
+        claude_dir = wd / ".claude"
+        try:
+            claude_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create .claude/ for context anchors: %s", exc)
+            return
+
+        claude_md = claude_dir / "CLAUDE.md"
+
+        existing = ""
+        if claude_md.exists():
+            try:
+                existing = claude_md.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
+        if self._CONTEXT_ANCHORS_MARKER in existing:
+            logger.debug("CLAUDE.md context anchors already present — skipping injection.")
+            return
+
+        # Lightweight pointer — NOT the full anchors.  The full text is in
+        # every prompt via ContextManager; this just ensures the LLM knows
+        # they exist after compaction.
+        block = (
+            "\n"
+            "<!-- BEGIN claude-runner context-anchors — do not remove -->\n"
+            "## Project Anchors\n\n"
+            "This project has standing context anchors injected by claude-runner.\n"
+            "They appear at the top of every prompt.  If your context was compacted\n"
+            "and you no longer see them, re-read the most recent prompt carefully —\n"
+            "they are always present.  Follow them in every phase.\n"
+            "<!-- END claude-runner context-anchors -->\n"
+        )
+
+        try:
+            with claude_md.open("a", encoding="utf-8") as fh:
+                fh.write(block)
+            logger.info(
+                "[ACTION] Context anchors appended to CLAUDE.md (%d chars added).",
+                len(block),
+            )
+        except OSError as exc:
+            logger.warning("Could not write context anchors to CLAUDE.md: %s", exc)
+
     def _inject_cccs_fragment(self) -> None:
         """Append a rendered CCCS CLAUDE.md fragment when ``cccs`` is configured.
 
@@ -1947,7 +2031,7 @@ class TaskRunner:
             logger.warning("CCCS render error for preset '%s': %s", preset_name, exc)
             return
 
-        working_dir = self._sandbox.working_dir if self._sandbox else self._book.working_dir
+        working_dir = self._sandbox.get_working_dir_path() if self._sandbox else self._book.working_dir
         claude_dir = Path(working_dir) / ".claude"
         claude_md = claude_dir / "CLAUDE.md"
 
@@ -2292,7 +2376,11 @@ class TaskRunner:
         """
         try:
             from .ntfy_client import NtfyClient  # noqa: PLC0415
-            client = NtfyClient()
+            ntfy_cfg = getattr(self._book, "ntfy", None)
+            client = NtfyClient(
+                out_channel_override=ntfy_cfg.out_channel if ntfy_cfg else None,
+                cmd_channel_override=ntfy_cfg.cmd_channel if ntfy_cfg else None,
+            )
             # Truncate very long responses for ntfy (4KB limit on free tier).
             truncated = response_text[:4000]
             if len(response_text) > 4000:

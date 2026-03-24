@@ -623,6 +623,13 @@ output:
     remote_url: https://github.com/LunaticSodium/BTO_Modulators_Simulator.git
     branch_prefix: bto-run/
 
+# ── ntfy.sh channels (v2.0a — supervisor's phone number) ─────────────────────
+# Primary source of truth for ntfy channels. Overrides Credential Manager.
+
+ntfy:
+  out_channel: claude-runner-honacoo
+  cmd_channel: claude-runner-honacoo-cmd
+
 # ── Notifications ─────────────────────────────────────────────────────────────
 
 notify:

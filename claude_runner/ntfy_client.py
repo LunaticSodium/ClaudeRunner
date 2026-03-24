@@ -3,9 +3,16 @@ claude_runner/ntfy_client.py
 
 Thin wrapper around the ntfy.sh HTTP API for claude-runner marathon mode.
 
-Channel names are read exclusively from Windows Credential Manager via
-the keyring library. They are never read from project books or environment
-variables to preserve the pipeline security boundary.
+Channel resolution priority (v2.0a):
+  1. Keyring (manual ``set-channels`` input), strictly valid
+  2. Project book ``ntfy:`` section
+  3. Keyring value that is "illegal but intentional" (e.g. ``"123456"``)
+  4. Sentinel default → **refuse to send/receive** with a logged error
+
+The sentinel default (``__unconfigured__``) exists only to make
+misconfiguration loud.  If the resolved channel is the sentinel,
+publish() and poll() raise ``NtfyNotConfiguredError`` instead of
+silently swallowing messages into a junk channel.
 
 Credential Manager service names:
   "claude-runner-ntfy-out"  — outbound notification channel
@@ -17,6 +24,7 @@ import json
 import logging
 import pathlib
 from dataclasses import dataclass
+from typing import Literal
 
 import requests
 
@@ -25,14 +33,34 @@ logger = logging.getLogger(__name__)
 _DEFAULT_HOME = pathlib.Path.home() / ".claude-runner"
 _NTFY_STATE_FILE = _DEFAULT_HOME / "ntfy_state.json"
 
-# Default channel names (used as fallback display labels only — not as secrets)
-_DEFAULT_OUT_CHANNEL = "claude-runner-honacoo"
-_DEFAULT_CMD_CHANNEL = "claude-runner-honacoo-cmd"
+# Sentinel — if the resolved channel equals this, ntfy refuses to operate.
+# No one should ever subscribe to this channel.  Its sole purpose is to make
+# "not configured" a loud error rather than a silent message into the void.
+_UNCONFIGURED_SENTINEL = "__unconfigured__"
 
 _KEYRING_SERVICE_OUT = "claude-runner-ntfy-out"
 _KEYRING_SERVICE_CMD = "claude-runner-ntfy-cmd"
 
 _NTFY_BASE_URL = "https://ntfy.sh"
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class NtfyNotConfiguredError(RuntimeError):
+    """Raised when publish/poll is attempted on an unconfigured channel.
+
+    This means the entire fallback chain was exhausted:
+    keyring (valid) → project book → keyring (loose) → sentinel.
+    The caller must configure a channel before ntfy can operate.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -44,35 +72,270 @@ class NtfyMessage:
     timestamp: int
 
 
-class NtfyClient:
-    """
-    Thin wrapper around ntfy.sh HTTP API.
+# ---------------------------------------------------------------------------
+# Two-tier channel name validation
+# ---------------------------------------------------------------------------
 
-    Both channel names are read from Windows Credential Manager
-    (service names: "claude-runner-ntfy-out", "claude-runner-ntfy-cmd").
-    Never read from project books or environment variables.
+
+def _is_strictly_valid_channel(value: str) -> bool:
+    """Return True if *value* is a well-formed ntfy channel name.
+
+    Strict rules (tier 1 — keyring read, project book):
+      - At least 4 characters
+      - Contains at least one ASCII letter
+      - Not a boolean-like or null-like string
+    """
+    if not value or len(value) < 4:
+        return False
+    if value.lower() in ("true", "false", "none", "null"):
+        return False
+    if value.isdigit():
+        return False
+    return any(c.isalpha() for c in value)
+
+
+def _is_plausibly_intentional(value: str) -> bool:
+    """Return True if *value* looks like a deliberate (but unusual) channel name.
+
+    Loose rules (tier 4 — "illegal but makes sense"):
+      - At least 4 characters
+      - Not a boolean-like or null-like string
+      - Pure-numeric like ``"123456"`` is accepted — the user typed it on purpose
+      - Short junk like ``"1"``, ``"0"`` is rejected (likely keyring corruption)
+    """
+    if not value or len(value) < 4:
+        return False
+    if value.lower() in ("true", "false", "none", "null"):
+        return False
+    return True
+
+
+# Keep backward-compatible alias used by tests and store_channel_in_keyring
+_looks_like_channel_name = _is_strictly_valid_channel
+
+
+# ---------------------------------------------------------------------------
+# Keyring helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_raw_from_keyring(service: str) -> str | None:
+    """Read the raw string from keyring without any validation.
+
+    Returns ``None`` if keyring is unavailable, the credential is not set,
+    or the stored value is empty.
+    """
+    try:
+        import keyring  # type: ignore[import-untyped]
+    except ImportError:
+        logger.debug(
+            "keyring not installed — cannot retrieve %r from Credential Manager.",
+            service,
+        )
+        return None
+    try:
+        value = keyring.get_password(service, "channel_name")
+        clean = (value or "").strip()
+        return clean or None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("keyring lookup for %r failed: %s", service, exc)
+        return None
+
+
+def _get_channel_from_keyring(
+    service: str,
+    tier: Literal["strict", "loose"] = "strict",
+) -> str | None:
+    """Retrieve a channel name from Windows Credential Manager.
+
+    Parameters
+    ----------
+    service:
+        Credential Manager service name.
+    tier:
+        ``"strict"`` (tier 1) — reject values that aren't well-formed channel
+        names (pure numeric, too short, boolean-like).
+        ``"loose"`` (tier 4) — accept anything plausibly intentional (≥4 chars,
+        not boolean-like).  Logs a warning for unusual values.
+
+    Returns ``None`` if keyring is unavailable, the credential is not set,
+    or the stored value fails the requested validation tier.
+    """
+    raw = _read_raw_from_keyring(service)
+    if raw is None:
+        return None
+
+    if tier == "strict":
+        if _is_strictly_valid_channel(raw):
+            return raw
+        # Strict failed — don't log here; the caller will try loose later.
+        return None
+
+    # Loose tier
+    if _is_plausibly_intentional(raw):
+        if not _is_strictly_valid_channel(raw):
+            logger.warning(
+                "ntfy channel from keyring (%r) is unusual: %r — accepting as "
+                "intentional input.  Use 'ntfy set-channels' to set a proper name.",
+                service,
+                raw,
+            )
+        return raw
+
+    logger.warning(
+        "ntfy channel from keyring (%r) has corrupted value %r — "
+        "too short or boolean-like.  Use 'ntfy set-channels' to fix.",
+        service,
+        raw,
+    )
+    return None
+
+
+def store_channel_in_keyring(service: str, channel_name: str) -> None:
+    """Store a channel name in Windows Credential Manager.
+
+    Called by the configure wizard.  Uses **loose** validation because the
+    user is explicitly typing the value — ``"123456"`` is intentional (if
+    odd).  Only truly corrupted values (``"1"``, ``"True"``) are rejected.
+
+    After storing, reads the value back and verifies it matches — a
+    corrupted write is caught immediately rather than silently failing
+    later during a test run.
+
+    Raises
+    ------
+    RuntimeError
+        If keyring is not installed, the value fails loose validation,
+        or the read-back verification fails.
+    """
+    if not _is_plausibly_intentional(channel_name):
+        raise RuntimeError(
+            f"Refusing to store suspicious channel name {channel_name!r}.  "
+            "A channel name must be at least 4 characters and not a "
+            "boolean-like value (True/False/None)."
+        )
+    if not _is_strictly_valid_channel(channel_name):
+        logger.warning(
+            "Channel name %r is unusual (no letters / pure numeric).  "
+            "Storing anyway since you typed it explicitly.",
+            channel_name,
+        )
+    try:
+        import keyring  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise RuntimeError(
+            "The keyring package is required to store ntfy channel names. "
+            "Install with: pip install claude-runner[keyring]"
+        ) from exc
+    keyring.set_password(service, "channel_name", channel_name)
+    # Read-back verification: catch corrupted writes immediately.
+    stored = keyring.get_password(service, "channel_name")
+    if stored != channel_name:
+        logger.error(
+            "Keyring read-back mismatch for %r: wrote %r, read %r",
+            service,
+            channel_name,
+            stored,
+        )
+        raise RuntimeError(
+            f"Keyring write verification failed: wrote {channel_name!r} "
+            f"but read back {stored!r}.  Check Windows Credential Manager."
+        )
+    logger.info(
+        "Stored and verified channel name for %r in Credential Manager.",
+        service,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+
+class NtfyClient:
+    """Thin wrapper around ntfy.sh HTTP API.
+
+    Channel resolution priority (v2.0a):
+
+    1. **Keyring (strict)** — manual ``set-channels`` input that passes full
+       validation.  Highest priority because the operator explicitly configured
+       this machine.
+    2. **Project book** — ``ntfy.out_channel`` / ``ntfy.cmd_channel`` from the
+       YAML.  Like a supervisor leaving their phone number in the project spec.
+    3. **Keyring (loose)** — stored value that is "illegal but intentional"
+       (e.g. ``"123456"``).  Accepted with a warning.
+    4. **Sentinel** — ``__unconfigured__``.  publish/poll **refuse** with
+       :class:`NtfyNotConfiguredError`.
 
     If a channel name is not found in Credential Manager, a warning is
     logged and operations for that channel degrade gracefully (publish is
     skipped, poll returns empty).
     """
 
-    def __init__(self) -> None:
-        self._out_channel: str | None = _get_channel_from_keyring(_KEYRING_SERVICE_OUT)
-        self._cmd_channel: str | None = _get_channel_from_keyring(_KEYRING_SERVICE_CMD)
+    def __init__(
+        self,
+        *,
+        out_channel_override: str | None = None,
+        cmd_channel_override: str | None = None,
+    ) -> None:
+        self._out_channel = self._resolve_priority_chain(
+            "out",
+            _KEYRING_SERVICE_OUT,
+            out_channel_override,
+        )
+        self._cmd_channel = self._resolve_priority_chain(
+            "cmd",
+            _KEYRING_SERVICE_CMD,
+            cmd_channel_override,
+        )
 
-        if not self._out_channel:
-            logger.warning(
-                "ntfy out-channel name not found in Credential Manager "
-                "(service=%r). Publish to 'out' will be disabled.",
-                _KEYRING_SERVICE_OUT,
+    @staticmethod
+    def _resolve_priority_chain(
+        label: str,
+        keyring_service: str,
+        book_override: str | None,
+    ) -> str:
+        """Walk the 4-tier fallback chain and return the winning channel name.
+
+        Returns the sentinel ``_UNCONFIGURED_SENTINEL`` only if every tier
+        is exhausted.
+        """
+        # Tier 1: keyring, strictly valid (manual config)
+        kr_strict = _get_channel_from_keyring(keyring_service, tier="strict")
+        if kr_strict:
+            logger.info(
+                "ntfy %s-channel from keyring (strict): %r",
+                label,
+                kr_strict,
             )
-        if not self._cmd_channel:
-            logger.warning(
-                "ntfy cmd-channel name not found in Credential Manager "
-                "(service=%r). Poll from 'cmd' will be disabled.",
-                _KEYRING_SERVICE_CMD,
+            return kr_strict
+
+        # Tier 2: project book override
+        if book_override and _is_strictly_valid_channel(book_override):
+            logger.info(
+                "ntfy %s-channel from project book: %r",
+                label,
+                book_override,
             )
+            return book_override
+
+        # Tier 3 (merged with 1): already handled by kr_strict above.
+
+        # Tier 4: keyring, loose (illegal but intentional — e.g. "123456")
+        kr_loose = _get_channel_from_keyring(keyring_service, tier="loose")
+        if kr_loose:
+            # _get_channel_from_keyring already logged a warning for unusual values.
+            return kr_loose
+
+        # Tier 5: sentinel — not configured at all.
+        logger.error(
+            "ntfy %s-channel: no valid channel found in keyring, project book, "
+            "or loose keyring.  ntfy will refuse to operate for this channel.  "
+            "Run 'ntfy set-channels' or add ntfy.%s_channel to your project book.",
+            label,
+            label,
+        )
+        return _UNCONFIGURED_SENTINEL
 
     # ------------------------------------------------------------------
     # Public API
@@ -82,13 +345,24 @@ class NtfyClient:
         """POST *message* to the ntfy channel.
 
         *channel* is a logical name: ``"out"`` or ``"cmd"``.
-        The actual channel name is resolved from Credential Manager.
+        The actual channel name is resolved from the priority chain.
         Fire-and-forget with a 5-second timeout; errors are logged only.
+
+        Raises
+        ------
+        NtfyNotConfiguredError
+            If the resolved channel is the unconfigured sentinel.
         """
         channel_name = self._resolve_channel(channel)
         if not channel_name:
             logger.debug("publish(%r) skipped — channel name not configured.", channel)
             return
+
+        if channel_name == _UNCONFIGURED_SENTINEL:
+            raise NtfyNotConfiguredError(
+                f"Cannot publish to {channel!r}: ntfy channel is not configured.  "
+                "Run 'ntfy set-channels' or add ntfy section to your project book."
+            )
 
         url = f"{_NTFY_BASE_URL}/{channel_name}"
         headers: dict = {}
@@ -119,11 +393,22 @@ class NtfyClient:
             Fetch only messages with ID > *since_id*.
             Pass ``None`` to fetch all available messages (equivalent to
             ``since=all``).
+
+        Raises
+        ------
+        NtfyNotConfiguredError
+            If the resolved channel is the unconfigured sentinel.
         """
         channel_name = self._resolve_channel(channel)
         if not channel_name:
             logger.debug("poll(%r) skipped — channel name not configured.", channel)
             return []
+
+        if channel_name == _UNCONFIGURED_SENTINEL:
+            raise NtfyNotConfiguredError(
+                f"Cannot poll {channel!r}: ntfy channel is not configured.  "
+                "Run 'ntfy set-channels' or add ntfy section to your project book."
+            )
 
         since = since_id if since_id else "all"
         url = f"{_NTFY_BASE_URL}/{channel_name}/json"
@@ -183,50 +468,6 @@ class NtfyClient:
             return self._cmd_channel
         # Allow passing raw channel names through directly.
         return logical or None
-
-
-# ---------------------------------------------------------------------------
-# Keyring helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_channel_from_keyring(service: str) -> str | None:
-    """Retrieve a channel name from Windows Credential Manager.
-
-    Returns ``None`` if keyring is unavailable or the credential is not set.
-    """
-    try:
-        import keyring  # type: ignore[import-untyped]
-    except ImportError:
-        logger.debug("keyring not installed — cannot retrieve %r from Credential Manager.", service)
-        return None
-    try:
-        value = keyring.get_password(service, "channel_name")
-        return (value or "").strip() or None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("keyring lookup for %r failed: %s", service, exc)
-        return None
-
-
-def store_channel_in_keyring(service: str, channel_name: str) -> None:
-    """Store a channel name in Windows Credential Manager.
-
-    Called by the configure wizard.
-
-    Raises
-    ------
-    RuntimeError
-        If keyring is not installed.
-    """
-    try:
-        import keyring  # type: ignore[import-untyped]
-    except ImportError as exc:
-        raise RuntimeError(
-            "The keyring package is required to store ntfy channel names. "
-            "Install with: pip install claude-runner[keyring]"
-        ) from exc
-    keyring.set_password(service, "channel_name", channel_name)
-    logger.info("Stored channel name for %r in Credential Manager.", service)
 
 
 # ---------------------------------------------------------------------------
