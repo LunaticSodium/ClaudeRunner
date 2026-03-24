@@ -45,6 +45,23 @@ HIDDEN_IMPORTS = [
     "claude_runner.sandbox",
     "claude_runner.sandbox.docker_sandbox",
     "claude_runner.sandbox.native_sandbox",
+    "claude_runner.cccs_parser",
+    "claude_runner.supervisor_protocol",
+    "claude_runner.worker_supervisor",
+    "claude_runner.thinking_manual",
+    "claude_runner.kpi_collector",
+    "claude_runner.supervisor_audit",
+    "claude_runner.ntfy_client",
+    "claude_runner.inbox",
+    "claude_runner.git_inbox",
+    "claude_runner.preflight",
+    "claude_runner.model_watchdog",
+    "claude_runner.model_resolver",
+    "claude_runner.constraint_checker",
+    "claude_runner.acceptance_runner",
+    "claude_runner.pipeline",
+    "claude_runner.autostart",
+    "claude_runner.daemon",
     # Third-party deps that are sometimes missed
     "click",
     "yaml",
@@ -66,6 +83,7 @@ HIDDEN_IMPORTS = [
 DATA_FILES_WIN = [
     ("docker/Dockerfile", "docker/"),
     ("projects/*.yaml", "projects/"),
+    ("claude_runner/presets/*", "claude_runner/presets/"),
 ]
 
 # apprise loads notification plugins by scanning its own package directory at

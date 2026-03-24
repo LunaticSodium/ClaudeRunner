@@ -315,3 +315,22 @@ def load_preset(name: str) -> CCCSSpec:
             f"Available: {available}"
         )
     return CCCSSpec.from_file(candidate)
+
+
+def load_spellbook(name: str) -> str:
+    """Load a built-in spellbook by short name (e.g. ``"supervisor-v2.0"``).
+
+    Looks in ``claude_runner/presets/<name>.spellbook.md``.
+
+    Returns the raw Markdown content as a string.
+
+    Raises :class:`CCCSParseError` if the spellbook file is not found.
+    """
+    candidate = _PRESETS_DIR / f"{name}.spellbook.md"
+    if not candidate.exists():
+        available = [p.stem.removesuffix(".spellbook") for p in _PRESETS_DIR.glob("*.spellbook.md")]
+        raise CCCSParseError(
+            f"Spellbook '{name}' not found in {_PRESETS_DIR}. "
+            f"Available: {available}"
+        )
+    return candidate.read_text(encoding="utf-8")

@@ -1929,14 +1929,19 @@ class TaskRunner:
     # Context-anchors marker so we never double-inject across reruns.
     _CONTEXT_ANCHORS_MARKER = "<!-- BEGIN claude-runner context-anchors"
 
+    # Default spellbook preset name — matches presets/supervisor-v2.0.spellbook.md
+    _DEFAULT_SPELLBOOK = "supervisor-v2.0"
+
     def _inject_context_anchors_to_claude_md(self) -> None:
         """
-        Append a lightweight context-anchors **reminder** to CLAUDE.md.
+        Append a context-anchors **pointer** to CLAUDE.md and copy the
+        spellbook into the workspace so the LLM can find it by name.
 
         The full context_anchors text is already prepended to every prompt via
-        ContextManager.  This method does NOT duplicate it — it only writes a
-        short pointer so the LLM knows the anchors exist and should be respected
-        even after context compaction.  Keeps CLAUDE.md lean for smaller LLMs.
+        ContextManager.  This method writes a short pointer that explicitly
+        names the spellbook file so the LLM can ``cat`` it after context
+        compaction.  Keeps CLAUDE.md lean for smaller LLMs while giving them
+        a concrete path to follow.
 
         Silently skipped when:
         - No ``context_anchors`` field in the project book.
@@ -1972,9 +1977,34 @@ class TaskRunner:
             logger.debug("CLAUDE.md context anchors already present — skipping injection.")
             return
 
-        # Lightweight pointer — NOT the full anchors.  The full text is in
-        # every prompt via ContextManager; this just ensures the LLM knows
-        # they exist after compaction.
+        # --- Copy spellbook into workspace ---
+        spellbook_dest = claude_dir / "spellbook.md"
+        spellbook_placed = False
+        if not spellbook_dest.exists():
+            try:
+                from .cccs_parser import load_spellbook  # noqa: PLC0415
+                content = load_spellbook(self._DEFAULT_SPELLBOOK)
+                spellbook_dest.write_text(content, encoding="utf-8")
+                spellbook_placed = True
+                logger.info(
+                    "[ACTION] Spellbook '%s' copied to %s (%d chars).",
+                    self._DEFAULT_SPELLBOOK, spellbook_dest, len(content),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not place spellbook in workspace: %s", exc)
+        else:
+            spellbook_placed = True
+
+        # --- Pointer block naming the spellbook file ---
+        spellbook_line = ""
+        if spellbook_placed:
+            spellbook_line = (
+                "\n"
+                "A **spellbook** with detailed function references and domain\n"
+                "instructions has been placed at `.claude/spellbook.md`.  Read it\n"
+                "when you need to find a tool, capability, or constraint.\n"
+            )
+
         block = (
             "\n"
             "<!-- BEGIN claude-runner context-anchors — do not remove -->\n"
@@ -1983,6 +2013,7 @@ class TaskRunner:
             "They appear at the top of every prompt.  If your context was compacted\n"
             "and you no longer see them, re-read the most recent prompt carefully —\n"
             "they are always present.  Follow them in every phase.\n"
+            f"{spellbook_line}"
             "<!-- END claude-runner context-anchors -->\n"
         )
 
@@ -1990,7 +2021,7 @@ class TaskRunner:
             with claude_md.open("a", encoding="utf-8") as fh:
                 fh.write(block)
             logger.info(
-                "[ACTION] Context anchors appended to CLAUDE.md (%d chars added).",
+                "[ACTION] Context anchors pointer appended to CLAUDE.md (%d chars).",
                 len(block),
             )
         except OSError as exc:
