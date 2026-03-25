@@ -64,7 +64,8 @@ logger = logging.getLogger(__name__)
 
 ResumeStrategy = Literal["continue", "restate", "summarize"]
 NotifyEvent = Literal[
-    "start", "rate_limit", "resume", "complete", "error", "model_switch",
+    "start", "rate_limit", "resume", "complete", "error", "milestone",
+    "model_switch",
     "supervisor_accident", "intake_pass", "intake_partial", "intake_fail",
     "preflight_finding", "preflight_action", "kpi_warning", "intervention",
     "escalate_to_human",
