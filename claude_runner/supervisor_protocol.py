@@ -826,6 +826,21 @@ def call_supervisor_llm(
     if model_id:
         env["ANTHROPIC_MODEL"] = model_id
 
+    # Ensure CLAUDE_CODE_GIT_BASH_PATH is set on Windows — without it,
+    # claude -p exits with code 1.  Mirrors the probe in native_sandbox.py.
+    if os.name == "nt" and "CLAUDE_CODE_GIT_BASH_PATH" not in env:
+        _bash_candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Git" / "bin" / "bash.exe",
+            Path.home() / "AppData" / "Local" / "Programs"
+            / "Git" / "bin" / "bash.exe",
+        ]
+        for _bash in _bash_candidates:
+            if _bash.exists():
+                env["CLAUDE_CODE_GIT_BASH_PATH"] = str(_bash)
+                logger.info("[SUPERVISOR-LLM] Auto-detected git bash: %s", _bash)
+                break
+
     cwd = str(working_dir) if working_dir else None
 
     logger.info(
