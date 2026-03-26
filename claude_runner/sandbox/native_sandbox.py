@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -204,7 +205,7 @@ class NativeSandbox:
 
         PipeProcess = _import_pipe_process()
 
-        cmd = self._build_command(prompt)
+        cmd, stdin_text = self._build_command(prompt)
         working_dir = self.get_working_dir_path()
 
         # Apply model override via env vars when requested.
@@ -214,9 +215,10 @@ class NativeSandbox:
             logger.info("Model override active: %s", model_id)
 
         logger.info(
-            "Launching Claude (native/pipe): %s  [cwd=%s]",
+            "Launching Claude (native/pipe): %s  [cwd=%s]%s",
             " ".join(cmd[:3]),  # omit the prompt from the log line
             working_dir,
+            " (stdin prompt)" if stdin_text else "",
         )
 
         self._process = PipeProcess(
@@ -226,6 +228,7 @@ class NativeSandbox:
             on_line=on_line,
             on_exit=on_exit,
             show_console=self._show_claude,
+            stdin_text=stdin_text,
         )
         try:
             self._process.start()
@@ -267,16 +270,33 @@ class NativeSandbox:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _build_command(self, prompt: str) -> list[str]:
-        """Construct the claude CLI command list."""
+    # Windows command-line limit is ~8191 chars.  Leave headroom for the
+    # executable path and flags.
+    _WIN_CMD_LIMIT = 7500
+
+    def _build_command(self, prompt: str) -> tuple[list[str], str | None]:
+        """Construct the claude CLI command list.
+
+        Returns (cmd, stdin_text).  When the prompt is short enough for the
+        Windows command-line limit it is passed inline via ``-p <prompt>``.
+        When it exceeds the limit, the command uses ``-p -`` and the prompt
+        is returned as *stdin_text* to be piped to the subprocess.
+        """
         cmd = ["claude", "--dangerously-skip-permissions"]
 
         if self._use_sandbox_flag and getattr(self, "_has_sandbox_flag", False):
             cmd.append("--sandbox")
 
         cmd += ["--output-format", "stream-json", "--verbose"]
-        cmd += ["-p", prompt]
-        return cmd
+
+        use_stdin = sys.platform == "win32" and len(prompt) > self._WIN_CMD_LIMIT
+        if use_stdin:
+            cmd += ["-p", "-"]
+            logger.info("Prompt too long for CLI (%d chars) — piping via stdin", len(prompt))
+            return cmd, prompt
+        else:
+            cmd += ["-p", prompt]
+            return cmd, None
 
     @staticmethod
     def _probe_sandbox_flag(claude_path: str) -> bool:

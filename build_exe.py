@@ -21,7 +21,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-ENTRY_POINT = PROJECT_ROOT / "claude_runner" / "main.py"
+ENTRY_POINT = PROJECT_ROOT / "claude_runner" / "__main__.py"
 DIST_DIR = PROJECT_ROOT / "dist"
 BUILD_DIR = PROJECT_ROOT / "build"
 SPEC_FILE = PROJECT_ROOT / "claude-runner.spec"
@@ -173,6 +173,15 @@ def _build(debug: bool) -> int:
     # Hidden imports
     for mod in HIDDEN_IMPORTS:
         cmd += ["--hidden-import", mod]
+
+    # Exclude modules that pull in large, unneeded Anaconda MKL/MPI/SYCL
+    # dependencies and generate harmless but noisy "Library not found" warnings.
+    for exc in (
+        "mkl", "numpy.distutils", "scipy", "pandas",
+        "matplotlib", "IPython", "notebook", "pytest",
+        "debugpy", "pydevd",
+    ):
+        cmd += ["--exclude-module", exc]
 
     # Data files
     cmd += _resolve_data_args()

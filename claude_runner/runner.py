@@ -314,6 +314,7 @@ class TaskRunner:
         # Silence watchdog: tracks last output time and the background task.
         self._last_output_time: float = time.monotonic()
         self._silence_watchdog_task: asyncio.Task | None = None
+        self._rate_limit_paused: bool = False  # suppresses silence watchdog during RL waits
 
         # Filesystem snapshot taken at task start (fallback when git unavailable).
         self._fs_snapshot_start: dict[str, tuple[int, float]] = {}  # path → (size, mtime)
@@ -443,20 +444,23 @@ class TaskRunner:
         logger.info("TaskRunner.run() starting: task=%r at %s", self._book.name, start_str)
 
         try:
-            await self._initialise()
-        except Exception as exc:
-            msg = f"Initialisation failed: {exc}"
-            logger.exception(msg)
-            return self._make_result("failed", error_message=msg)
+            try:
+                await self._initialise()
+            except Exception as exc:
+                msg = f"Initialisation failed: {exc}"
+                logger.exception(msg)
+                return self._make_result("failed", error_message=msg)
 
-        try:
             result = await self._run_inner()
         except Exception as exc:
             # Catch-all: log, dispatch error notification, persist, return failed result.
             msg = f"Unexpected error in run loop: {exc}"
             logger.exception(msg)
             self._fault_log.append(f"[FATAL] {msg}")
-            await self._dispatch("error", {"error": msg, "task": self._book.name})
+            try:
+                await self._dispatch("error", {"error": msg, "task": self._book.name})
+            except Exception as dispatch_exc:
+                logger.warning("Failed to dispatch error notification: %s", dispatch_exc)
             result = self._make_result("failed", error_message=msg)
         finally:
             await self._cleanup()
@@ -997,6 +1001,9 @@ class TaskRunner:
             self._persistence.save(self._make_state("failed"))
             return self._make_result("failed", error_message=msg)
 
+        # --- Suppress silence watchdog during wait -------------------------
+        self._rate_limit_paused = True
+
         # --- Wait with TUI countdown -------------------------------------
         from .rate_limit import RateLimitWaiter  # noqa: PLC0415
         logger.info("[ACTION] Waiting for rate limit to reset at %s.", wait_until_str)
@@ -1005,7 +1012,13 @@ class TaskRunner:
             on_tick=self._on_countdown_tick,
             on_resume=lambda: None,  # resume is handled after wait returns
         )
-        await waiter.wait()
+        try:
+            await waiter.wait()
+        finally:
+            self._rate_limit_paused = False
+            # Reset silence timer so watchdog doesn't immediately fire after
+            # the long (expected) silence during the rate-limit wait.
+            self._last_output_time = time.monotonic()
         logger.info("Rate limit wait complete.  Resuming task.")
 
         # --- Dispatch resume notification --------------------------------
@@ -1014,6 +1027,15 @@ class TaskRunner:
             "resume",
             {"task": self._book.name, "cycle": self._rate_limit_cycles},
         )
+
+        # --- Verify the process survived the wait --------------------------
+        if self._process is not None and hasattr(self._process, "is_alive"):
+            if not self._process.is_alive():
+                msg = "Worker process died during rate-limit wait."
+                logger.error(msg)
+                self._fault_log.append(f"[ERROR] {msg}")
+                await self._dispatch("error", {"error": msg, "task": self._book.name})
+                return self._make_result("failed", error_message=msg)
 
         # --- Build and send resume prompt --------------------------------
         resume_prompt = self._context_manager.build_resume_prompt(
@@ -1067,13 +1089,16 @@ class TaskRunner:
         # --- Stop the current process -------------------------------------
         if self._process is not None:
             try:
-                if hasattr(self._process, "is_alive") and self._process.is_alive():
-                    if hasattr(self._process, "terminate"):
-                        self._process.terminate()
-                    elif hasattr(self._process, "stop"):
-                        self._process.stop()
-                    # Give the process a moment to terminate gracefully.
-                    await asyncio.sleep(1.0)
+                if hasattr(self._process, "stop"):
+                    self._process.stop(timeout=5.0)
+                elif hasattr(self._process, "terminate"):
+                    self._process.terminate()
+                    await asyncio.sleep(2.0)
+                    # Force-kill if still alive after grace period.
+                    if hasattr(self._process, "is_alive") and self._process.is_alive():
+                        if hasattr(self._process, "kill"):
+                            self._process.kill()
+                        logger.warning("Model switch: force-killed lingering process.")
             except Exception as exc:
                 logger.warning("Model switch: error stopping current process: %s", exc)
             self._process = None
@@ -2455,6 +2480,13 @@ class TaskRunner:
         while True:
             await asyncio.sleep(silence_timeout_s)
 
+            # Skip probes while the runner is in a rate-limit wait — the
+            # silence is expected and sending "continue" would trigger Claude
+            # Code to make API calls, burning tokens for no reason.
+            if self._rate_limit_paused:
+                logger.debug("Silence watchdog: skipping — rate-limit pause active.")
+                continue
+
             elapsed = time.monotonic() - self._last_output_time
             if elapsed < silence_timeout_s:
                 # New output arrived during our sleep — nothing to do.
@@ -2473,6 +2505,12 @@ class TaskRunner:
 
             # Wait one more window; if output resumes, the next cycle is a no-op.
             await asyncio.sleep(silence_timeout_s)
+
+            # Re-check pause flag after second sleep — rate limit may have
+            # been detected while we were waiting for the probe response.
+            if self._rate_limit_paused:
+                logger.debug("Silence watchdog: skipping error escalation — rate-limit pause active.")
+                continue
 
             elapsed2 = time.monotonic() - self._last_output_time
             if elapsed2 >= silence_timeout_s:
@@ -2508,6 +2546,21 @@ class TaskRunner:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+        # Explicitly kill the worker process before sandbox teardown — the
+        # sandbox.teardown() is best-effort and may hang or fail, leaving the
+        # subprocess orphaned.
+        if self._process is not None:
+            try:
+                if hasattr(self._process, "is_alive") and self._process.is_alive():
+                    logger.info("[CLEANUP] Stopping worker process …")
+                    if hasattr(self._process, "stop"):
+                        self._process.stop(timeout=5.0)
+                    elif hasattr(self._process, "terminate"):
+                        self._process.terminate()
+            except Exception as exc:
+                logger.warning("[CLEANUP] Error stopping worker process: %s", exc)
+            self._process = None
 
         if self._sandbox is not None:
             try:

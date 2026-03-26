@@ -621,9 +621,15 @@ def run(
                 return
             try:
                 if hasattr(proc, "stop"):
-                    proc.stop(timeout=3.0)
+                    proc.stop(timeout=8.0)
                 elif hasattr(proc, "terminate"):
                     proc.terminate()
+                    # Give a moment, then force-kill.
+                    import time as _time  # noqa: PLC0415
+                    _time.sleep(2.0)
+                    if hasattr(proc, "is_alive") and proc.is_alive():
+                        if hasattr(proc, "kill"):
+                            proc.kill()
             except Exception:
                 pass
 

@@ -516,6 +516,7 @@ class PipeProcess:
         on_exit: Callable[[int], None],
         *,
         show_console: bool = False,
+        stdin_text: str | None = None,
         **_kwargs,  # absorb cols/rows that ClaudeProcess accepts
     ) -> None:
         self._command = list(command)
@@ -524,6 +525,7 @@ class PipeProcess:
         self._on_line = on_line
         self._on_exit = on_exit
         self._show_console = show_console
+        self._stdin_text = stdin_text
 
         self._proc: subprocess.Popen | None = None
         self._pid: int = -1
@@ -563,13 +565,13 @@ class PipeProcess:
                 # the pipe handles set in STARTUPINFO.
                 creation_flags = _sp.DETACHED_PROCESS
 
-        # stdin=None: child inherits the parent's stdin handle (the user's terminal).
-        # This is the key fix: with stdin=PIPE and no writer, Claude Code blocks
-        # on a read(stdin) forever because it supports "echo prompt | claude -p".
-        # With an inherited terminal stdin, Claude Code can start immediately.
-        # Both production mode and show_console mode use None; the only difference
-        # between the modes is the creation flags (DETACHED_PROCESS vs CREATE_NEW_CONSOLE).
-        stdin_handle = None
+        # stdin handling:
+        # - When stdin_text is provided (long prompt piped via stdin), use PIPE
+        #   and write+close after spawn.  Claude Code reads the prompt from stdin
+        #   when invoked with `-p -`.
+        # - Otherwise stdin=None: child inherits the parent's stdin handle.
+        #   With stdin=PIPE and no writer, Claude Code blocks forever.
+        stdin_handle = _sp.PIPE if self._stdin_text else None
 
         try:
             self._proc = _sp.Popen(
@@ -583,6 +585,14 @@ class PipeProcess:
             )
         except Exception as exc:
             raise ProcessError(f"Failed to spawn subprocess: {exc}") from exc
+
+        # Pipe the prompt into stdin and close so Claude Code sees EOF.
+        if self._stdin_text and self._proc.stdin:
+            try:
+                self._proc.stdin.write(self._stdin_text.encode("utf-8"))
+                self._proc.stdin.close()
+            except Exception as exc:
+                log.warning("Failed to write prompt to stdin: %s", exc)
 
         self._pid = self._proc.pid
         self._stop_event.clear()
@@ -658,7 +668,16 @@ class PipeProcess:
             try:
                 self._proc.terminate()
             except Exception as exc:
-                log.debug("PipeProcess.stop(): ignoring error on terminate: %s", exc)
+                log.debug("PipeProcess.stop(): terminate failed: %s", exc)
+            # Wait briefly for graceful exit, then force-kill if still alive.
+            try:
+                self._proc.wait(timeout=min(timeout, 3.0))
+            except Exception:
+                try:
+                    log.warning("PipeProcess: terminate did not exit in time — force-killing.")
+                    self._proc.kill()
+                except Exception as exc2:
+                    log.warning("PipeProcess: kill also failed: %s", exc2)
         if self._reader_thread and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=timeout)
         log.info("PipeProcess stopped (exit_code=%s)", self._exit_code)
