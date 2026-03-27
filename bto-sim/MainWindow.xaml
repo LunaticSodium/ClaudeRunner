@@ -1,0 +1,306 @@
+<Window x:Class="bto_sim.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:bto_sim"
+        mc:Ignorable="d"
+        Title="bto-sim Config Editor"
+        Height="1000" Width="920">
+
+    <DockPanel Margin="18">
+
+        <!-- Status bar -->
+        <Border DockPanel.Dock="Bottom" Padding="10" CornerRadius="8" BorderThickness="1"
+                BorderBrush="#B9D2F0" Background="#F7FBFF" Margin="0,12,0,0">
+            <TextBlock x:Name="StatusText" Text="Ready."/>
+        </Border>
+
+        <!-- Main content -->
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="12"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="12"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="12"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- Buttons -->
+                <StackPanel Orientation="Horizontal" Grid.Row="0">
+                    <Button Content="Load..." Click="Load_Click"/>
+                    <Button Content="Save As..." Click="Save_Click" Margin="10,0,0,0"/>
+                    <Button Content="Validate" Click="Validate_Click" Margin="10,0,0,0"/>
+                    <Button Content="Run" Width="90" Margin="18,0,8,0" Click="Run_Click"/>
+                    <ProgressBar x:Name="RunProgress"
+                         Width="220" Height="18"
+                         Minimum="0" Maximum="100"
+                         Value="0"
+                         Margin="8,0,0,0"/>
+                    <TextBlock x:Name="RunStatus" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                    <Button Content="Open Output" Click="OpenOutputDir_Click" Margin="18,0,0,0"/>
+                    <Button Content="Open Latest" Click="OpenLatest_Click" Margin="10,0,0,0"/>
+                </StackPanel>
+
+                <!-- ── Basic ─────────────────────────────────────────────── -->
+                <GroupBox Header="Basic" Grid.Row="2">
+                    <Grid Margin="16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="300"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock x:Name="TypeLabel" Grid.Row="0" Grid.Column="0" Text="type"/>
+                        <ComboBox x:Name="TypeCombo" Grid.Row="0" Grid.Column="1"
+                                  DisplayMemberPath="DisplayName"
+                                  SelectedValuePath="Type"
+                                  SelectionChanged="TypeCombo_SelectionChanged"/>
+
+                        <TextBlock x:Name="SchemaLabel" Grid.Row="1" Grid.Column="0" Text="schema_version"/>
+                        <TextBox x:Name="SchemaBox" Grid.Row="1" Grid.Column="1"/>
+
+                        <TextBlock x:Name="NConfigsLabel" Grid.Row="2" Grid.Column="0" Text="n_configs_per_type"/>
+                        <TextBox x:Name="NConfigsBox" Grid.Row="2" Grid.Column="1"/>
+
+                        <TextBlock x:Name="DeviceTypesLabel" Grid.Row="3" Grid.Column="0" Text="device_types"/>
+                        <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal">
+                            <CheckBox x:Name="DeviceFlatCheck" Content="flat" Margin="0,0,18,0"/>
+                            <CheckBox x:Name="DeviceRidgeCheck" Content="ridge"/>
+                        </StackPanel>
+
+                        <TextBlock x:Name="SeedLabel" Grid.Row="4" Grid.Column="0" Text="random_seed"/>
+                        <TextBox x:Name="SeedBox" Grid.Row="4" Grid.Column="1"/>
+
+                        <TextBlock x:Name="WorkersLabel" Grid.Row="5" Grid.Column="0" Text="workers (empty = null)"/>
+                        <TextBox x:Name="WorkersBox" Grid.Row="5" Grid.Column="1"/>
+
+                        <TextBlock x:Name="WavelengthLabel" Grid.Row="6" Grid.Column="0" Text="wavelength_um"/>
+                        <TextBox x:Name="WavelengthBox" Grid.Row="6" Grid.Column="1"/>
+
+                        <TextBlock x:Name="VlowLabel" Grid.Row="7" Grid.Column="0" Text="voltages_V.low"/>
+                        <TextBox x:Name="VlowBox" Grid.Row="7" Grid.Column="1"/>
+
+                        <TextBlock x:Name="VhighLabel" Grid.Row="8" Grid.Column="0" Text="voltages_V.high"/>
+                        <TextBox x:Name="VhighBox" Grid.Row="8" Grid.Column="1"/>
+
+                        <TextBlock x:Name="OutputDirLabel" Grid.Row="9" Grid.Column="0" Text="output.output_dir"/>
+
+                        <Grid Grid.Row="9" Grid.Column="1">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="10"/>
+                                <ColumnDefinition Width="110"/>
+                            </Grid.ColumnDefinitions>
+
+                            <TextBox x:Name="OutputDirBox" Grid.Column="0"/>
+                            <Button x:Name="BrowseOutputDirButton"
+                                 Grid.Column="2" Content="Browse..." Click="BrowseOutputDir_Click"/>
+                        </Grid>
+
+                        <TextBlock x:Name="DirPrefixLabel" Grid.Row="10" Grid.Column="0" Text="output.dir_prefix"/>
+                        <TextBox x:Name="DirPrefixBox" Grid.Row="10" Grid.Column="1"/>
+                    </Grid>
+                </GroupBox>
+
+                <!-- ── LHS Parameter Ranges ──────────────────────────────── -->
+                <GroupBox Header="Parameter Ranges (min, max)" Grid.Row="4">
+                    <Grid Margin="16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="300"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text=""/>
+                        <TextBlock Grid.Row="0" Grid.Column="1" Text="min"/>
+                        <TextBlock Grid.Row="0" Grid.Column="2" Text="max"/>
+
+                        <TextBlock x:Name="BtoTLabel" Grid.Row="1" Grid.Column="0" Text="bto_thickness_um"/>
+                        <TextBox x:Name="BtoTMinBox" Grid.Row="1" Grid.Column="1" Margin="0,0,10,0"/>
+                        <TextBox x:Name="BtoTMaxBox" Grid.Row="1" Grid.Column="2"/>
+
+                        <TextBlock x:Name="WLabel" Grid.Row="2" Grid.Column="0" Text="width_um"/>
+                        <TextBox x:Name="WMinBox" Grid.Row="2" Grid.Column="1" Margin="0,0,10,0"/>
+                        <TextBox x:Name="WMaxBox" Grid.Row="2" Grid.Column="2"/>
+
+                        <TextBlock x:Name="HLabel" Grid.Row="3" Grid.Column="0" Text="height_um"/>
+                        <TextBox x:Name="HMinBox" Grid.Row="3" Grid.Column="1" Margin="0,0,10,0"/>
+                        <TextBox x:Name="HMaxBox" Grid.Row="3" Grid.Column="2"/>
+
+                        <TextBlock x:Name="GapLabel" Grid.Row="4" Grid.Column="0" Text="electrode_gap_um"/>
+                        <TextBox x:Name="GapMinBox" Grid.Row="4" Grid.Column="1" Margin="0,0,10,0"/>
+                        <TextBox x:Name="GapMaxBox" Grid.Row="4" Grid.Column="2"/>
+
+                        <TextBlock x:Name="EHLabel" Grid.Row="5" Grid.Column="0" Text="electrode_height_um"/>
+                        <TextBox x:Name="EHMinBox" Grid.Row="5" Grid.Column="1" Margin="0,0,10,0"/>
+                        <TextBox x:Name="EHMaxBox" Grid.Row="5" Grid.Column="2"/>
+
+                        <TextBlock x:Name="RidgeLabel" Grid.Row="6" Grid.Column="0" Text="ridge_angle_deg"/>
+                        <TextBox x:Name="RidgeMinBox" Grid.Row="6" Grid.Column="1" Margin="0,0,10,0"/>
+                        <TextBox x:Name="RidgeMaxBox" Grid.Row="6" Grid.Column="2"/>
+
+                        <TextBlock x:Name="CryLabel" Grid.Row="7" Grid.Column="0" Text="crystal_angle_deg"/>
+                        <TextBox x:Name="CryMinBox" Grid.Row="7" Grid.Column="1" Margin="0,0,10,0"/>
+                        <TextBox x:Name="CryMaxBox" Grid.Row="7" Grid.Column="2"/>
+                    </Grid>
+                </GroupBox>
+
+                <!-- ── Sandwich Optimizer ────────────────────────────────── -->
+                <GroupBox Header="Sandwich Optimizer" Grid.Row="6">
+                    <Grid Margin="16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="300"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <!-- Solver settings -->
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <!-- Save JSON output -->
+                            <RowDefinition Height="Auto"/>
+                            <!-- Divider label -->
+                            <RowDefinition Height="14"/>
+                            <RowDefinition Height="Auto"/>
+                            <!-- Fixed geometry rows -->
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- stack_topology (derives structure_family for JSON) -->
+                        <TextBlock x:Name="StackTopologyLabel" Grid.Row="0" Grid.Column="0" Text="stack_topology"/>
+                        <ComboBox x:Name="StackTopologyCombo" Grid.Row="0" Grid.Column="1"
+                                  SelectionChanged="StackTopologyCombo_SelectionChanged"/>
+
+                        <!-- top_core_material -->
+                        <TextBlock x:Name="TopCoreLabel" Grid.Row="1" Grid.Column="0" Text="top_core_material"/>
+                        <ComboBox x:Name="TopCoreCombo" Grid.Row="1" Grid.Column="1"/>
+
+                        <!-- spacer_material (greyed for Patch topology) -->
+                        <TextBlock x:Name="SpacerMatLabel" Grid.Row="2" Grid.Column="0" Text="spacer_material"/>
+                        <ComboBox x:Name="SpacerCombo" Grid.Row="2" Grid.Column="1"/>
+
+                        <!-- voltage_v -->
+                        <TextBlock x:Name="VoltVLabel" Grid.Row="3" Grid.Column="0" Text="voltage_v (V)"/>
+                        <TextBox x:Name="VoltVBox" Grid.Row="3" Grid.Column="1"/>
+
+                        <!-- phi_deg -->
+                        <TextBlock x:Name="PhiDegLabel" Grid.Row="4" Grid.Column="0" Text="phi_deg (crystal °)"/>
+                        <TextBox x:Name="PhiDegBox" Grid.Row="4" Grid.Column="1"/>
+
+                        <!-- n_modes -->
+                        <TextBlock x:Name="NModesLabel" Grid.Row="5" Grid.Column="0" Text="n_modes"/>
+                        <TextBox x:Name="NModesBox" Grid.Row="5" Grid.Column="1"/>
+
+                        <!-- min_te_fraction -->
+                        <TextBlock x:Name="MinTEFracLabel" Grid.Row="6" Grid.Column="0" Text="min_te_fraction"/>
+                        <TextBox x:Name="MinTEFracBox" Grid.Row="6" Grid.Column="1"/>
+
+                        <!-- time_limit_sec -->
+                        <TextBlock x:Name="TimeLimitLabel" Grid.Row="7" Grid.Column="0" Text="time_limit_sec"/>
+                        <TextBox x:Name="TimeLimitBox" Grid.Row="7" Grid.Column="1"/>
+
+                        <!-- top_k -->
+                        <TextBlock x:Name="TopKLabel" Grid.Row="8" Grid.Column="0" Text="top_k"/>
+                        <TextBox x:Name="TopKBox" Grid.Row="8" Grid.Column="1"/>
+
+                        <!-- sweep_random_seed -->
+                        <TextBlock x:Name="SweepSeedLabel" Grid.Row="9" Grid.Column="0" Text="sweep_random_seed (empty = null)"/>
+                        <TextBox x:Name="SweepSeedBox" Grid.Row="9" Grid.Column="1"/>
+
+                        <!-- opt_gap -->
+                        <TextBlock x:Name="OptGapLabel" Grid.Row="10" Grid.Column="0" Text="opt_gap (GPT solver only)"/>
+                        <CheckBox x:Name="OptGapCheck" Grid.Row="10" Grid.Column="1" VerticalAlignment="Center"/>
+
+                        <!-- save_json -->
+                        <TextBlock x:Name="SaveJsonLabel" Grid.Row="11" Grid.Column="0" Text="output.save_json"/>
+                        <Grid Grid.Row="11" Grid.Column="1">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="10"/>
+                                <ColumnDefinition Width="110"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBox x:Name="SaveJsonBox" Grid.Column="0"/>
+                            <Button x:Name="BrowseSaveJsonButton" Grid.Column="2"
+                                    Content="Browse..." Click="BrowseSaveJson_Click"/>
+                        </Grid>
+
+                        <!-- Divider -->
+                        <TextBlock Grid.Row="12" Grid.ColumnSpan="2"
+                                   Text="── Fixed Geometry (optimizer start / fixed axes) ──"
+                                   FontStyle="Italic" Foreground="#666" VerticalAlignment="Center"/>
+
+                        <!-- Column headers -->
+                        <TextBlock Grid.Row="13" Grid.Column="0" Text="parameter"/>
+                        <TextBlock Grid.Row="13" Grid.Column="1" Text="fixed value (µm or °)"/>
+
+                        <!-- al2o3_thickness_um -->
+                        <TextBlock x:Name="Al2O3ThkLabel" Grid.Row="14" Grid.Column="0" Text="al2o3_thickness_um"/>
+                        <TextBox x:Name="Al2O3ThkBox" Grid.Row="14" Grid.Column="1"/>
+
+                        <!-- bto_thickness_um -->
+                        <TextBlock x:Name="BtoThkLabel" Grid.Row="15" Grid.Column="0" Text="bto_thickness_um"/>
+                        <TextBox x:Name="BtoThkBox" Grid.Row="15" Grid.Column="1"/>
+
+                        <!-- spacer_thickness_um -->
+                        <TextBlock x:Name="SpacerThkLabel" Grid.Row="16" Grid.Column="0" Text="spacer_thickness_um"/>
+                        <TextBox x:Name="SpacerThkBox" Grid.Row="16" Grid.Column="1"/>
+
+                        <!-- top_width_um -->
+                        <TextBlock x:Name="TopWidthLabel" Grid.Row="17" Grid.Column="0" Text="top_width_um"/>
+                        <TextBox x:Name="TopWidthBox" Grid.Row="17" Grid.Column="1"/>
+
+                        <!-- top_height_um -->
+                        <TextBlock x:Name="TopHeightLabel" Grid.Row="18" Grid.Column="0" Text="top_height_um"/>
+                        <TextBox x:Name="TopHeightBox" Grid.Row="18" Grid.Column="1"/>
+
+                        <!-- electrode_gap_um -->
+                        <TextBlock x:Name="ElecGapLabel" Grid.Row="19" Grid.Column="0" Text="electrode_gap_um"/>
+                        <TextBox x:Name="ElecGapBox" Grid.Row="19" Grid.Column="1"/>
+
+                    </Grid>
+                </GroupBox>
+
+            </Grid>
+        </ScrollViewer>
+    </DockPanel>
+</Window>

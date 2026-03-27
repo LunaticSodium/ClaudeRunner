@@ -1,0 +1,162 @@
+========================================================================
+claude-runner — Task Report
+========================================================================
+Task:              bto-runner
+Status:            COMPLETE
+Started:           2026-03-22 16:08:12 UTC
+Ended:             2026-03-23 03:09:53 UTC
+Duration:          11h 01m 40s
+Rate limit cycles: 0
+Context checkpts:  3
+Est. tokens used:  9606
+
+------------------------------------------------------------------------
+CHANGE SUMMARY
+------------------------------------------------------------------------
+.claude-runner/progress.log                            |   3 +++
+ bto_runner/gui/app.py                                  |   4 ----
+ bto_runner/params/__init__.py                          |  16 ++++++++--------
+ bto_runner/params/__pycache__/__init__.cpython-313.pyc | Bin 635 -> 633 bytes
+ bto_runner/runner/executor.py                          |   1 -
+ bto_runner/simulator/mock_sim.py                       |   1 -
+ 6 files changed, 11 insertions(+), 14 deletions(-)
+Untracked new files:
+  audit/supervisor_budget.md (new, untracked)
+  audit/supervisor_history.md (new, untracked)
+  bto_runner.yaml (new, untracked)
+  bto_runner/__pycache__/cli.cpython-313.pyc (new, untracked)
+  bto_runner/budget/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/budget/__pycache__/complexity.cpython-313.pyc (new, untracked)
+  bto_runner/budget/__pycache__/pid.cpython-313.pyc (new, untracked)
+  bto_runner/inverse/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/inverse/__pycache__/solver.cpython-313.pyc (new, untracked)
+  bto_runner/inverse/solver.py (new, untracked)
+  bto_runner/runner/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/runner/__pycache__/executor.cpython-313.pyc (new, untracked)
+  bto_runner/runner/__pycache__/logger.cpython-313.pyc (new, untracked)
+  bto_runner/runner/__pycache__/scheduler.cpython-313.pyc (new, untracked)
+  bto_runner/simulator/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/simulator/__pycache__/mock_sim.cpython-313.pyc (new, untracked)
+  bto_runner/strategies/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/strategies/__pycache__/base.cpython-313.pyc (new, untracked)
+  bto_runner/strategies/__pycache__/bayesian.cpython-313.pyc (new, untracked)
+  bto_runner/strategies/__pycache__/cmaes.cpython-313.pyc (new, untracked)
+  bto_runner/strategies/__pycache__/hill.cpython-313.pyc (new, untracked)
+  bto_runner/strategies/__pycache__/registry.cpython-313.pyc (new, untracked)
+  designs_v2.0/ADVERSARIAL_REVIEW_v2.0.md (new, untracked)
+  designs_v2.0/CHANGES_v1.1_to_v2.0.md (new, untracked)
+  designs_v2.0/IMPLEMENTATION_LOG_v2.0.md (new, untracked)
+  designs_v2.0/REVIEW_DECISIONS.md (new, untracked)
+  designs_v2.0/TEST_PLAN_v2.0.md (new, untracked)
+  designs_v2.0/The Adversarial Supervisor Pattern_ Strong Foundations, Real Risks.pdf (new, untracked)
+  designs_v2.0/clauderunner_flow.html (new, untracked)
+  designs_v2.0/compass_artifact_wf-c88cddfa-91fb-4315-a58e-787a13305b43_text_markdown.md (new, untracked)
+  designs_v2.0/supervisor_protocol_addendum.md (new, untracked)
+  generate_plots.py (new, untracked)
+  output/plots/delta_neff_vs_voltage.png (new, untracked)
+  output/plots/generate_log.txt (new, untracked)
+  output/plots/literature_comparison.json (new, untracked)
+  output/plots/loss_vs_bto_thickness.png (new, untracked)
+  output/plots/loss_vs_electrode_gap.png (new, untracked)
+  output/plots/loss_vs_wg_width.png (new, untracked)
+  output/plots/neff_vs_bto_thickness.png (new, untracked)
+  output/plots/neff_vs_wg_width.png (new, untracked)
+  output/plots/sweetspot_results.json (new, untracked)
+  output/plots/vpiL_sweetspot_comparison.png (new, untracked)
+  output/plots/vpiL_vs_bto_thickness.png (new, untracked)
+  output/plots/vpiL_vs_crystal_angle.png (new, untracked)
+  output/plots/vpiL_vs_electrode_gap.png (new, untracked)
+  output/plots/vpiL_vs_wg_width.png (new, untracked)
+  tests/__pycache__/test_budget.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_executor.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_inverse.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_scheduler.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_strategies.cpython-313-pytest-8.3.4.pyc (new, untracked)
+
+--- git workflow ---
+Branch: bto-run/bto_runner-20260323_031005
+Commit: [bto-run/bto_runner-20260323_031005 bfb0883] claude-runner: bto-runner
+ 57 files
+
+------------------------------------------------------------------------
+FAULT LOG
+------------------------------------------------------------------------
+[SUPERVISOR] Intake call failed: Supervisor LLM call failed (exit=1): Claude Code on Windows requires git-bash (https://git-scm.com/downloads/win). If installed but not in PATH, set environment variable pointing to your bash.exe, similar to: CLAUDE_CODE_GIT_BASH_PATH=C:\Program Files\Git\bin\bash.exe
+
+[SUPERVISOR] Pre-flight call failed: Supervisor LLM call failed (exit=1): Claude Code on Windows requires git-bash (https://git-scm.com/downloads/win). If installed but not in PATH, set environment variable pointing to your bash.exe, similar to: CLAUDE_CODE_GIT_BASH_PATH=C:\Program Files\Git\bin\bash.exe
+
+[ACCEPTANCE] AcceptanceCheck: FAILED (4 check(s))
+  PASS [1/11] type=command
+  PASS [2/11] type=command
+  PASS [3/11] type=command
+  PASS [4/11] type=command
+  PASS [5/11] type=command
+  PASS [6/11] type=file_exists
+  PASS [7/11] type=command
+  FAIL [8/11] type=command
+    command: 'python -c "import pathlib,sys; d=pathlib.Path(\'output/plots\'); pngs=list(d.glob(\'*.png\')) if d.exists() else []; n=len(pngs); print(\'Plots:\', n); [print(\' \', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=11 else 1)"' exited with 1 (expected 0)
+  stdout: Plots: 0
+
+  stderr: 
+  FAIL [9/11] type=file_exists
+    file_exists: 'output/plots/sweetspot_results.json' does not exist in C:\Local_Projects\BTO_Modulators_Simulatior_runner\workspace
+  FAIL [10/11] type=file_exists
+    file_exists: 'output/plots/literature_comparison.json' does not exist in C:\Local_Projects\BTO_Modulators_Simulatior_runner\workspace
+  FAIL [11/11] type=command
+    command: 'python -c "import json,sys; data=json.load(open(\'output/plots/literature_comparison.json\')); mismatches=[r[\'structure\'] for r in data if not r.get(\'within_order\',True)]; print(\'Lit. comparison mismatches:\', mismatches or \'none\'); sys.exit(0)"' exited with 1 (expected 0)
+  stdout: 
+  stderr: Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json,sys; data=json.load(open('output/plots/literature_comparison.json')); mismatches=[r['structure'] for r in data if not r.get('within_order',True)]; print('Lit. comparison mismatches:', mismatches or 'none'); sys.exit(0)
+                                    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'output/plots/literature_comparison.json'
+
+[ACCEPTANCE] AcceptanceCheck: FAILED (4 check(s))
+  PASS [1/11] type=command
+  PASS [2/11] type=command
+  PASS [3/11] type=command
+  PASS [4/11] type=command
+  PASS [5/11] type=command
+  PASS [6/11] type=file_exists
+  PASS [7/11] type=command
+  FAIL [8/11] type=command
+    command: 'python -c "import pathlib,sys; d=pathlib.Path(\'output/plots\'); pngs=list(d.glob(\'*.png\')) if d.exists() else []; n=len(pngs); print(\'Plots:\', n); [print(\' \', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=11 else 1)"' exited with 1 (expected 0)
+  stdout: Plots: 0
+
+  stderr: 
+  FAIL [9/11] type=file_exists
+    file_exists: 'output/plots/sweetspot_results.json' does not exist in C:\Local_Projects\BTO_Modulators_Simulatior_runner\workspace
+  FAIL [10/11] type=file_exists
+    file_exists: 'output/plots/literature_comparison.json' does not exist in C:\Local_Projects\BTO_Modulators_Simulatior_runner\workspace
+  FAIL [11/11] type=command
+    command: 'python -c "import json,sys; data=json.load(open(\'output/plots/literature_comparison.json\')); mismatches=[r[\'structure\'] for r in data if not r.get(\'within_order\',True)]; print(\'Lit. comparison mismatches:\', mismatches or \'none\'); sys.exit(0)"' exited with 1 (expected 0)
+  stdout: 
+  stderr: Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json,sys; data=json.load(open('output/plots/literature_comparison.json')); mismatches=[r['structure'] for r in data if not r.get('within_order',True)]; print('Lit. comparison mismatches:', mismatches or 'none'); sys.exit(0)
+                                    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'output/plots/literature_comparison.json'
+
+
+------------------------------------------------------------------------
+PROGRESS LOG
+------------------------------------------------------------------------
+# claude-runner progress log
+# Task:    bto-runner
+# Started: 2026-03-22 16:08:13 UTC
+#
+# Format:
+#   [TIMESTAMP] [PHASE]    Description of current state
+#   [TIMESTAMP] [DONE]     Description of completed step
+#   [TIMESTAMP] [BLOCK]    Description of a blocker or open question
+#   [TIMESTAMP] [DECISION] Rationale for a choice made
+#
+[2026-03-22T16:10:00Z] [PHASE]    Starting PHASE 1 - Audit. Will read existing codebase and write AUDIT.md.
+[2026-03-22T16:10:00Z] [DECISION] Audit completed via subagent exploring all .py files in extracted BTO simulator.
+[2026-03-22T16:12:15Z] [DECISION] Model switched to claude-haiku-4-5-20251001: Haiku for audit — reading only, no generation
+[2026-03-22T16:15:46Z] [DECISION] Model switched to claude-opus-4-6: Opus for core architecture (params, budget, executor)
+[2026-03-22T16:22:16Z] [DECISION] Model switched to claude-sonnet-4-6: Sonnet for strategies, GUI, CLI, tests
+
+========================================================================
+END OF REPORT
+========================================================================

@@ -1,0 +1,28 @@
+{
+  "type": "bto_ml_dataset_lhs_fast",
+  "schema_version": "0.1.0",
+
+  "n_configs_per_type": 100,
+  "device_types": ["flat", "ridge"],
+
+  "random_seed": 42,
+  "workers": null,
+
+  "wavelength_um": 1.55,
+  "voltages_V": { "low": 0.1, "high": 5.0 },
+
+  "parameter_ranges": {
+    "bto_thickness_um": [0.05, 0.5],
+    "width_um": [0.5, 2.0],
+    "height_um": [0.05, 0.35],
+    "electrode_gap_um": [2.5, 7.0],
+    "electrode_height_um": [0.1, 1.0],
+    "ridge_angle_deg": [0.0, 35.0],
+    "crystal_angle_deg": [0.0, 90.0]
+  },
+
+  "output": {
+    "output_dir": "",
+    "dir_prefix": "BTO_ML_Dataset_LHS_Fast"
+  }
+}

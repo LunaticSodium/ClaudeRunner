@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:\\Local_Projects\\BTO_Modulators_Simulatior_runner\\ClaudeRunner\\claude_runner\\main.py'],
+    ['C:\\Local_Projects\\BTO_Modulators_Simulatior_runner\\ClaudeRunner\\claude_runner\\__main__.py'],
     pathex=[],
     binaries=[],
     datas=[('docker/Dockerfile', 'docker/'), ('projects/*.yaml', 'projects/'), ('claude_runner/presets/*', 'claude_runner/presets/'), ('C:\\Apps\\Anaconda3\\Lib\\site-packages\\apprise', 'apprise')],
@@ -10,7 +10,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['mkl', 'numpy.distutils', 'scipy', 'pandas', 'matplotlib', 'IPython', 'notebook', 'pytest', 'debugpy', 'pydevd'],
     noarchive=False,
     optimize=0,
 )

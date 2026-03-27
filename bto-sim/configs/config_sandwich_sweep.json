@@ -1,0 +1,38 @@
+{
+  "type": "bto_sandwich_sweep",
+  "schema_version": "0.2.0",
+
+  "structure_family": "sio2_patch",
+  "top_core_material": "sio2",
+  "spacer_material": "air",
+
+  "wavelength_um": 1.55,
+  "dx_um": 0.02,
+  "dy_um": 0.02,
+
+  "voltage_v": 3.0,
+  "phi_deg": 45.0,
+
+  "n_modes": 8,
+  "n_eff_guesses": [1.7, 1.9, 2.1],
+  "min_te_fraction": 0.85,
+
+  "time_limit_sec": 3600.0,
+  "top_k": 3,
+  "sweep_random_seed": null,
+
+  "geometry": {
+    "al2o3_thickness_um": 0.026,
+    "bto_thickness_um":   0.150,
+    "spacer_thickness_um": 0.050,
+    "top_width_um":       1.000,
+    "top_height_um":      0.150,
+    "electrode_gap_um":   4.400
+  },
+
+  "output": {
+    "output_dir": "",
+    "dir_prefix": "bto_sandwich_sweep",
+    "save_json":  "sweep_report.json"
+  }
+}

@@ -1,0 +1,101 @@
+========================================================================
+claude-runner — Task Report
+========================================================================
+Task:              bto-runner
+Status:            COMPLETE
+Started:           2026-03-23 14:46:21 UTC
+Ended:             2026-03-24 01:52:56 UTC
+Duration:          11h 06m 35s
+Rate limit cycles: 0
+Context checkpts:  3
+Est. tokens used:  8452
+
+------------------------------------------------------------------------
+CHANGE SUMMARY
+------------------------------------------------------------------------
+.claude-runner/progress.log                        |   2 +
+ .../inverse/__pycache__/solver.cpython-313.pyc     | Bin 8825 -> 8728 bytes
+ bto_runner/params/__init__.py                      |  10 ++--
+ bto_runner/params/loader.py                        |   8 +--
+ bto_runner/params/material.py                      |  11 ++--
+ bto_runner/params/types.py                         |  16 ++---
+ bto_runner/runner/__init__.py                      |   2 +-
+ bto_runner/runner/executor.py                      |  26 ++++-----
+ bto_runner/runner/logger.py                        |  14 ++---
+ .../strategies/__pycache__/base.cpython-313.pyc    | Bin 2270 -> 2225 bytes
+ .../__pycache__/bayesian.cpython-313.pyc           | Bin 3715 -> 3669 bytes
+ .../strategies/__pycache__/cmaes.cpython-313.pyc   | Bin 5909 -> 5862 bytes
+ .../strategies/__pycache__/hill.cpython-313.pyc    | Bin 5659 -> 5589 bytes
+ .../__pycache__/registry.cpython-313.pyc           | Bin 2333 -> 2282 bytes
+ bto_runner/strategies/base.py                      |   8 +--
+ bto_runner/strategies/bayesian.py                  |  19 +++---
+ bto_runner/strategies/cmaes.py                     |  30 +++++-----
+ bto_runner/strategies/hill.py                      |  20 +++----
+ bto_runner/strategies/registry.py                  |   6 +-
+ designs_v2.1/CHANGES_v2.0_to_v2.1.md               |  32 +++++++++-
+ designs_v2.1/THREE_WAY_COMPARISON.md               |  65 ++++++++++++++++-----
+ 21 files changed, 167 insertions(+), 102 deletions(-)
+Untracked new files:
+  bto_runner/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/__pycache__/cli.cpython-313.pyc (new, untracked)
+  bto_runner/budget/__init__.py (new, untracked)
+  bto_runner/budget/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/budget/__pycache__/complexity.cpython-313.pyc (new, untracked)
+  bto_runner/budget/__pycache__/pid.cpython-313.pyc (new, untracked)
+  bto_runner/budget/complexity.py (new, untracked)
+  bto_runner/params/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/params/__pycache__/loader.cpython-313.pyc (new, untracked)
+  bto_runner/params/__pycache__/material.cpython-313.pyc (new, untracked)
+  bto_runner/params/__pycache__/space.cpython-313.pyc (new, untracked)
+  bto_runner/params/__pycache__/types.cpython-313.pyc (new, untracked)
+  bto_runner/runner/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  bto_runner/runner/__pycache__/executor.cpython-313.pyc (new, untracked)
+  bto_runner/runner/__pycache__/logger.cpython-313.pyc (new, untracked)
+  bto_runner/runner/__pycache__/scheduler.cpython-313.pyc (new, untracked)
+  output/phase8_run_debug2.jsonl (new, untracked)
+  output/phase8_tiny.jsonl (new, untracked)
+  tests/__pycache__/__init__.cpython-313.pyc (new, untracked)
+  tests/__pycache__/test_budget.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_executor.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_inverse.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_mock_sim.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_params.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_scheduler.cpython-313-pytest-8.3.4.pyc (new, untracked)
+  tests/__pycache__/test_strategies.cpython-313-pytest-8.3.4.pyc (new, untracked)
+
+--- git workflow ---
+Branch: bto-run/bto_runner-20260324_015309
+Commit: [bto-run/bto_runner-20260324_015309 76dd030] claude-runner: bto-runner
+ 47 files
+
+------------------------------------------------------------------------
+FAULT LOG
+------------------------------------------------------------------------
+[SUPERVISOR] Intake call failed: Supervisor LLM call failed (exit=1): Claude Code on Windows requires git-bash (https://git-scm.com/downloads/win). If installed but not in PATH, set environment variable pointing to your bash.exe, similar to: CLAUDE_CODE_GIT_BASH_PATH=C:\Program Files\Git\bin\bash.exe
+
+[SUPERVISOR] Pre-flight call failed: Supervisor LLM call failed (exit=1): Claude Code on Windows requires git-bash (https://git-scm.com/downloads/win). If installed but not in PATH, set environment variable pointing to your bash.exe, similar to: CLAUDE_CODE_GIT_BASH_PATH=C:\Program Files\Git\bin\bash.exe
+
+
+------------------------------------------------------------------------
+PROGRESS LOG
+------------------------------------------------------------------------
+# claude-runner progress log
+# Task:    bto-runner
+# Started: 2026-03-23 14:46:22 UTC
+#
+# Format:
+#   [TIMESTAMP] [PHASE]    Description of current state
+#   [TIMESTAMP] [DONE]     Description of completed step
+#   [TIMESTAMP] [BLOCK]    Description of a blocker or open question
+#   [TIMESTAMP] [DECISION] Rationale for a choice made
+#
+[2026-03-23T14:46:49Z] [PHASE] Starting PHASE-1: Repository audit
+[2026-03-23T14:49:35Z] [DONE] PHASE-1: Audit complete, AUDIT.md committed
+[2026-03-23T14:49:35Z] [PHASE] Starting PHASE-2: Parameter types, space, material library, mock sim
+[2026-03-23T14:49:54Z] [DECISION] Model switched to claude-haiku-4-5-20251001: Haiku for audit — reading only, no generation
+[2026-03-23T14:53:54Z] [DECISION] Model switched to claude-opus-4-6: Opus for core architecture (params, budget, executor)
+[2026-03-23T15:00:55Z] [DECISION] Model switched to claude-sonnet-4-6: Sonnet for strategies, GUI, CLI, tests
+
+========================================================================
+END OF REPORT
+========================================================================

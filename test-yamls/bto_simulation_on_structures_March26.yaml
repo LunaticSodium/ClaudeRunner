@@ -1,0 +1,258 @@
+name: bto-simulation-on-structures-march26
+description: >-
+  Standalone BTO EO structure characterisation run — uses the existing
+  bto_runner package (already built) and a small autonomy script to sweep
+  8 BTO cladding/spacer configurations with the real FEM solver and produce
+  publication-ready plots.
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
+
+prompt: |
+  # BTO Structure Simulation — March 26 Run
+
+  ## Context
+
+  The `bto_runner/` package is already built and tested in this repo (branch: clauded).
+  Do NOT rebuild it. Do NOT touch any existing file outside `output/` and the
+  autonomy script you will create.
+
+  Your sole task: write and run a self-contained Python script
+  `run_structure_sim.py` at the repo root that characterises 8 BTO EO
+  structures using the real FEM solver and saves all plots + JSON results
+  to `output/plots/`.
+
+  ## Physics solver
+
+  ```python
+  import sys
+  sys.path.insert(0, 'bto-sim/py/solvers')
+  from BTO_Sandwich_Flat import CombinedBTOFlatThinFilmSolver
+  ```
+
+  CRITICAL — set EO coefficients BEFORE every `extract_key_metrics()` call:
+  ```python
+  solver.r42 = <r42_SI>   # SI: m/V  (923 pm/V → 923e-12)
+  solver.r51 = solver.r42
+  solver.orientation = 'a-axis'
+  solver.phi_deg = 0.0
+  ```
+
+  CRITICAL — NO RESULT REUSE:
+  All numerical results (VpiL, loss, n_eff, gamma) MUST come from live
+  solver calls in this session. Do NOT read or copy values from any file in
+  the workspace. Code architecture may reference prior work; output numbers
+  must not.
+
+  ## Structure configurations
+
+  | ID            | top_core | spacer  | spacer_thick_um | r42 pm/V |
+  |---------------|----------|---------|-----------------|----------|
+  | sin_patch     | sin      | air     | 0.0             | 923      |
+  | sio2_patch    | sio2     | air     | 0.0             | 923      |
+  | al2o3_patch   | al2o3    | air     | 0.0             | 923      |
+  | sin_sio2      | sio2     | sin     | 0.05            | 923      |
+  | sin_al2o3     | al2o3    | sin     | 0.05            | 923      |
+  | sio2_al2o3    | al2o3    | sio2    | 0.05            | 923      |
+  | al2o3_sio2    | sio2     | al2o3   | 0.05            | 923      |
+  | sin_patch_hq  | sin      | air     | 0.0             | 1340     |
+
+  Analytical reference lines only (NOT FEM — formula only):
+  ```python
+  # LNOI: r33=27 pm/V, n=2.14, Gamma=0.35
+  # SOH:  r33=150 pm/V, n=1.65, Gamma=0.45
+  VpiL_ref = (100 * 1.55 * g_um) / (n**3 * r33_pm_V * Gamma)
+  ```
+
+  ## Script structure (`run_structure_sim.py`)
+
+  Write a single script. No new packages — only stdlib + numpy + scipy +
+  matplotlib + concurrent.futures.
+
+  ### Step 0 — Sweet-spot 2D sweep
+
+  MESH RESOLUTION — MANDATORY:
+  Step 0 uses fine mesh: solver.mesh_dx = solver.mesh_dy = 0.01  (µm)
+  Step 1 uses coarse mesh: solver.mesh_dx = solver.mesh_dy = 0.02 (µm)
+  Set these BEFORE every solver call in each step. Do NOT use solver defaults.
+  Rationale: Step 0 locates the sweet-spot — accuracy matters (~10 min/call,
+  ~8 h total at 4 workers). Step 1 traces sweep shapes — coarse is sufficient
+  (~2 min/call, ~6 h total at 4 workers). Total estimated wall-clock: ~14 h.
+
+  5×5 grid per structure (200 total solver calls):
+  - `d_BTO`: [0.05, 0.15, 0.25, 0.35, 0.50] µm
+  - `w_rib`: [0.5, 0.75, 1.0, 1.5, 2.0] µm
+  - Fixed: electrode_gap=4.4 µm, voltage=5.0 V, phi_deg=0
+
+  Dispatch with `ProcessPoolExecutor(max_workers=4)`.
+
+  VpiL extraction (in order of preference):
+  1. Use `'v_pi_cm_V'` key from solver output if present
+  2. Otherwise: `VpiL = (100 * 1.55 * 4.4) / (n_eff**3 * r42_pm_V * 0.35)`
+
+  Find `(d*, w*) = argmin(VpiL)` per structure.
+  Save `output/plots/sweetspot_results.json`.
+  Print sweet-spot table before continuing.
+
+  ### Step 1 — 1D parameter sweeps (at sweet-spot operating point)
+
+  For each structure use `(d*, w*)` from Step 0.
+  Mesh resolution: solver.mesh_dx = solver.mesh_dy = 0.02 (coarse — sweep shapes only).
+
+  a. BTO thickness: linspace(0.05, 0.50, 20) µm — fixed w*, g=4.4, V=5
+  b. WG width:      linspace(0.5, 2.0, 20) µm  — fixed d*, g=4.4, V=5
+  c. Electrode gap: linspace(2.5, 10.0, 16) µm — fixed d*, w*, V=5
+  d. Crystal angle: linspace(0, 90, 19) deg     — set solver.phi_deg each iter;
+     r42_eff = r42 * cos(phi_rad)**2
+  e. Voltage:       linspace(1, 15, 15) V        — plot delta_neff only
+
+  Use `ProcessPoolExecutor(max_workers=4)` for each sweep.
+
+  ### Step 2 — Literature comparison
+
+  Extract sweet-spot VpiL and compare against:
+  - sin_patch (923):    0.05 – 0.50 V·cm  [Eltes APL 2019]
+  - sin_patch_hq (1340): 0.03 – 0.30 V·cm [Eltes Nat.Mat. 2020]
+  - LNOI (analytical):  1.0  – 6.0  V·cm  [Wang Nat.Photon. 2018]
+  - SOH  (analytical):  0.10 – 1.5  V·cm  [Lauermann Optica 2016]
+
+  `within_order`: True if VpiL ∈ [target_min/10, target_max×10]
+  Save `output/plots/literature_comparison.json`.
+  If any within_order=False: print MISMATCH WARNING and check:
+    1. solver.r42 in SI (m/V) before extract_key_metrics()?
+    2. VpiL key correct? Try both 'v_pi_cm_V' and 'v_pi_V'*g_cm
+    3. solver.phi_deg=0?
+
+  ### Step 3 — Plots
+
+  Minimum 11 PNG files in `output/plots/`.
+  Style: figsize=(10,6), dpi=150, tight_layout(), log-y for VpiL.
+  Legend: "{id} (r42={r42} pm/V)"; analytical refs as dashed lines.
+  Axis labels with units. Grid on.
+  Use `open(path, 'w', encoding='utf-8')` for all file writes.
+
+  Required plots:
+  - sweetspot_vpil.png          (bar chart: best VpiL per structure)
+  - literature_comparison.png   (simulation vs literature ranges)
+  - vpiL_vs_bto_thickness.png
+  - loss_vs_bto_thickness.png
+  - vpiL_vs_wg_width.png
+  - loss_vs_wg_width.png
+  - vpiL_vs_electrode_gap.png
+  - vpiL_vs_crystal_angle.png
+  - delta_neff_vs_voltage.png
+  - neff_vs_loss.png            (scatter: n_eff vs loss, coloured by VpiL)
+  - geometry_sensitivity.png    (BTO thickness vs width, coloured by VpiL)
+
+  ### Step 4 — Commit
+
+  ```
+  git add run_structure_sim.py output/plots/
+  git commit -m "PHASE-1: BTO structure sim complete — 8 configs, real FEM, March 26"
+  ```
+
+  Then print `##RUNNER:COMPLETE##`.
+
+# ── Context anchors ───────────────────────────────────────────────────────────
+
+context_anchors: |
+  Repo: BTO_Modulators_Simulator, branch clauded
+  bto_runner/ already exists — do NOT rebuild it
+  Task: write run_structure_sim.py only
+  FEM solver: sys.path.insert(0,'bto-sim/py/solvers'); from BTO_Sandwich_Flat import CombinedBTOFlatThinFilmSolver
+  r42 in SI (m/V): 923 pm/V → 923e-12; set solver.r42 BEFORE every extract_key_metrics()
+  VpiL key: try 'v_pi_cm_V' first; fallback analytical: (100*1.55*4.4)/(n_eff**3*r42_pm_V*0.35)
+  Parallelism: ProcessPoolExecutor(max_workers=4) — mandatory for all sweep steps
+  Mesh resolution: Step 0 → dx=dy=0.01 µm (fine, ~10 min/call); Step 1 → dx=dy=0.02 µm (coarse, ~2 min/call)
+  NO RESULT REUSE: all numbers must come from live solver calls this session
+  Output: output/plots/ — minimum 11 PNG + sweetspot_results.json + literature_comparison.json
+  File writes: open(path,'w',encoding='utf-8') — no sys.stdout for logging
+
+# ── Protocol ──────────────────────────────────────────────────────────────────
+
+cccs:
+  preset: cccs-v1.0
+  profile: scisim
+
+marathon_mode: false
+
+# ── Model schedule ────────────────────────────────────────────────────────────
+
+model_schedule:
+  poll_interval_seconds: 30
+  rules:
+    - triggers:
+        - phase_gte: 0
+      action:
+        model_id: claude-sonnet-4-6
+        message: "Sonnet from start — single-phase production run"
+
+    - triggers:
+        - token_pct_gte: 0.80
+      action:
+        model_id: claude-sonnet-4-6
+        message: "Context near limit — maintaining Sonnet"
+
+# ── Sandbox ───────────────────────────────────────────────────────────────────
+
+sandbox:
+  backend: native
+  working_dir: .
+
+# ── Execution ─────────────────────────────────────────────────────────────────
+
+execution:
+  timeout_hours: 96
+  max_rate_limit_waits: 50
+  skip_permissions: true
+  resume_strategy: restate
+  silence_timeout_minutes: 2880
+
+  milestones:
+    - pattern: "sweetspot_results.json"
+      message: "Step 0 done — sweet-spot 2D sweep complete (~8h mark)"
+    - pattern: "PHASE-1:"
+      message: "Structure sim complete — all plots generated"
+
+  context:
+    checkpoint_threshold_tokens: 80000
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+output:
+  git:
+    enabled: true
+    auto_push: false
+    remote_url: https://github.com/LunaticSodium/BTO_Modulators_Simulator.git
+    branch_prefix: bto-sim/
+
+# ── ntfy.sh ───────────────────────────────────────────────────────────────────
+
+ntfy:
+  out_channel: claude-runner-honacoo
+  cmd_channel: claude-runner-honacoo-cmd
+
+notify:
+  on: [start, complete, error, rate_limit, milestone, resume]
+  channels:
+    - type: desktop
+    - type: webhook
+      url: https://ntfy.sh/claude-runner-honacoo
+
+# ── Acceptance criteria ───────────────────────────────────────────────────────
+
+acceptance_criteria:
+  on_failure: retry
+  max_retries: 2
+  checks:
+    - type: file_exists
+      path: output/plots/sweetspot_results.json
+    - type: file_exists
+      path: output/plots/literature_comparison.json
+    - type: command
+      run: "python -c \"import pathlib,sys; d=pathlib.Path('output/plots'); pngs=list(d.glob('*.png')) if d.exists() else []; n=len(pngs); print('Plots:', n); [print(' ', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=11 else 1)\""
+      expect_exit: 0
+    - type: command
+      run: "python -c \"import json,sys; data=json.load(open('output/plots/literature_comparison.json')); mismatches=[r['structure'] for r in data if not r.get('within_order',True)]; print('Mismatches:', mismatches or 'none'); sys.exit(0)\""
+      expect_exit: 0
+    - type: file_exists
+      path: run_structure_sim.py
