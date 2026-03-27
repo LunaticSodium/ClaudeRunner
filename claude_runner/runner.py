@@ -465,6 +465,11 @@ class TaskRunner:
         finally:
             await self._cleanup()
 
+        # Write a human-readable final state summary into the workspace so it
+        # is visible alongside the output artifacts (the authoritative state
+        # lives in ~/.claude-runner/state/ but is hard to find).
+        self._write_final_state_summary(result)
+
         return result
 
     # ------------------------------------------------------------------
@@ -1260,6 +1265,10 @@ class TaskRunner:
             implementation_constraints=impl_constraints or None,
         )
 
+        # Persist acceptance results to the workspace audit directory so the
+        # human can inspect them after the run without digging into runner state.
+        self._write_acceptance_results(check_result, working_dir)
+
         if check_result.passed:
             logger.info("[ACCEPTANCE] All checks passed.")
             return await self._handle_completion()
@@ -1288,6 +1297,53 @@ class TaskRunner:
         if criteria.on_failure in ("retry", "notify"):
             await self._dispatch("error", {"error": msg, "task": self._book.name})
         return self._make_result("failed", error_message=msg)
+
+    def _write_final_state_summary(self, result) -> None:
+        """Write a human-readable final state file into the workspace."""
+        import json as _json  # noqa: PLC0415
+        try:
+            working_dir = self._working_dir()
+            cr_dir = working_dir / ".claude-runner"
+            cr_dir.mkdir(parents=True, exist_ok=True)
+            summary = {
+                "task": self._book.name,
+                "status": result.status if result else "unknown",
+                "started": self._start_time.isoformat() if self._start_time else None,
+                "finished": datetime.now(tz=timezone.utc).isoformat(),
+                "rate_limit_cycles": self._rate_limit_cycles,
+                "acceptance_retries": self._acceptance_retries,
+                "checkpoint_count": self._context_manager.checkpoint_count if self._context_manager else 0,
+                "fault_log": self._fault_log,
+                "error": result.error_message if result and hasattr(result, "error_message") else None,
+            }
+            (cr_dir / "final_state.json").write_text(
+                _json.dumps(summary, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info("Final state summary written to .claude-runner/final_state.json")
+        except Exception as exc:
+            logger.warning("Failed to write final state summary: %s", exc)
+
+    def _write_acceptance_results(self, check_result, working_dir) -> None:
+        """Write acceptance check results to audit/acceptance_results.json."""
+        import json as _json  # noqa: PLC0415
+        try:
+            audit_dir = working_dir / "audit"
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            result_data = {
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "passed": check_result.passed,
+                "failed_checks": check_result.failed_checks,
+                "details": check_result.details,
+                "retry_attempt": self._acceptance_retries,
+            }
+            (audit_dir / "acceptance_results.json").write_text(
+                _json.dumps(result_data, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info("[ACCEPTANCE] Results written to audit/acceptance_results.json")
+        except Exception as exc:
+            logger.warning("[ACCEPTANCE] Failed to write results file: %s", exc)
 
     async def _launch_acceptance_retry(self, check_result) -> None:
         """
@@ -1593,13 +1649,31 @@ class TaskRunner:
             freshly_initted = True
             logger.info("Git workflow: initialised new repo in %s", working_dir)
 
-        # --- Write .gitattributes for fresh repos -------------------------
+        # --- Write .gitattributes and .gitignore for fresh repos -----------
         # Only written when we just called git init (new workspace with no
         # prior git history).  Existing repos — including those where Claude
         # cloned or pulled code from GitHub during the task — are left alone
         # so we don't override their established line-ending conventions.
         if freshly_initted:
             _write_gitattributes(working_dir)
+            # Ensure common build artifacts are never committed.
+            gitignore_path = Path(working_dir) / ".gitignore"
+            if not gitignore_path.exists():
+                gitignore_path.write_text(
+                    "# claude-runner internals\n"
+                    ".claude-runner/\n"
+                    "\n"
+                    "# Build / runtime artifacts\n"
+                    "__pycache__/\n"
+                    "*.pyc\n"
+                    "*.pyd\n"
+                    "*.exe\n"
+                    "dist/\n"
+                    "build/\n"
+                    ".pytest_cache/\n",
+                    encoding="utf-8",
+                )
+                logger.info("Git workflow: wrote .gitignore for fresh repo.")
 
         # --- Configure remote origin from remote_url (if given) ----------
         if remote_url:

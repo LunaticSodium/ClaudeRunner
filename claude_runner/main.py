@@ -1099,9 +1099,20 @@ context resets.
             try:
                 import subprocess as _sp  # noqa: PLC0415
                 _sp.run(["git", "init", str(work_dir)], check=True, capture_output=True)
-                # Basic .gitignore
+                # Basic .gitignore — exclude runner internals and common build artifacts
                 (work_dir / ".gitignore").write_text(
-                    "# claude-runner internals\n.claude-runner/\n", encoding="utf-8"
+                    "# claude-runner internals\n"
+                    ".claude-runner/\n"
+                    "\n"
+                    "# Build / runtime artifacts\n"
+                    "__pycache__/\n"
+                    "*.pyc\n"
+                    "*.pyd\n"
+                    "*.exe\n"
+                    "dist/\n"
+                    "build/\n"
+                    ".pytest_cache/\n",
+                    encoding="utf-8",
                 )
                 # Initial commit with .gitignore and .claude/ scaffold.
                 _sp.run(

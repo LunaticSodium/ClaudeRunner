@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -165,6 +166,9 @@ class ContextManager:
         # Checkpoint response exclusion: while True, count_output() is a no-op
         # so Claude's checkpoint-response tokens don't inflate the estimate.
         self._in_checkpoint: bool = False
+        self._in_checkpoint_since: float = 0.0  # monotonic time when checkpoint started
+        _CHECKPOINT_TIMEOUT_S = 60.0  # auto-reset if signal not detected within this window
+        self._checkpoint_timeout_s: float = _CHECKPOINT_TIMEOUT_S
         # Becomes True when a blank line or "Then continue" appears in output
         # while _in_checkpoint is set; the next non-empty line clears both.
         self._checkpoint_saw_signal: bool = False
@@ -223,8 +227,17 @@ class ContextManager:
             return
         # While Claude is writing its checkpoint response, skip token counting
         # so the response itself does not push us immediately over threshold again.
+        # Safety: auto-reset after timeout so a missed signal never freezes counting forever.
         if self._in_checkpoint:
-            return
+            if (time.monotonic() - self._in_checkpoint_since) > self._checkpoint_timeout_s:
+                logger.warning(
+                    "Checkpoint response timeout (%.0fs) — signal was never detected. "
+                    "Resuming token counting.",
+                    self._checkpoint_timeout_s,
+                )
+                self.acknowledge_checkpoint_end()
+            else:
+                return
         tokens = _chars_to_tokens(len(text))
         with self._lock:
             self._token_estimate += tokens
@@ -307,6 +320,7 @@ class ContextManager:
         # a signal that it has finished (blank line, "Then continue", or the
         # next substantive output line after either of those).
         self._in_checkpoint = True
+        self._in_checkpoint_since = time.monotonic()
         self._checkpoint_saw_signal = False
         logger.info("Token counter reset after checkpoint injection (checkpoint #%d).", self._checkpoint_count)
 
@@ -394,6 +408,16 @@ class ContextManager:
                     "inject_log_on_resume is True but progress.log is empty/missing — "
                     "no log prepended."
                 )
+
+        # Append progress-log maintenance reminder so the worker continues
+        # writing structured entries even after model switches / rate-limit
+        # resumes (the original _PROGRESS_LOG_INSTRUCTION is only in the
+        # initial prompt and is lost on context reset).
+        core += (
+            "\n\nREMINDER: Continue maintaining `.claude-runner/progress.log` "
+            "with `[TIMESTAMP] [PHASE/DONE/BLOCK/DECISION] description` entries "
+            "for every significant action."
+        )
 
         # Prepend context_anchors last so they always appear at the very top,
         # regardless of strategy or inject_log_on_resume ordering.
