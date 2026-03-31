@@ -264,7 +264,9 @@ def run_step1(sweetspots):
                 elif pname == 'gap':    gap = val
                 elif pname == 'phi':
                     phi = val
-                    r42 = struct['r42_pm_V'] * math.cos(math.radians(val))**2 * 1e-12
+                    # Do NOT multiply r42 by cos²(phi) — the solver's _get_rotations()
+                    # handles full Pockels tensor rotation internally. External multiplication
+                    # would double-count the angular dependence.
                 elif pname == 'voltage': V = val
                 tasks.append((struct['top_core'], struct['spacer'], struct['spacer_thick'],
                               d, w, gap, V, phi, r42, MESH))
@@ -390,8 +392,8 @@ def run_step3(sweetspots, grid_map, sweep_results, lit_out, VpiL_LNOI, VpiL_SOH)
              'Electrode gap (um)', 'VpiL (V*cm)', 'VpiL vs Electrode Gap', 'vpiL_vs_electrode_gap.png', True)
 
     def _vpil_phi(s, m, phi):
-        r42_eff = s['r42_pm_V'] * math.cos(math.radians(phi))**2
-        return calc_vpil(m, r42_eff) if r42_eff > 1e-6 else float('nan')
+        # Use nominal r42 — solver already applies tensor rotation internally
+        return calc_vpil(m, s['r42_pm_V'])
     _plot_1d(_sweep_series(sweep_results, 'phi', _vpil_phi),
              'Crystal angle phi (deg)', 'VpiL (V*cm)', 'VpiL vs Crystal Angle', 'vpiL_vs_crystal_angle.png', True)
 
