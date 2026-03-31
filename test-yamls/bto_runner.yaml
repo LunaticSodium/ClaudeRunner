@@ -1,501 +1,342 @@
-name: bto-runner
+name: bto-runner-bo
 description: >-
-  BTO Simulation Runner — Python optimisation layer that extends the existing
-  BTO_Modulators_Simulator with a typed mixed-parameter space, three auto-selected
-  search strategies (Hill Climbing / Bayesian-TPE / CMA-ES), budget/PID management,
-  an inverse solver, parametric geometry, and a Tkinter GUI. Wraps either the
-  existing ML surrogate or a real simulator subprocess as the evaluation back-end.
+  BTO Mode-Tracking BO Run — diagnoses and fixes the mode selection heuristic
+  in the FDFD solver, runs Bayesian optimisation (Optuna TPE) on 8 BTO EO
+  structures to find optimal geometries with reliable mode tracking, then
+  generates publication-quality characterisation plots with literature comparison.
 
 # ── Tunable constants (search-replace these values to adjust) ─────────────────
-# PHASE8_MIN_EVALS  = 500    (appears in: prompt lines ~320,341,534; acceptance check)
-# PHASE8_BUDGET_H   = 10.0   (appears in: prompt line ~327)
+# BO_TIMEOUT_H      = 2.0     (per-structure BO timeout in hours)
+# BO_MAX_EVALS      = 150     (per-structure max evaluations)
+# BO_CONV_WINDOW    = 20      (convergence look-back window)
+# BO_CONV_REL_TOL   = 0.01    (1% relative improvement threshold)
+# BO_CONV_MIN_EVALS = 30      (minimum evals before convergence check)
+# MESH_RESOLUTION   = 0.02    (µm — ~13s/eval)
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
 prompt: |
-  # BTO Runner — Development Session
+  # BTO Mode-Tracking Bayesian Optimisation
 
-  ## Project overview
+  ## Context
 
-  You are extending the BTO_Modulators_Simulator repository (branch: clauded)
-  with a new Python sub-package `bto_runner/`. The existing code optimises BTO
-  electro-optic devices using pre-trained ML surrogate models (LGBM / XGBoost /
-  TF) via `Advanced_BTO_Optimizer_ML.py`. Do NOT move or rename any existing file.
+  The `bto-sim/` solver package is already built and committed. Do NOT move,
+  rename, or modify any existing file in `bto-sim/`. Your task: diagnose and
+  fix the mode selection problem, run BO on 8 structures, and produce
+  publication-quality plots.
 
-  ### Target architecture
+  ## Physics solver
 
-  ```
-  (existing files — untouched)
-  Advanced_BTO_Optimizer_ML.py
-  requirements.txt
-  ...
-
-  bto_runner/
-    __init__.py
-    params/
-      types.py       # BaseParam, ConstantParam, ScanParam, RangeParam, MaterialParam
-      space.py       # ParameterSpace, SpaceType, strategy_for_space()
-      material.py    # MaterialLibrary, MaterialEntry, materials.yaml
-    budget/
-      complexity.py  # ComplexityBudget
-      pid.py         # PIDEstimator
-    strategies/
-      base.py        # AbstractStrategy (ABC)
-      hill.py        # HillClimbingStrategy
-      bayesian.py    # BayesianStrategy (Optuna TPE)
-      cmaes.py       # CMAESStrategy (cma library)
-      registry.py    # STRATEGIES dict, auto_select()
-    inverse/
-      solver.py      # InverseSolver, InverseResult
-    geometry/
-      shapes.py      # Rectangle
-      builder.py     # ParametricGeometry
-    runner/
-      executor.py    # SimulationExecutor (subprocess | surrogate)
-      scheduler.py   # RunScheduler
-      logger.py      # RunLogger (JSONL)
-    gui/
-      app.py         # Tkinter GUI, six panels
-    cli.py           # Click CLI entry point
-  simulator/
-    mock_sim.py      # Deterministic multi-peaked mock, --seed, --delay
-  tests/
-    test_params.py
-    test_budget.py
-    test_executor.py
-    test_strategies.py
-    test_inverse.py
-    test_scheduler.py
+  ```python
+  import sys
+  sys.path.insert(0, 'bto-sim/py/solvers')
+  from BTO_Sandwich_Flat import CombinedBTOFlatThinFilmSolver
   ```
 
-  ### Strategy auto-selection rules
-
-  Auto-selection is based on the parameter space composition:
-
-  | Space type                          | Strategy   | Rationale                        |
-  |-------------------------------------|------------|----------------------------------|
-  | Any MaterialParam present           | TPE        | Native categorical support       |
-  | Pure continuous, dims < 15          | Bayesian   | Best eval efficiency             |
-  | Pure continuous, dims >= 15         | CMA-ES     | Scales better at high dims       |
-  | Any space (fallback / debug)        | Hill       | Always available                 |
-
-  `BayesianStrategy` and `tpe` both map to the same class (Optuna TPE sampler).
-  The sampler handles categoricals natively via `suggest_categorical`.
-
-  ### Simulation objectives (from existing code)
-  - Minimise switching voltage V_π (V)
-  - Minimise propagation loss (dB/cm)
-  - Maximise effective refractive index change Δn_eff
-  - Scalar score: `score = -w1*v_pi - w2*loss + w3*delta_n`
-    (weights configurable, default 1.0 each, normalised to [-1, 1])
-
-  ### Active parameter space (LHS fast solver, for reference)
-  | Parameter           | Range        | Type      |
-  |---------------------|--------------|-----------|
-  | bto_thickness_um    | [0.05, 0.5]  | RangeParam|
-  | width_um            | [0.5, 2.0]   | RangeParam|
-  | height_um           | [0.05, 0.35] | RangeParam|
-  | electrode_gap_um    | [2.5, 7.0]   | RangeParam|
-  | electrode_height_um | [0.1, 1.0]   | RangeParam|
-  | ridge_angle_deg     | [0.0, 35.0]  | RangeParam|
-  | crystal_angle_deg   | [0.0, 90.0]  | RangeParam|
-  | wavelength_um       | 1.55         | ConstantParam|
-
-  ## Your task
-
-  Review the full repository and implement bto_runner/ phase by phase.
-  Prefix every milestone commit with `PHASE-N:`.
-
-  ### PHASE 1 — Audit
-  - `find . -name "*.py" | sort`
-  - Read README and Advanced_BTO_Optimizer_ML.py entry point.
-  - Identify: parameter definition style, ML model load/call interface,
-    existing output format, any material values (n_optical, eps_r, tan_delta).
-  - Write AUDIT.md:
-      ## What exists
-      ## What is missing
-      ## Surrogate integration interface (how to call the existing model eval)
-      ## Material values found
-      ## Risk notes
-  - Commit: `PHASE-1: audit complete, AUDIT.md written`
-
-  ### PHASE 2 — Parameter types and space
-  Implement `bto_runner/params/` and `simulator/mock_sim.py`.
-
-  `BaseParam` (ABC): name, degrees_of_freedom(), sample(rng)
-  `ConstantParam`: value, dof=0, sample always returns value
-  `ScanParam`: start/step/stop, grid_values() -> np.arange, treated as discrete
-  `RangeParam`: low/high, linspace(n), one continuous dim
-  `MaterialParam`: allowed list of str keys, min_count/max_count, sample random
-
-  `ParameterSpace`:
-  - continuous_dims(), has_categoricals(), degrees_of_freedom()
-  - to_optuna_trial(trial) -> dict
-      RangeParam    -> suggest_float
-      ScanParam     -> suggest_int mapped to index into grid_values()
-      MaterialParam -> suggest_categorical
-      ConstantParam -> always returns value, no Optuna call
-  - materialise(optuna_params) -> flat JSON-serialisable dict
-
-  `SpaceType` enum + `strategy_for_space(space) -> str` per table above.
-
-  `MaterialLibrary`: loads from materials.yaml; fallback hardcoded defaults.
-  Check AUDIT.md "Material values found" first — use existing values for BTO/SiO2/Si.
-  Defaults if not found:
-    BTO:  n_optical=2.30, eps_r=1000.0, tan_delta=0.02
-    SiO2: n_optical=1.44, eps_r=3.9,    tan_delta=0.0001
-    Si:   n_optical=3.48, eps_r=11.7,   tan_delta=0.001
-    ITO:  n_optical=1.80, eps_r=9.0,    tan_delta=0.05
-    Au:   n_optical=0.18, eps_r=-10.0,  tan_delta=2.0
-    SiN:  n_optical=2.00, eps_r=7.5,    tan_delta=0.001
-
-  `mock_sim.py`:
-  - Reads JSON params from sys.argv[1]
-  - Multi-peaked landscape (PEAKS defined below); normalises RangeParam to [0,1]
-    PEAKS = [(0.78,0.22,10,0.035),(0.22,0.78,8,0.04),(0.18,0.18,6,0.04),
-             (0.72,0.72,5.5,0.04),(0.50,0.30,4,0.05),(0.35,0.62,3.5,0.05)]
-    score = sum(h*exp(-((x-cx)**2+(y-cy)**2)/(2*s**2))) + rng.normal(0,0.05)
-  - MaterialParam: score *= (1 + 0.1*(n_optical - 2.0))
-  - Accepts --seed INT (default 42), --delay FLOAT (default 5.0)
-  - Prints {"score": float, "duration_s": float, "seed": int}
-  - Same seed + same params MUST produce same score (determinism requirement)
-
-  Also create `tests/fixtures/` with two fixture files used by Phase 7 V&V:
-    tests/fixtures/space_continuous.yaml  — pure RangeParam space (7 dims, matches
-      the LHS fast solver table above); triggers Bayesian auto-select
-    tests/fixtures/space_mixed.yaml       — same dims + one MaterialParam
-      (material: [BTO, SiO2, Si]); triggers TPE auto-select
-
-  - Commit: `PHASE-2: param types, space, material library, mock sim`
-
-  ### PHASE 3 — Budget, PID, executor, logger
-  `ComplexityBudget`:
-  - total_hours=10.0
-  - n_evals(sim_time_minutes) = max(1, int((total_hours*60)/sim_time_minutes))
-    Note: the max(1,...) guard is mandatory — a single real sandwich sweep can
-    take 240–1440 min; without it n_evals returns 0 and the scheduler loop,
-    resolution calculation, and any downstream division all break silently
-  - range_resolution(n_dims) = max(3, int(n_evals(1.0)**(1/n_dims)))
-    Note: when n_evals==1 (budget < 1 eval), resolution falls to the floor of
-    3 — this is the correct graceful degradation: run at coarsest resolution
-    rather than crashing
-
-  `PIDEstimator`:
-  - Kp=0.4, Ki=0.1, Kd=0.05, setpoint=60s, clamp=[5, 86400]
-  - update(measured_seconds), reset(), estimated_seconds property
-  - Note: clamp upper bound is 86 400 s (24 h) — a single real sandwich sweep
-    can legitimately take up to 24 hours; clamping lower would permanently
-    corrupt the ETA and budget accounting
-
-  `SimResult` dataclass:
-    params, score, raw, duration_s, success, error, seed
-
-  `SimulationExecutor`:
-  - Backend "subprocess": serialise params to temp JSON, spawn sim_cmd,
-    parse stdout as JSON, no timeout (block until process exits naturally)
-  - Backend "surrogate": wrap existing ML model eval from AUDIT.md findings,
-    score = -w1*v_pi - w2*loss + w3*delta_n, normalised
-  - On non-zero exit or unparseable stdout: SimResult(success=False)
-  - If the process is still running when RunScheduler fires stop_event,
-    send SIGTERM and wait up to 5 s before SIGKILL (graceful shutdown only)
-  - Hard ceiling: if a single eval exceeds 86 400 s (24 h), send SIGTERM/SIGKILL,
-    return SimResult(success=False, error="EVAL_EXCEEDED_24H — human review required"),
-    print a clearly visible warning to stderr:
-      "⚠ EVAL EXCEEDED 24 H — simulation may be diverging or stalled.
-         Params logged to output/exceeded_24h.jsonl. Human review required."
-    append the params + timestamp to output/exceeded_24h.jsonl,
-    then HALT the RunScheduler (do not continue to next eval).
-    This is not an automatic retry condition — it requires a human decision.
-
-  `RunLogger`: JSONL, tail(n), best(k), statistics() -> {mean,std,min,max,count}
-
-  Commit: `PHASE-3: budget, PID, executor, logger`
-
-  ### PHASE 4 — Strategies and scheduler
-  `HillClimbingStrategy`:
-  - n_restarts=3, step_scale=0.12, max_no_improve=6
-  - Multi-start; 4 random neighbours per step; shrink step 0.82x on failure
-  - Ignores MaterialParam dims (holds at initial sampled value)
-
-  `BayesianStrategy`:
-  - optuna.create_study(direction="maximize", sampler=TPESampler())
-  - ask(n): study.ask() x n, store trial refs for tell()
-  - tell(params, score): study.tell(trial, score)
-
-  `CMAESStrategy`:
-  - cma library; normalise dims to [0,1]; initial sigma=0.3
-  - ask(n): es.ask() up to n candidates, de-normalise
-  - tell(batch, scores): es.tell(candidates, [-s for s in scores])
-  - Raises ValueError on mixed space (has MaterialParam)
-
-  `registry.py`:
-  - STRATEGIES = {"hill": ..., "bayesian": ..., "tpe": ..., "cmaes": ...}
-  - auto_select(space, override=None) -> AbstractStrategy instance
-
-  `RunScheduler`:
-  - Loop: ask(1) -> run -> log -> tell -> pid.update -> emit progress to stderr
-  - ETA = remaining_budget / pid.estimated_seconds
-  - Respects stop_event; finishes current sim before exiting
-
-  Commit: `PHASE-4: all strategies, auto-select, scheduler`
-
-  ### PHASE 5 — Inverse solver and geometry
-  `InverseResult`: free_param, target_score, best_value, best_score,
-    scan_values, scan_scores, interpolated_crossing
-
-  `InverseSolver`:
-  - solve(base_params, target_score, free_param, n_samples=40)
-  - solve_all(base_params, target_score) sorted by abs(best_score - target_score)
-
-  `Rectangle`: name, material, width (Range|Constant), height (Range|Constant)
-  `ParametricGeometry`:
-  - to_space(), validate_material_constraints(), render() -> Figure
-
-  Commit: `PHASE-5: inverse solver, parametric geometry`
-
-  ### PHASE 6 — GUI
-  Tkinter + ttk, notebook, six panels, all long ops in daemon threads + queue.Queue.
-
-  Panel 1 — Parameters: per-type widgets, Load/Save YAML,
-    "Auto-select strategy" label that updates on param change.
-  Panel 2 — Budget: hours spinbox, live PID estimate label, n_evals label,
-    strategy combobox [auto/hill/bayesian/tpe/cmaes], backend combobox,
-    subprocess cmd entry.
-  Panel 3 — Run: [Run]/[Abort], progress bar, scrolling log (30 lines),
-    current best score label.
-  Panel 4 — Results: Treeview (rank/score/strategy/duration/params),
-    [Show inverse] button, [Export CSV].
-  Panel 5 — Geometry: shape slots, validate, preview canvas, export to params.
-  Panel 6 — Legacy: wrap Advanced_BTO_Optimizer_ML.py with its CLI args,
-    stream stdout to Text widget.
-  InverseDialog: modal, free param dropdown, compute thread, results treeview,
-    embedded score-vs-value plot.
-
-  Commit: `PHASE-6: GUI all panels functional`
-
-  ### PHASE 7 — CLI, pyproject, README, V&V gate
-  `bto-runner` Click CLI:
-    run     --space YAML --budget HOURS [--strategy NAME] [--sim-cmd CMD]
-            [--log FILE] [--seed INT]
-            (create parent directories for --log automatically if missing)
-    gui     [--space YAML]
-    inverse --space YAML --log JSONL --target SCORE [--param NAME]
-    validate --space YAML  (prints SpaceType + auto-selected strategy, exits 0/1)
-    legacy  [-- ARGS...]
-
-  pyproject.toml (preserve all requirements.txt entries):
-    dependencies: numpy>=1.26, scipy>=1.12, optuna>=3.6, cma>=3.3,
-                  click>=8.1, pyyaml>=6.0, matplotlib>=3.8, pydantic>=2.6
-    dev: pytest>=7.0, pytest-cov, ruff, mypy
-
-  Update README: add "bto_runner extension" section at top, preserve existing.
-
-  V&V gate (all must pass before final commit):
-  - pytest tests/ (all green)
-  - ruff check bto_runner/
-  - mypy bto_runner/ --strict
-  - python -m bto_runner.cli validate --space tests/fixtures/space_continuous.yaml
-  - python -m bto_runner.cli validate --space tests/fixtures/space_mixed.yaml
-
-  Commit: `PHASE-7: CLI, pyproject, README, all V&V gates passing`
-
-  ### PHASE 8 — Sustained simulation run
-
-  Step 1 — Smoke-test (~36 evals, ~3 min):
-    mkdir -p output
-    python -m bto_runner.cli run \
-      --space tests/fixtures/space_continuous.yaml \
-      --budget 0.05 \
-      --sim-cmd "python simulator/mock_sim.py --delay 5.0 --seed 42" \
-      --log output/phase8_smoke.jsonl --seed 42
-  Verify output/phase8_smoke.jsonl has at least 5 lines.
-  Fix any issues before proceeding.
-
-  Step 2 — Full run:
-    python -m bto_runner.cli run \
-      --space tests/fixtures/space_continuous.yaml \
-      --budget 10.0 \
-      --sim-cmd "python simulator/mock_sim.py --delay 5.0 --seed 42" \
-      --log output/phase8_run.jsonl --seed 42
-  Run as a foreground process and wait for it to complete.
-
-  Step 3 — Report:
-    Print total evals, best score, wall-clock time, and log file path.
-
-  Commit: `PHASE-8: 10-hour simulation run complete`
-
-  ### PHASE 9 — Scientific EO structure characterisation
-
-  ENVIRONMENT: Python with numpy, scipy, matplotlib, optuna, cma installed.
-  Run `pip install -e .` once if bto_runner is not yet importable.
-
-  Physics solver import (copy exactly):
-    import sys
-    sys.path.insert(0, 'bto-sim/py/solvers')
-    from BTO_Sandwich_Flat import CombinedBTOFlatThinFilmSolver
-
-  TASK: characterise how EO performance depends on the dielectric stack on top
-  of the BTO film (top-core material and spacer layer). The "structures" here
-  are different cladding/spacer combinations around the SAME BTO film -- this
-  is NOT about replacing BTO with a different EO platform. LNOI and SOH appear
-  as dashed analytical reference lines only for context.
-
-  ── Structure configurations (8 BTO structures using the FEM solver) ──────────
-
-  CombinedBTOFlatThinFilmSolver accepts top_core_material in {'sin','sio2','al2o3'}
-  and spacer_material in {'air','sio2','al2o3','sin','water'}.
-
-  CRITICAL: set EO coefficients BEFORE calling extract_key_metrics():
-    solver.r42 = <r42_SI>   # SI units: m/V  (e.g. 923e-12 for 923 pm/V)
-    solver.r51 = solver.r42
-    solver.orientation = 'a-axis'
-    solver.phi_deg = 0.0    # optimal alignment; varies only in sweep d
-
-  Structure table:
-    ID              top_core_material  spacer_material  spacer_thickness_um  r42 pm/V  Reference
-    sin_patch       'sin'              'air'            0.0                  923       Eltes APL 2019
-    sio2_patch      'sio2'             'air'            0.0                  923
-    al2o3_patch     'al2o3'            'air'            0.0                  923
-    sin_sio2        'sio2'             'sin'            0.05                 923
-    sin_al2o3       'al2o3'            'sin'            0.05                 923
-    sio2_al2o3      'al2o3'            'sio2'           0.05                 923
-    al2o3_sio2      'sio2'             'al2o3'          0.05                 923
-    sin_patch_hq    'sin'              'air'            0.0                  1340      Eltes Nat.Mat. 2020
-
-  Analytical reference lines only (formula, NOT the FEM solver):
-    LNOI: r33=27 pm/V, n=2.14, Gamma=0.35  [Wang et al., Nat.Photon. 2018]
-    SOH:  r33=150 pm/V, n=1.65, Gamma=0.45 [Lauermann et al., Optica 2016]
-    VpiL_Vcm = (100 * 1.55 * g_um) / (n**3 * r33_pm_V * Gamma)
-    # units: lambda[um]*g[um] / (n^3 * r33[pm/V] * Gamma) * 100 = V*cm
-    # (the 1e-6 from um and 1e-12 from pm/V cancel; *100 converts m->cm)
-
-  ── Step 0: Sweet-spot 2D sweep (find optimal operating point) ───────────────
-
-  For each of the 8 BTO structures, do a coarse 5x5 grid sweep:
-    d_BTO : [0.05, 0.15, 0.25, 0.35, 0.50] um   (5 values)
-    w_rib : [0.5, 0.75, 1.0, 1.5, 2.0] um        (5 values)
-    Fixed : electrode_gap=4.4, voltage=5.0 V, phi_deg=0
-
-  Build a flat param_list of all (structure, d, w) combos and dispatch with
-  ProcessPoolExecutor(max_workers=4) per the parallelism standard in CLAUDE.md.
-  Preferred VpiL key: 'v_pi_cm_V'. If absent, compute:
-    VpiL = (100 * 1.55 * 4.4) / (n_eff**3 * r42_pm_V * 0.35)
-  Record vpiL, loss ('loss_base_db_cm'), n_eff ('n_eff_base').
-
-  After the grid: find (d*, w*) = argmin(vpiL) for each structure.
-  Save output/plots/sweetspot_results.json:
-    {"sin_patch": {"d_opt_um": 0.15, "w_opt_um": 1.0, "vpiL_min_Vcm": 0.23,
-                   "loss_dBcm": 0.6, "n_eff": 2.05}, ...}
-  Print the sweet-spot table before proceeding.
-  Total: 200 solver calls, 4 workers -> ~3 min (vs ~15 min single-threaded).
-
-  ── Step 1: 1D sweeps using sweet-spot as fixed operating point ─────────────
-
-  For each structure, use (d*, w*) from Step 0 as the base operating point.
-
-  a. BTO thickness: linspace(0.05, 0.50, 20) um
-     Fixed: w=w*, g=4.4, V=5.0
-     Output: vpiL_vs_bto_thickness.png, loss_vs_bto_thickness.png,
-             neff_vs_bto_thickness.png
-
-  b. WG width: linspace(0.5, 2.0, 20) um
-     Fixed: d=d*, g=4.4, V=5.0
-     Output: vpiL_vs_wg_width.png, loss_vs_wg_width.png, neff_vs_wg_width.png
-
-  c. Electrode gap: linspace(2.5, 10.0, 16) um
-     Fixed: d=d*, w=w*, V=5.0
-     Physics check: VpiL should be approximately linear with g.
-     Output: vpiL_vs_electrode_gap.png, loss_vs_electrode_gap.png
-
-  d. Crystal angle: linspace(0, 90, 19) deg
-     Set solver.phi_deg = phi each iteration.
-     a-axis EO: r42_eff = r42 * cos(phi_rad)**2 (set solver.r42 each iteration)
-     Fixed: d=d*, w=w*, g=4.4
-     Output: vpiL_vs_crystal_angle.png, loss_vs_crystal_angle.png
-
-  e. Applied voltage: linspace(1, 15, 15) V
-     Plot delta_neff only (VpiL is independent of V):
-       delta_neff = n_eff**3 * r42_eff * V / (2 * g_um * 1e-6) / 2  (approx)
-     Fixed: d=d*, w=w*, g=4.4
-     Output: delta_neff_vs_voltage.png
-
-  Plot style: figsize=(10,6), dpi=150, tight_layout(), log-y scale for VpiL.
-  Legend: "{structure_id} (r42={r42} pm/V)"; analytical refs as dashed lines.
-  Axis labels with units (um, V.cm, dB/cm). Grid on.
-  IMPORTANT: write log via open(path,'w',encoding='utf-8') -- do NOT use
-  sys.stdout.write for logging (cp1252 crash on Windows with non-ASCII chars).
-
-  Minimum 11 PNG files in output/plots/.
-
-  ── Step 2: Literature comparison ────────────────────────────────────────────
-
-  Extract the sweet-spot VpiL from sweetspot_results.json and compare:
-    sin_patch (r42=923):     target 0.05 - 0.50 V.cm  Eltes APL 2019
-    sin_patch_hq (r42=1340): target 0.03 - 0.30 V.cm  Eltes Nat.Mat. 2020
-    LNOI (analytical):       target 1.0  - 6.0  V.cm  Wang Nat.Photon. 2018
-    SOH (analytical):        target 0.10 - 1.5  V.cm  Lauermann Optica 2016
-
-  Write output/plots/literature_comparison.json as a list:
-    [{"structure": "sin_patch", "vpiL_Vcm": <val>,
-      "target_min": 0.05, "target_max": 0.50,
-      "within_order": <bool>,  # true if vpiL in [target_min/10, target_max*10]
-      "reference": "Eltes APL 2019"}, ...]
-
-  If any BTO structure has within_order=false, print MISMATCH WARNING and debug:
-    1. Was solver.r42 set in SI units (m/V) BEFORE extract_key_metrics()?
-       r42=923 pm/V means solver.r42 = 923e-12  (NOT 923)
-    2. Is the VpiL key correct? Try both 'v_pi_cm_V' and 'v_pi_V'*g_cm
-    3. Is solver.phi_deg=0 (optimal alignment)?
-  Fix the issue and re-run the failing structure before committing.
-
-  ── Step 3: Commit ───────────────────────────────────────────────────────────
-
-  git add output/plots/ output/generate_plots.py
-  git commit -m "PHASE-9: EO structure characterisation, 8 BTO configs x 5 sweeps + lit. comparison"
+  CRITICAL — set EO coefficients BEFORE every `extract_key_metrics()` call:
+  ```python
+  solver.r42 = <r42_SI>   # SI: m/V  (923 pm/V → 923e-12)
+  solver.r51 = solver.r42
+  solver.orientation = 'a-axis'
+  solver.phi_deg = 0.0
+  ```
+
+  CRITICAL — NO RESULT REUSE:
+  All numerical results must come from live solver calls in this session.
+  Do NOT read or copy values from any file in the workspace.
+
+  ## Known problem: mode selection
+
+  The solver's `find_fundamental_mode_index()` (~line 1277) uses a heuristic
+  `score = 0.7 * confinement + 0.3 * centering` to pick the fundamental TE0
+  mode. This MISIDENTIFIES the target mode for low-index-contrast structures
+  (sio2_patch, al2o3_patch at d_BTO=0.25µm), selecting HE1 instead of TE0.
+  When this happens, VpiL and gamma values are unreliable.
+
+  The solver has TWO existing methods that can help:
+  - `track_mode_from_reference(ref_Ex, ref_Ey)` — tracks a mode across
+    parameter changes by computing overlap integrals with a reference field
+  - `select_seed_mode_max_topconf()` — selects the mode with maximum
+    field confinement in the top core region
+
+  Your FIRST task is to understand these methods, test them on known-failing
+  cases, and build a robust mode selection wrapper for BO evaluations.
+
+  ## Structure configurations (8 BTO structures)
+
+  CombinedBTOFlatThinFilmSolver accepts top_core_material in
+  {'sin','sio2','al2o3'} and spacer_material in {'air','sio2','al2o3','sin'}.
+
+  ### Patch structures (no spacer)
+
+  | ID            | top_core | spacer | spacer_thick_um | r42 pm/V | Reference          |
+  |---------------|----------|--------|-----------------|----------|--------------------|
+  | sin_patch     | sin      | air    | 0.0             | 923      | Eltes APL 2019     |
+  | sio2_patch    | sio2     | air    | 0.0             | 923      |                    |
+  | al2o3_patch   | al2o3    | air    | 0.0             | 923      |                    |
+  | sin_patch_hq  | sin      | air    | 0.0             | 1340     | Eltes Nat.Mat. 2020|
+
+  ### Sandwich structures (with spacer)
+
+  | ID            | top_core | spacer | r42 pm/V |
+  |---------------|----------|--------|----------|
+  | sin_sio2      | sio2     | sin    | 923      |
+  | sin_al2o3     | al2o3    | sin    | 923      |
+  | sio2_al2o3    | al2o3    | sio2   | 923      |
+  | al2o3_sio2    | sio2     | al2o3  | 923      |
+
+  ## Fixed parameters
+
+  ```python
+  ELECTRODE_GAP    = 4.4    # µm (Eltes APL 2019)
+  VOLTAGE          = 5.0    # V
+  MESH             = 0.02   # µm (~13s/eval)
+  ```
+
+  ## BO parameter space
+
+  Patch structures — 3 continuous dimensions:
+  ```python
+  bto_thickness_um  : [0.05,  0.50]
+  sin_rib_width     : [0.5,   3.0]
+  sin_rib_height    : [0.05,  0.35]
+  ```
+
+  Sandwich structures — 4 continuous dimensions:
+  ```python
+  bto_thickness_um  : [0.05,  0.50]
+  sin_rib_width     : [0.5,   3.0]
+  sin_rib_height    : [0.05,  0.35]
+  spacer_thickness  : [0.02,  0.20]
+  ```
+
+  Fixed for all: electrode_gap=4.4, voltage=5.0, phi_deg=0.
+
+  ## Your task — 5 phases
+
+  ### PHASE 1 — Audit & Mode Selection Analysis
+
+  1. Read `bto-sim/py/solvers/BTO_Sandwich_Flat.py` thoroughly. Focus on:
+     - `find_fundamental_mode_index()` (~line 1277) — current heuristic
+     - `track_mode_from_reference()` — overlap-based mode tracking
+     - `select_seed_mode_max_topconf()` — top-core confinement selection
+     - `solve_modes()` (~line 932) — eigenvalue solve, what it returns
+     - `extract_key_metrics()` (~line 1367) — how it picks the mode today
+
+  2. Run diagnostic solver calls on TWO known-failing configs:
+     - sio2_patch:  d_BTO=0.25, w_rib=1.0, h_rib=0.15, gap=4.4
+     - al2o3_patch: d_BTO=0.25, w_rib=1.0, h_rib=0.15, gap=4.4
+     For each, call solve_modes(), then compare:
+       a. Mode selected by find_fundamental_mode_index()
+       b. Mode selected by select_seed_mode_max_topconf()
+       c. TE fraction of each candidate mode (TE > 0.8 expected for TE0)
+     Print: mode_index, TE_fraction, n_eff, confinement for the top 5 modes.
+
+  3. Also test a KNOWN-WORKING config for comparison:
+     - sin_patch: d_BTO=0.25, w_rib=1.0, h_rib=0.15, gap=4.4
+     Verify that both methods agree on this one.
+
+  4. Write `AUDIT.md` documenting:
+     - The mode selection problem (which method works, which doesn't, and why)
+     - Proposed fix strategy for the BO wrapper
+     - Solver API summary (constructor params, key methods, output keys)
+     - Risk notes (known failure modes, unit traps)
+
+  Commit: `PHASE-1: audit — mode selection diagnosis`
+
+  ### PHASE 2 — BO Script with Mode Tracking
+
+  Write `run_bo.py` — a single self-contained script. Dependencies: numpy,
+  scipy, matplotlib, optuna. All available in the conda env.
+
+  The script must implement:
+
+  1. **`evaluate_structure(structure_config, params, ref_fields=None)`**
+     - Creates solver, sets all geometry params + r42/r51/orientation/phi_deg
+     - Calls solve_modes()
+     - Mode selection logic (YOUR KEY FIX):
+       * If ref_fields is None (first eval or no reference): use
+         select_seed_mode_max_topconf() or improved heuristic.
+         Verify TE fraction > 0.7; if not, try next-best mode.
+       * If ref_fields provided (subsequent BO evals): use
+         track_mode_from_reference(ref_Ex, ref_Ey) to follow the same
+         mode branch. Fall back to select_seed_mode_max_topconf() if
+         overlap is poor (< 0.5).
+     - Extracts metrics using the selected mode index (not the default one)
+     - Returns: dict with v_pi_cm_V, loss_db_cm, n_eff, gamma, delta_n,
+       mode_index, TE_fraction, success, and the mode fields (Ex, Ey)
+       for subsequent tracking
+     - On solver failure: returns dict with success=False, error message
+
+  2. **`run_bo_for_structure(structure_id, structure_config, ...)`**
+     - Creates Optuna study (TPE sampler, direction='minimize' for VpiL)
+     - Each trial: suggest_float for bto_thickness, width, height
+       (and spacer_thickness for sandwich structures)
+     - Call evaluate_structure with mode tracking — pass ref_fields from
+       the best-so-far evaluation to maintain mode branch continuity
+     - Convergence check after each eval:
+       * Take last 20 best-so-far VpiL values
+       * If relative improvement < 1% AND at least 30 evals done → stop
+     - Timeout: hard 2h wall-clock per structure
+     - Max evals: 150 per structure
+     - Log each eval to JSONL: output/bo_log_{structure_id}.jsonl
+     - Returns: best params, best VpiL, all trial results, ref_fields of best
+
+  3. **Main loop**: iterate over all 8 structures sequentially.
+     Print progress: structure name, eval count, current best VpiL.
+     Save output/plots/bo_results.json:
+     ```json
+     {"sin_patch": {"d_opt_um": 0.25, "w_opt_um": 1.5, "h_opt_um": 0.15,
+                    "vpiL_Vcm": 0.18, "loss_dBcm": 0.5, "n_eff": 2.1,
+                    "gamma": 0.35, "evals": 67, "time_s": 850,
+                    "mode_tracking_used": true}, ...}
+     ```
+
+  Commit: `PHASE-2: BO script with mode tracking`
+
+  ### PHASE 3 — Run BO on All 8 Structures
+
+  Execute `run_bo.py`. Expected performance:
+  - ~13s/eval at mesh=0.02
+  - 50-100 evals/structure to converge (TPE is efficient in 3-4D)
+  - 8 structures sequentially → ~1.5-3h total
+
+  After completion, print a summary table:
+  ```
+  | Structure    | Best VpiL | d_BTO* | w_rib* | h_rib* | sp*  | Evals | Time  |
+  |--------------|-----------|--------|--------|--------|------|-------|-------|
+  | sin_patch    | 0.18      | 0.25   | 1.5    | 0.15   | —    | 67    | 14min |
+  | ...          |           |        |        |        |      |       |       |
+  ```
+
+  If any structure fails to converge within 150 evals, note it but continue.
+
+  Commit: `PHASE-3: BO optimisation complete — 8 structures`
+
+  ### PHASE 4 — Publication Plots & Characterisation
+
+  MANDATORY PRE-EXECUTION CHECK (P4):
+  Before running the sweep script, perform a static code trace on every swept
+  parameter. For each, verify the data path is unbroken:
+    sweep loop variable → function argument → solver attribute setter
+  Print a checklist like:
+    [PASS] bto_thickness → evaluate_point(d_bto=...) → solver.bto_thickness = d_bto
+    [FAIL] electrode_gap → gap=v (local only) → solver.electrode_gap = CONSTANT
+  Do NOT proceed if any parameter fails. Fix the code first.
+
+  MANDATORY POST-EXECUTION CHECK (P2-Enhanced):
+  After sweeps complete, before committing, validate every sweep output:
+    rel_range = (max(y) - min(y)) / (|mean(y)| + 1e-15)
+  FAIL if rel_range < 1% for any parameter — it means the parameter is not
+  being passed to the solver. Additionally:
+    - electrode_gap vs VpiL: must be approximately linear (VpiL ~ g)
+    - bto_thickness vs VpiL: must show decreasing trend
+    - voltage vs delta_n: must be approximately linear
+  Do NOT commit results that fail either check.
+
+  Using the BO optima from Phase 3, run 1D characterisation sweeps WITH
+  mode tracking (use ref_fields from each structure's BO optimum as the
+  reference for all sweeps of that structure):
+
+  a. **BTO thickness**: linspace(0.05, 0.50, 20) at optimal (w*, h*, sp*)
+  b. **WG width**: linspace(0.5, 3.0, 20) at optimal (d*, h*, sp*)
+  c. **Electrode gap**: linspace(2.5, 10.0, 16) at optimal (d*, w*, h*, sp*)
+  d. **Crystal angle**: linspace(0, 90, 19) deg at optimal geometry
+     For each phi: set solver.phi_deg = phi ONLY. Do NOT modify solver.r42.
+     The solver internally rotates the full Pockels tensor (r13, r33, r42, r51)
+     via _get_rotations() → eps_with_pockels(). Multiplying r42 by cos²(phi)
+     externally would double-count the angular dependence.
+  e. **Voltage**: linspace(1, 15, 15) V — delta_neff analytical only
+  f. **Spacer thickness** (sandwich only): linspace(0.02, 0.20, 10) at (d*, w*, h*)
+
+  Total: 8 structures × ~85 sweeps/structure = ~680 solver calls → ~2.5h
+
+  Use ProcessPoolExecutor(max_workers=2) for the sweep dispatch.
+
+  Generate publication plots (minimum 18 PNGs in output/plots/):
+  Style: figsize=(10,6), dpi=150, tight_layout(), log-y for VpiL.
+  Legend: "{id} (r42={r42} pm/V)"; analytical refs as dashed lines.
+  Axis labels with units (µm, V·cm, dB/cm). Grid on.
+  Use `open(path, 'w', encoding='utf-8')` for all file writes.
+
+  Composite figure of merit: `score = -ln(VpiL * alpha_dB)` where VpiL is V·cm
+  and alpha_dB is loss in dB/cm. Higher is better. Include in bar chart and results JSON.
+
+  Required plots:
+  - bo_convergence.png             (best-so-far VpiL vs eval# for all structures)
+  - bo_results_bar.png             (bar chart: best VpiL per structure)
+  - score_comparison.png           (bar chart: composite score per structure)
+  - vpiL_vs_bto_thickness.png      (1D sweep, all structures, log-y)
+  - loss_vs_bto_thickness.png
+  - vpiL_vs_wg_width.png
+  - loss_vs_wg_width.png
+  - vpiL_vs_electrode_gap.png
+  - loss_vs_electrode_gap.png
+  - vpiL_vs_crystal_angle.png
+  - delta_neff_vs_voltage.png
+  - vpiL_vs_spacer_thickness.png   (sandwich structures only)
+  - neff_vs_loss.png               (scatter coloured by VpiL)
+  - gamma_comparison.png           (bar chart: gamma per structure)
+  - geometry_sensitivity_<id>.png  (8 heatmaps from BO trial scatter)
+  - literature_comparison.png      (simulation vs literature bands)
+  - mode_tracking_diagnostics.png  (TE fraction & mode index across BO evals)
+
+  Literature comparison (analytical reference lines only):
+  ```python
+  # LNOI: r33=27 pm/V, n=2.14, Gamma=0.35  [Wang Nat.Photon. 2018]
+  # SOH:  r33=150 pm/V, n=1.65, Gamma=0.45 [Lauermann Optica 2016]
+  VpiL_ref = (100 * 1.55 * g_um) / (n**3 * r33_pm_V * Gamma)
+  ```
+
+  Literature targets:
+  - sin_patch (r42=923):     0.05 – 0.50 V·cm  [Eltes APL 2019]
+  - sin_patch_hq (r42=1340): 0.03 – 0.30 V·cm  [Eltes Nat.Mat. 2020]
+  - LNOI (analytical):       1.0  – 6.0  V·cm  [Wang Nat.Photon. 2018]
+  - SOH  (analytical):       0.10 – 1.5  V·cm  [Lauermann Optica 2016]
+
+  `within_order`: True if VpiL ∈ [target_min/10, target_max×10]
+
+  Save output/plots/literature_comparison.json:
+  ```json
+  [{"structure": "sin_patch", "vpiL_Vcm": 0.18,
+    "target_min": 0.05, "target_max": 0.50,
+    "within_order": true, "reference": "Eltes APL 2019"}, ...]
+  ```
+
+  Commit: `PHASE-4: publication plots + literature comparison`
+
+  ### PHASE 5 — Final Summary & Commit
+
+  Print a comprehensive summary:
+  1. BO results table (all 8 structures)
+  2. Mode tracking effectiveness:
+     - How many evals used tracking vs fresh selection?
+     - Did tracking prevent any mode-hopping events?
+     - Which structures had the most mode instability?
+  3. Literature comparison: all within_order?
+  4. Total wall-clock time and eval count
+
   Then print `##RUNNER:COMPLETE##`.
-
-# ── Output mode ───────────────────────────────────────────────────────────────
-#
-# Separates the "project" (phases 1-8, bto_runner package) from the "target"
-# (what scientific analysis phase 9 runs). To run a different analysis, create
-# a new YAML file that copies this one and changes only output_mode and the
-# phase 9 section of prompt. Phases 1-8 are re-verified but not re-run if
-# their commits already exist.
-
-# output_mode: eo-structure-characterization-v2  (commented out — runner schema forbids extra keys)
-#   phase: 9
-#   structures:
-#     - {id: sin_patch,    top_core: sin,   spacer: air,   spacer_thick_um: 0.0,  r42_pm_V: 923}
-#     - {id: sio2_patch,   top_core: sio2,  spacer: air,   spacer_thick_um: 0.0,  r42_pm_V: 923}
-#     - {id: al2o3_patch,  top_core: al2o3, spacer: air,   spacer_thick_um: 0.0,  r42_pm_V: 923}
-#     - {id: sin_sio2,     top_core: sio2,  spacer: sin,   spacer_thick_um: 0.05, r42_pm_V: 923}
-#     - {id: sin_al2o3,    top_core: al2o3, spacer: sin,   spacer_thick_um: 0.05, r42_pm_V: 923}
-#     - {id: sio2_al2o3,   top_core: al2o3, spacer: sio2,  spacer_thick_um: 0.05, r42_pm_V: 923}
-#     - {id: al2o3_sio2,   top_core: sio2,  spacer: al2o3, spacer_thick_um: 0.05, r42_pm_V: 923}
-#     - {id: sin_patch_hq, top_core: sin,   spacer: air,   spacer_thick_um: 0.0,  r42_pm_V: 1340}
-#   literature_targets:
-#     sin_patch:    {min_Vcm: 0.05, max_Vcm: 0.50, ref: "Eltes APL 2019"}
-#     sin_patch_hq: {min_Vcm: 0.03, max_Vcm: 0.30, ref: "Eltes Nat.Mat. 2020"}
-#     LNOI:         {min_Vcm: 1.0,  max_Vcm: 6.0,  ref: "Wang Nat.Photon. 2018"}
-#     SOH:          {min_Vcm: 0.10, max_Vcm: 1.5,  ref: "Lauermann Optica 2016"}
 
 # ── Context anchors ───────────────────────────────────────────────────────────
 
 context_anchors: |
   Repo: BTO_Modulators_Simulator, branch clauded
-  New sub-package: bto_runner/ (do NOT touch existing files)
-  Python: 3.11+, type annotations required, mypy --strict on bto_runner/
-  Key libs: optuna>=3.6, cma>=3.3, numpy, scipy, matplotlib, pydantic>=2.6
-  Strategy auto-select: MaterialParam -> TPE | d<15 -> Bayesian | d>=15 -> CMA-ES
-  Score: -w1*v_pi - w2*loss + w3*delta_n (surrogate backend)
-  Mock sim: deterministic given same seed; PEAKS defined in PHASE-2; default --delay 5.0 s
-  ComplexityBudget.total_hours = 10.0
-  Real sandwich sweeper eval time: 4–24 h per run — do NOT assume fast evals.
-  PID clamp upper = 86400 s (24 h); n_evals uses max(1,...) guard — both mandatory.
-  Commit style: PHASE-N: <short description>
-  Do NOT commit with failing tests or ruff/mypy errors.
-  SciSim standards: all random ops accept explicit seed, 64-bit floats,
-    normalise all output, log run metadata to JSONL.
+  bto-sim/ already exists — do NOT modify any file in it
+  FDFD solver: bto-sim/py/solvers/BTO_Sandwich_Flat.py — CombinedBTOFlatThinFilmSolver
+  KEY TASK: fix mode selection using track_mode_from_reference() / select_seed_mode_max_topconf()
+  r42 in SI (m/V): 923 pm/V → 923e-12; set solver.r42 BEFORE every metrics call
+  VpiL key: 'v_pi_cm_V' from solver; fallback: (100*1.55*4.4)/(n_eff**3*r42_pm_V*0.35)
+  BO: Optuna TPE, 3D patch (d_BTO, w_rib, h_rib) / 4D sandwich (+spacer_thick)
+  Convergence: rel_tol=1%, window=20, min_evals=30, timeout=2h/structure, max=150 evals
+  Mesh: 0.02 µm (~13s/eval)
+  Mode tracking: pass ref_fields from best-so-far to track_mode_from_reference()
+  Fixed: electrode_gap=4.4, voltage=5.0, phi_deg=0
+  NO RESULT REUSE: all numbers from live solver calls only
+  Output: output/plots/ — minimum 18 PNG + bo_results.json + literature_comparison.json
+  File writes: open(path,'w',encoding='utf-8')
+  Windows: use cp1252-safe logging, no sys.stdout for non-ASCII
+  Estimated total: ~6-9h (audit ~1h, coding ~2h, BO ~2-3h, sweeps ~2.5h, plots ~1h)
 
 # ── Protocol ──────────────────────────────────────────────────────────────────
 
@@ -511,65 +352,37 @@ model_schedule:
   poll_interval_seconds: 30
   rules:
     - triggers:
-        - phase_gte: 1
-          phase_lte: 1
-      action:
-        model_id: claude-haiku-4-5-20251001
-        message: "Haiku for audit — reading only, no generation"
-
-    - triggers:
-        - phase_gte: 2
-          phase_lte: 3
-      action:
-        model_id: claude-opus-4-6
-        message: "Opus for core architecture (params, budget, executor)"
-
-    - triggers:
-        - phase_gte: 4
-      action:
-        model_id: claude-sonnet-4-6
-        message: "Sonnet for strategies, GUI, CLI, tests"
-
-    - triggers:
         - token_pct_gte: 0.80
       action:
         model_id: claude-sonnet-4-6
-        message: "Context near limit — maintaining Sonnet"
+        message: "Context near limit — switching to Sonnet"
 
 # ── Sandbox ───────────────────────────────────────────────────────────────────
 
 sandbox:
   backend: native
-  working_dir: .
+  working_dir: C:/Doc_PhD_ORC/bto-runner-bo
 
 # ── Execution ─────────────────────────────────────────────────────────────────
 
 execution:
-  timeout_hours: 96
+  timeout_hours: 12
   max_rate_limit_waits: 50
-  skip_permissions: false
+  skip_permissions: true
   resume_strategy: restate
   silence_timeout_minutes: 2880
 
   milestones:
     - pattern: "PHASE-1:"
-      message: "Phase 1 committed — audit complete"
+      message: "Phase 1 — audit & mode selection diagnosis complete"
     - pattern: "PHASE-2:"
-      message: "Phase 2 committed — param types, space, mock sim"
+      message: "Phase 2 — BO script with mode tracking written"
     - pattern: "PHASE-3:"
-      message: "Phase 3 committed — budget, PID, executor, logger"
+      message: "Phase 3 — BO optimisation complete for 8 structures"
     - pattern: "PHASE-4:"
-      message: "Phase 4 committed — strategies, scheduler"
+      message: "Phase 4 — publication plots + literature comparison"
     - pattern: "PHASE-5:"
-      message: "Phase 5 committed — inverse solver, geometry"
-    - pattern: "PHASE-6:"
-      message: "Phase 6 committed — GUI"
-    - pattern: "PHASE-7:"
-      message: "Phase 7 committed — CLI, V&V gates passing"
-    - pattern: "PHASE-8:"
-      message: "Phase 8 committed — 10-hour simulation run complete"
-    - pattern: "PHASE-9:"
-      message: "Phase 9 committed — scientific characterisation plots complete"
+      message: "All phases complete"
 
   context:
     checkpoint_threshold_tokens: 80000
@@ -583,14 +396,11 @@ output:
     remote_url: https://github.com/LunaticSodium/BTO_Modulators_Simulator.git
     branch_prefix: bto-run/
 
-# ── ntfy.sh channels (v2.0a — supervisor's phone number) ─────────────────────
-# Primary source of truth for ntfy channels. Overrides Credential Manager.
+# ── ntfy.sh ───────────────────────────────────────────────────────────────────
 
 ntfy:
   out_channel: claude-runner-honacoo
   cmd_channel: claude-runner-honacoo-cmd
-
-# ── Notifications ─────────────────────────────────────────────────────────────
 
 notify:
   on: [start, complete, error, rate_limit, milestone, resume]
@@ -603,35 +413,22 @@ notify:
 
 acceptance_criteria:
   on_failure: retry
-  max_retries: 3
+  max_retries: 2
   checks:
-    - type: command
-      run: pytest tests/ -q
-      expect_exit: 0
-    - type: command
-      run: ruff check bto_runner/
-      expect_exit: 0
-    - type: command
-      run: mypy bto_runner/ --strict
-      expect_exit: 0
-    - type: command
-      run: python -m bto_runner.cli validate --space tests/fixtures/space_continuous.yaml
-      expect_exit: 0
-    - type: command
-      run: python -m bto_runner.cli validate --space tests/fixtures/space_mixed.yaml
-      expect_exit: 0
     - type: file_exists
-      path: output/phase8_run.jsonl
-    - type: command
-      run: "python -c \"import json,sys; n=sum(1 for l in open('output/phase8_run.jsonl') if l.strip()); print(f'Evals: {n}'); sys.exit(0 if n>=500 else 1)\""
-      expect_exit: 0
-    - type: command
-      run: "python -c \"import pathlib,sys; d=pathlib.Path('output/plots'); pngs=list(d.glob('*.png')) if d.exists() else []; n=len(pngs); print('Plots:', n); [print(' ', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=11 else 1)\""
-      expect_exit: 0
+      path: AUDIT.md
     - type: file_exists
-      path: output/plots/sweetspot_results.json
+      path: run_bo.py
+    - type: file_exists
+      path: output/plots/bo_results.json
     - type: file_exists
       path: output/plots/literature_comparison.json
     - type: command
-      run: "python -c \"import json,sys; data=json.load(open('output/plots/literature_comparison.json')); mismatches=[r['structure'] for r in data if not r.get('within_order',True)]; print('Lit. comparison mismatches:', mismatches or 'none'); sys.exit(0)\""
+      run: "C:/Users/20894/miniconda3/envs/bto_ml/python.exe -c \"import json,sys; data=json.load(open('output/plots/bo_results.json')); n=len(data); print(f'Structures optimised: {n}'); sys.exit(0 if n>=8 else 1)\""
+      expect_exit: 0
+    - type: command
+      run: "C:/Users/20894/miniconda3/envs/bto_ml/python.exe -c \"import pathlib,sys; d=pathlib.Path('output/plots'); pngs=list(d.glob('*.png')) if d.exists() else []; n=len(pngs); print('Plots:', n); [print(' ', p.name) for p in sorted(pngs)]; sys.exit(0 if n>=18 else 1)\""
+      expect_exit: 0
+    - type: command
+      run: "C:/Users/20894/miniconda3/envs/bto_ml/python.exe -c \"import json,sys; data=json.load(open('output/plots/literature_comparison.json')); mismatches=[r['structure'] for r in data if not r.get('within_order',True)]; print('Mismatches:', mismatches or 'none'); sys.exit(0)\""
       expect_exit: 0

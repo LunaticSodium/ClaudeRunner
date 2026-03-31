@@ -1,0 +1,590 @@
+name: bto-vacation-2wk
+description: >-
+  Two-week unattended BTO EO modulator research — single long-running session
+  on a 20-core workstation. Two deliverables in separate project directories:
+  (A) comprehensive Python-based BO optimisation with publication-quality results,
+  (B) C# FDFD eigenmode solver port validated against the Python reference.
+
+# ── Tunable constants ─────────────────────────────────────────────────────────
+# MAX_WORKERS       = 14      (ProcessPoolExecutor — leave cores for OS/LLM)
+# MESH_DEFAULT      = 0.01    (µm — ~32s/eval on 1 core at this mesh)
+# SCORE_FORMULA     = -ln(VpiL * alpha_dB)   (higher is better)
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
+
+prompt: |
+  # Two-Week BTO Modulator Research Programme
+
+  You have ~2 weeks of wall-clock time on a 20-core Windows workstation.
+  Your job: produce two deliverables in two SEPARATE project directories.
+
+  ## Deliverable Overview
+
+  | Dir | Deliverable | Language | Est. time |
+  |-----|-------------|----------|-----------|
+  | `output/vacation/python/` | Publication-quality BTO optimisation | Python | ~8 days |
+  | `output/vacation/csharp/` | C# FDFD solver port (Phase A) | C# | ~4 days |
+  | (both) | Final report & cross-validation | Both | ~2 days |
+
+  Work on them sequentially: Python first (needs compute time), then C#
+  (needs the Python results for validation), then cross-validate.
+
+  ## Checkpoint Discipline
+
+  After each major stage, write a checkpoint:
+  1. Commit all work with descriptive message
+  2. Write/update `output/vacation/STATE.md` with:
+     - Which stages are complete
+     - Key results so far
+     - Any issues or surprises
+     - Next planned action
+  3. Write/update `output/vacation/state.json`:
+     ```json
+     {
+       "stage_completed": "A3",
+       "timestamp": "2026-04-03T14:22:00",
+       "python_complete": false,
+       "csharp_complete": false,
+       "global_best": {"structure": "sin_patch_hq", "score": 1.45}
+     }
+     ```
+
+  This way, if the runner restarts (crash, power outage), you can read
+  STATE.md to understand where you left off and resume from that stage.
+
+  ---
+
+  # PART A — Python BTO Optimisation
+
+  Working directory: `output/vacation/python/`
+  Solver: `bto-sim/py/solvers/BTO_Sandwich_Flat.py`
+
+  ```python
+  import sys, os
+  sys.path.insert(0, 'bto-sim/py/solvers')
+  os.environ["MPLBACKEND"] = "Agg"
+  from BTO_Sandwich_Flat import CombinedBTOFlatThinFilmSolver
+  ```
+
+  ### Resources & Parallelism
+
+  - 20 cores available. Use ProcessPoolExecutor(max_workers=14).
+  - Auto-detect RAM and adjust:
+    ```python
+    import psutil
+    ram_gb = psutil.virtual_memory().total / 1e9
+    max_workers = min(14, int(ram_gb / 4.5))
+    ```
+  - Each eval at mesh=0.01: ~32s single-threaded, ~4 GB peak RAM.
+  - For BO: use Optuna n_jobs=max_workers for batch-parallel trials.
+  - For sweeps: ProcessPoolExecutor for embarrassingly parallel points.
+  - Always try/except around solver calls. Log failures, never crash.
+  - Memory: `del solver` after each eval, `gc.collect()` every 100 evals.
+
+  ### Physics Solver Setup (CRITICAL — apply to EVERY solver call)
+
+  ```python
+  solver.r42 = r42_pm_V * 1e-12   # SI: m/V
+  solver.r51 = solver.r42
+  solver.orientation = 'a-axis'
+  solver.phi_deg = 0.0             # unless sweeping crystal angle
+  ```
+
+  Mode selection: `select_seed_mode_max_topconf()` for initial mode,
+  then `track_mode_from_reference(ref_Ex, ref_Ey)` for subsequent evals.
+  Always verify TE fraction > 0.7.
+
+  Score: `score = -ln(VpiL_Vcm * loss_dBcm)` — higher is better.
+
+  ### Structure Configurations (8 structures)
+
+  | ID            | top_core | spacer | spacer_thick | r42 pm/V |
+  |---------------|----------|--------|--------------|----------|
+  | sin_patch     | sin      | air    | 0.0          | 923      |
+  | sio2_patch    | sio2     | air    | 0.0          | 923      |
+  | al2o3_patch   | al2o3    | air    | 0.0          | 923      |
+  | sin_patch_hq  | sin      | air    | 0.0          | 1340     |
+  | sin_sio2      | sio2     | sin    | sweep        | 923      |
+  | sin_al2o3     | al2o3    | sin    | sweep        | 923      |
+  | sio2_al2o3    | al2o3    | sio2   | sweep        | 923      |
+  | al2o3_sio2    | sio2     | al2o3  | sweep        | 923      |
+
+  ### Supervisor Checks (apply to EVERY sweep in EVERY stage)
+
+  Read `_supervisor_sweep_checks.md` at project root. Apply:
+
+  **P4 — Pre-Execution**: Static code trace of every swept parameter:
+    sweep variable → function argument → solver attribute setter.
+  Print `[PASS]` / `[FAIL]`. Do NOT proceed if any fails.
+
+  **P2-Enhanced — Post-Execution**: `rel_range = (max-min)/|mean| > 1%`
+  for every swept output. Physics checks: VpiL ~ linear with gap,
+  delta_n ~ linear with voltage. Do NOT commit if any fails.
+
+  ### Baseline Results (Iteration 0 — reference only)
+
+  Previous run at mesh=0.02 (loss refined at 0.01). Available at
+  `output/plots/bo_results.json` and `output/plots/loss_refined.json`.
+  Use as comparison only — do NOT copy values into new results.
+
+  | Structure     | VpiL   | Loss(0.01) | Score  | d_BTO | w_rib | h_rib |
+  |---------------|--------|------------|--------|-------|-------|-------|
+  | sin_patch_hq  | 0.1445 |  4.30      | +1.13  | 0.332 | 1.968 | 0.051 |
+  | sin_patch     | 0.2098 |  4.30      | +0.48  | 0.332 | 1.968 | 0.051 |
+  | al2o3_patch   | 0.2126 | 13.74      | -1.07  | 0.394 | 2.491 | 0.320 |
+  | sio2_al2o3    | 0.2568 | 19.95      | -1.64  | 0.217 | 2.987 | 0.127 |
+
+  Key observations:
+  - sin_patch h_rib=0.051 is AT the lower bound (0.05) — boundary-limited
+  - Most structures converged in only 31 evals — likely local optima
+  - Loss is the main differentiator (4-20 dB/cm); VpiL is similar
+  - SiN structures are very mesh-sensitive (loss halved at 0.01 vs 0.02)
+
+  ---
+
+  ### Stage A1 — Fine-Mesh Baseline BO (~2 days)
+
+  Run BO for all 8 structures at mesh=0.01 with serious eval budgets.
+
+  **Protocol**:
+  1. Per structure: max 2000 evals, convergence window=50, rel_tol=0.3%
+  2. Extended lower bound: h_rib ∈ [0.02, 0.35] (was 0.05 — allow thinner ribs)
+  3. Optuna TPE with n_jobs=max_workers, seed=42
+  4. Run structures sequentially (stable mode tracking between them)
+  5. Save per-structure: bo_log_{id}.jsonl, best params, convergence plot
+
+  **Output**: `output/vacation/python/A1_baseline/`
+  - bo_results.json (all 8 structures)
+  - bo_convergence.png
+  - Score comparison table
+  - Comparison vs Iteration 0: which structures improved? By how much?
+
+  Commit: `STAGE-A1: fine-mesh BO — all 8 structures at mesh=0.01`
+
+  ### Stage A2 — Deep BO + Electrode Gap Optimisation (~2 days)
+
+  **Protocol**:
+  1. Read A1 results. Rank by score. Select top-4 structures.
+  2. For each top-4, run BO with electrode_gap as free parameter:
+     - Patch: 4D (d_BTO, w_rib, h_rib, gap) with gap ∈ [2.0, 8.0]
+     - Sandwich: 5D (+ spacer_thickness)
+     - IMPORTANT: check solver.domain_width. If gap > 7.0, set
+       solver.domain_width = max(8.0, gap + 2.0)
+  3. Dual-study approach per structure:
+     a. **Exploit**: ±30% around A1 optimum, 2000 evals
+     b. **Explore**: full wide ranges, 2000 evals, seed=137
+     Take the better result from each pair.
+  4. Also run remaining 4 structures with 500 evals each (maintenance).
+  5. Full 1D sweep suite at each new optimum:
+     - bto_thickness (20 pts), wg_width (20 pts), electrode_gap (16 pts),
+       crystal_angle (19 pts), voltage (15 pts), spacer_thickness (10 pts)
+  6. Apply P4 + P2-Enhanced to ALL sweeps.
+
+  **Output**: `output/vacation/python/A2_deep_bo/`
+  - bo_results.json, all sweep plots, score comparison
+  - gap_optimisation.png (VpiL and loss vs gap for top-4)
+
+  Commit: `STAGE-A2: deep BO + gap optimisation — top-4 structures`
+
+  ### Stage A3 — r42 Sensitivity + Crystal Angle (~2 days)
+
+  **Protocol**:
+  1. Read A2 results. Select top-4 structures (gap-optimised).
+  2. **r42 sweep**: For each structure, re-run BO at r42 = [200, 400, 600, 800, 923, 1100, 1340] pm/V.
+     - 500 evals per (structure, r42) pair = 4×7×500 = 14000 evals
+     - Re-optimise geometry at each r42 (VpiL optimum shifts)
+  3. **Crystal angle**: For top-2 structures, add phi_deg ∈ [0, 90] as BO dimension:
+     - CRITICAL: Do NOT multiply r42 by cos²(phi). The solver's _get_rotations()
+       handles the full Pockels tensor rotation internally. Just set solver.phi_deg.
+     - 2000 evals per structure
+  4. Generate:
+     - VpiL vs r42 (one curve per structure)
+     - Score vs r42
+     - "Which structure wins at which r42?" table
+     - VpiL vs phi_deg at optimal geometry
+     - Optimal geometry vs r42 trends
+
+  **Output**: `output/vacation/python/A3_sensitivity/`
+
+  Commit: `STAGE-A3: r42 sensitivity + crystal angle`
+
+  ### Stage A4 — Multi-Objective Pareto + Fabrication Tolerance (~2 days)
+
+  **Protocol**:
+  1. Read A3 results. Select top-4 structures at r42=923.
+  2. **Pareto optimisation**: Use Optuna NSGA-II for bi-objective BO:
+     - Objective 1: minimise VpiL
+     - Objective 2: minimise loss (dB/cm)
+     - Use A2's gap-inclusive parameter ranges
+     - 3000 evals per structure × 4 = 12000 evals
+  3. Extract Pareto front. Identify knee point (best tradeoff) for each.
+  4. **Tolerance analysis**: For each structure, test 3 designs from Pareto front
+     (lowest VpiL, knee point, lowest loss):
+     - Monte Carlo: Gaussian noise σ = [5%, 10%, 15%] of nominal
+     - 300 samples per (design, σ) = 4×3×3×300 = 10800 evals
+  5. Compute yield = fraction where VpiL < threshold AND loss < threshold.
+     Set thresholds based on Pareto results.
+  6. Generate:
+     - Pareto front plot (all structures overlaid)
+     - Violin plots of VpiL/loss distributions at σ=10%
+     - Yield vs σ plot
+     - Rank designs by yield-adjusted score = score × yield_10%
+
+  **Output**: `output/vacation/python/A4_pareto_tolerance/`
+
+  Commit: `STAGE-A4: Pareto fronts + fabrication tolerance`
+
+  ### Stage A5 — Mesh Convergence + Publication Plots (~1 day)
+
+  **Protocol**:
+  1. Select top-2 structures (by score across all stages).
+  2. **Mesh convergence**: At best design point, run solver at:
+     mesh = [0.020, 0.015, 0.010, 0.008, 0.006]
+     - Reduce max_workers for fine meshes (more RAM per eval)
+     - For each mesh: n_eff, loss, VpiL, gamma, delta_n
+  3. **Richardson extrapolation** (FDFD has h² convergence):
+     f_exact ≈ f_h + C·h². Fit C, extrapolate to h→0. Give error bars.
+  4. **Final publication figure set** (in `output/vacation/python/FINAL/`):
+     - All standard sweep plots from best stage (A2 or A4)
+     - Pareto front overlay
+     - r42 sensitivity curves
+     - Tolerance yield maps
+     - Mesh convergence with Richardson error bars
+     - Literature comparison (BTO vs LNOI vs SOH)
+     - Presentation table (structure_table.png style with blue shading)
+     - Mode profiles (Ex, Ey field plots) for top-3 designs
+     - Score evolution across stages (how did each structure improve?)
+  5. Literature comparison:
+     - LNOI: r33=27 pm/V, n=2.14, Gamma=0.35 (Wang Nat.Photon. 2018)
+     - SOH: r33=150 pm/V, n=1.65, Gamma=0.45 (Lauermann Optica 2016)
+     - BTO sin_patch: target 0.05–0.50 V·cm (Eltes APL 2019)
+     - BTO sin_patch_hq: target 0.03–0.30 V·cm (Eltes Nat.Mat. 2020)
+
+  **Output**: `output/vacation/python/A5_convergence/` and `output/vacation/python/FINAL/`
+
+  Commit: `STAGE-A5: mesh convergence + final publication plots`
+
+  ---
+
+  # PART B — C# FDFD Solver Port (Phase A)
+
+  Working directory: `output/vacation/csharp/`
+
+  The existing `bto-sim/` project has a WPF launcher (Config.cs, SolverCatalog.cs)
+  that calls Python solvers. Your task: port the core FDFD eigenmode solver from
+  `BTO_Sandwich_Flat.py` to C#, creating a standalone console library that can be
+  called from both the WPF app and command-line tools.
+
+  ### What to port (Phase A — direct FDFD port)
+
+  The Python solver has these key components:
+  1. **Material database** — refractive indices (n_sin, n_sio2, n_al2o3, n_bto, n_au)
+  2. **Geometry builder** — creates 2D cross-section (rib, electrodes, BTO, spacer)
+  3. **Permittivity matrix** — builds ε(x,y) grid including Pockels EO effect
+  4. **Q-matrix assembly** — 9-point FD stencil for vectorial Helmholtz operator
+  5. **Eigenvalue solve** — ARPACK shift-invert for guided mode β values
+  6. **Mode analysis** — TE fraction, confinement, overlap integrals
+  7. **Electrostatic solver** — Laplace equation for voltage distribution
+  8. **Pockels tensor rotation** — full 3×3 impermeability perturbation
+
+  ### Architecture
+
+  Create a new C# console project: `BtoFdfdSolver/`
+  ```
+  BtoFdfdSolver/
+    BtoFdfdSolver.csproj     (.NET 8, console app)
+    Materials/
+      MaterialDatabase.cs     — refractive indices at 1.55 µm
+    Geometry/
+      CrossSection.cs         — 2D geometry builder
+      StructureConfig.cs      — structure parameters (mirrors Python config)
+    Solver/
+      PermittivityGrid.cs     — ε(x,y) assembly including Pockels
+      QMatrixBuilder.cs       — sparse Q operator (9-point stencil)
+      EigenSolver.cs          — ARPACK/Spectra wrapper
+      ModeResult.cs           — eigenmode data (n_eff, fields, TE fraction)
+      ElectrostaticSolver.cs  — Laplace FD solver
+      PockelsTensor.cs        — tensor rotation + impermeability perturbation
+    Analysis/
+      ModeSelector.cs         — top-conf selection + mode tracking
+      MetricsCalculator.cs    — VpiL, gamma, loss, delta_n computation
+    Program.cs                — CLI entry point for validation runs
+  ```
+
+  ### Dependencies (NuGet only)
+
+  - `MathNet.Numerics` — sparse matrix, linear algebra
+  - `MathNet.Numerics.MKL.Win` — Intel MKL backend for ARPACK
+  - No WPF dependency. Pure console library + CLI.
+
+  ### Validation strategy
+
+  This is the most critical part. The C# solver must reproduce the Python solver's
+  results to within numerical tolerance. For each validation case:
+
+  1. Run the Python solver at a test point → record n_eff, loss, VpiL, TE_frac
+  2. Run the C# solver at the same point → compare
+  3. Pass criteria: |Δn_eff| < 1e-6, |Δloss| < 0.1 dB/cm, |ΔVPL| < 1%
+
+  Test points (use the BO optima from Part A):
+  - sin_patch at its A1 optimum
+  - sio2_patch at its A1 optimum
+  - sin_sio2 (sandwich) at its A1 optimum
+  - sin_patch at a DIFFERENT mesh (0.02) to verify mesh handling
+  - Edge case: very thin BTO (d=0.05), very wide rib (w=3.0)
+
+  **Generate a validation report**: `output/vacation/csharp/VALIDATION.md`
+  with a table of all test points and pass/fail status.
+
+  ### Performance benchmark
+
+  After validation, benchmark C# vs Python:
+  - Time per eval at mesh=0.01 (same hardware, single-threaded)
+  - Time for Q-matrix assembly specifically
+  - Memory usage
+  - Expected speedup factor
+
+  Save: `output/vacation/csharp/BENCHMARK.md`
+
+  ### Stages
+
+  **Stage B1 — Scaffold + Materials + Geometry** (~1 day)
+  - Create project, set up NuGet packages
+  - Port material database (exact same constants)
+  - Port geometry builder (cross-section assembly)
+  - Unit tests: geometry matches Python output
+
+  Commit: `STAGE-B1: C# scaffold + materials + geometry`
+
+  **Stage B2 — Core Solver** (~2 days)
+  - Port Q-matrix assembly (the main bottleneck — 321k-iteration loop → compiled)
+  - Port electrostatic solver
+  - Port eigenvalue solve via MathNet ARPACK
+  - Port Pockels tensor rotation
+  - Port mode analysis (TE fraction, confinement)
+
+  Commit: `STAGE-B2: C# core FDFD solver`
+
+  **Stage B3 — Validation + Benchmark** (~1 day)
+  - Run all validation test points
+  - Generate VALIDATION.md and BENCHMARK.md
+  - Fix any discrepancies
+  - If validation passes: integrate with existing bto-sim solution
+    (add project reference in ClaudeRunner.sln)
+
+  Commit: `STAGE-B3: C# solver validated against Python`
+
+  ---
+
+  # PART C — Cross-Validation & Final Report (~1 day)
+
+  **Stage C1**:
+  1. Run the C# solver on ALL BO optima from Part A (not just test points)
+  2. Compare: do the structure rankings match? Are scores within tolerance?
+  3. If the C# solver is fast enough: re-run a small BO (100 evals) for
+     sin_patch_hq in C# and compare the optimum against Python
+  4. Write `output/vacation/FINAL_REPORT.md`:
+     - Executive summary: best structure, best geometry, expected VpiL/loss
+     - Part A results summary with key figures
+     - Part B validation summary + speedup factor
+     - All key figures referenced (relative paths)
+     - LaTeX-ready results table
+     - Recommendations for next steps (Phase B FEM? More structures?)
+  5. Commit: `STAGE-C1: cross-validation + final report`
+  6. Print `##RUNNER:COMPLETE##`
+
+  ---
+
+  ## IMPORTANT RULES
+
+  1. NO RESULT REUSE — all numbers from live solver calls only.
+  2. File writes: `open(path, 'w', encoding='utf-8')` in Python. UTF-8 in C#.
+  3. Windows paths: forward slashes in Python, `Path.Combine` in C#.
+  4. Commit after each stage with descriptive message.
+  5. Update STATE.md and state.json after every stage.
+  6. If a solver call fails, log it and continue — never crash the session.
+  7. If a stage will clearly exceed its time budget, stop with partial results,
+     note "PARTIAL" in STATE.md, and move to the next stage.
+  8. The two project directories must be INDEPENDENT — C# project must not
+     depend on Python output at runtime (only at validation time).
+  9. Apply P4 + P2-Enhanced supervisor checks to ALL parameter sweeps.
+  10. Do not modify any existing file in `bto-sim/`.
+
+  ## SAFETY LIMITS (unattended 2-week run)
+
+  ### Disk space
+  - Before EACH stage, check free disk space:
+    ```python
+    import shutil
+    free_gb = shutil.disk_usage("C:/").free / 1e9
+    if free_gb < 10:
+        print("SAFETY: <10 GB free. Stopping.")
+        sys.exit(1)
+    ```
+  - JSONL BO logs: rotate/compress after each stage. Delete raw logs > 500 MB.
+  - Do NOT commit binary files (*.npy, *.pkl, large JSON > 50 MB) to git.
+  - Total output budget: 20 GB max. Track cumulative size in state.json.
+
+  ### Memory & processes
+  - Every Python script MUST use a subprocess timeout:
+    ```python
+    # In ProcessPoolExecutor calls:
+    future.result(timeout=300)  # 5 min max per single eval
+    ```
+  - After each BO study completes, force garbage collection:
+    ```python
+    import gc; gc.collect()
+    ```
+  - If RAM usage exceeds 80%, reduce max_workers by 2 and log the adjustment.
+  - Never spawn more than max_workers simultaneous solver processes.
+  - If a Python subprocess hangs > 10 min, kill it and log the failure.
+
+  ### CPU thermal protection
+  - Between stages, sleep 5 minutes to let the CPU cool down.
+  - Use max_workers=12 (not 14) to leave thermal headroom for sustained load.
+  - If the system has been running > 48h continuously, insert a 30-min cooldown.
+
+  ### Git discipline
+  - Do NOT auto-push. All commits are local only.
+  - Do NOT commit output/ directories larger than 100 MB per commit.
+  - Use .gitignore for: *.npy, *.pkl, __pycache__/, obj/, bin/, *.jsonl
+  - One commit per stage maximum. Do not commit intermediate work.
+
+  ### API rate limits
+  - max_rate_limit_waits: 200 (see execution section). If exhausted, stop gracefully.
+  - If the LLM is rate-limited 5 times in 10 minutes, wait 30 minutes before retrying.
+
+  ### Eval budget caps (prevent runaway BO)
+  - Stage A1: max 2000 evals per structure × 8 = 16000 total
+  - Stage A2: max 4000 evals per top-4 + 500 × 4 = 18000 total
+  - Stage A3: max 500 × 28 r42 combos + 2000 × 2 angle = 18000 total
+  - Stage A4: max 12000 Pareto + 10800 tolerance = 22800 total
+  - Stage A5: max 1000 convergence evals total
+  - Grand total Python evals: ~76000 max (≈ 676 core-hours at 32s/eval)
+  - HARD CAP: if cumulative evals exceed 100000, stop and report.
+
+  ### Watchdog
+  - If no progress (no new file written, no new commit) for 4 hours,
+    write a warning to STATE.md and send an ntfy notification.
+  - If no progress for 8 hours, stop gracefully with a final commit.
+
+# ── Context anchors ───────────────────────────────────────────────────────────
+
+context_anchors: |
+  Repo: BTO_Modulators_Simulator
+  bto-sim/ exists — do NOT modify any file in it
+  Python solver: bto-sim/py/solvers/BTO_Sandwich_Flat.py (CombinedBTOFlatThinFilmSolver)
+  Existing C# project: bto-sim/ (WPF launcher, Config.cs, SolverCatalog.cs)
+  Score: -ln(VpiL * alpha_dB), higher is better
+  Mesh default: 0.01 µm (~32s/eval)
+  Baseline: output/plots/bo_results.json, output/plots/loss_refined.json
+  Python output: output/vacation/python/
+  C# output: output/vacation/csharp/
+  State: output/vacation/STATE.md + output/vacation/state.json
+  Supervisor checks: _supervisor_sweep_checks.md (P4 + P2-Enhanced)
+  Crystal angle: set solver.phi_deg ONLY, never multiply r42 externally
+  Windows: cp1252-safe logging, forward slashes in Python paths
+
+# ── Protocol ──────────────────────────────────────────────────────────────────
+
+cccs:
+  preset: cccs-v1.0
+  profile: scisim
+
+marathon_mode: false
+
+# ── Model schedule ────────────────────────────────────────────────────────────
+
+model_schedule:
+  poll_interval_seconds: 30
+  rules:
+    - triggers:
+        - token_pct_gte: 0.80
+      action:
+        model_id: claude-sonnet-4-6
+        message: "Context near limit — switching to Sonnet"
+
+# ── Sandbox ───────────────────────────────────────────────────────────────────
+
+sandbox:
+  backend: native
+  working_dir: C:/Doc_PhD_ORC/bto-runner-bo
+
+# ── Execution ─────────────────────────────────────────────────────────────────
+
+execution:
+  timeout_hours: 360          # 15 days hard cap
+  max_rate_limit_waits: 200   # ~3h of rate-limit waits before giving up
+  skip_permissions: true
+  resume_strategy: restate
+  silence_timeout_minutes: 480  # 8h — if no output for 8h, something is stuck
+
+  milestones:
+    - pattern: "STAGE-A1:"
+      message: "Stage A1 — Fine-mesh BO complete"
+    - pattern: "STAGE-A2:"
+      message: "Stage A2 — Deep BO + gap optimisation complete"
+    - pattern: "STAGE-A3:"
+      message: "Stage A3 — r42 sensitivity + crystal angle complete"
+    - pattern: "STAGE-A4:"
+      message: "Stage A4 — Pareto + fabrication tolerance complete"
+    - pattern: "STAGE-A5:"
+      message: "Stage A5 — Mesh convergence + publication plots complete"
+    - pattern: "STAGE-B1:"
+      message: "Stage B1 — C# scaffold + materials + geometry"
+    - pattern: "STAGE-B2:"
+      message: "Stage B2 — C# core FDFD solver"
+    - pattern: "STAGE-B3:"
+      message: "Stage B3 — C# solver validated"
+    - pattern: "STAGE-C1:"
+      message: "Stage C1 — Cross-validation + final report"
+
+  context:
+    checkpoint_threshold_tokens: 80000
+
+# ── Output ────────────────────────────────────────────────────────────────────
+
+output:
+  git:
+    enabled: true
+    auto_push: false
+    remote_url: https://github.com/LunaticSodium/BTO_Modulators_Simulator.git
+    branch_prefix: vacation/
+
+# ── ntfy.sh ───────────────────────────────────────────────────────────────────
+
+ntfy:
+  out_channel: claude-runner-honacoo
+  cmd_channel: claude-runner-honacoo-cmd
+
+notify:
+  on: [start, complete, error, rate_limit, milestone, resume]
+  channels:
+    - type: desktop
+    - type: webhook
+      url: https://ntfy.sh/claude-runner-honacoo
+
+# ── Acceptance criteria ───────────────────────────────────────────────────────
+
+acceptance_criteria:
+  on_failure: retry
+  max_retries: 1
+  checks:
+    # Python deliverable
+    - type: file_exists
+      path: output/vacation/python/A1_baseline/bo_results.json
+    - type: file_exists
+      path: output/vacation/python/FINAL/score_comparison.png
+    - type: command
+      run: "C:/Users/20894/miniconda3/envs/bto_ml/python.exe -c \"import json,sys; d=json.load(open('output/vacation/python/A1_baseline/bo_results.json')); n=len(d); print(f'Structures: {n}'); sys.exit(0 if n>=8 else 1)\""
+      expect_exit: 0
+    # C# deliverable
+    - type: file_exists
+      path: output/vacation/csharp/BtoFdfdSolver/BtoFdfdSolver.csproj
+    - type: file_exists
+      path: output/vacation/csharp/VALIDATION.md
+    # Final report
+    - type: file_exists
+      path: output/vacation/FINAL_REPORT.md
+    - type: file_exists
+      path: output/vacation/state.json
