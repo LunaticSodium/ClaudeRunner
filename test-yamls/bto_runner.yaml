@@ -323,6 +323,7 @@ prompt: |
 context_anchors: |
   Repo: BTO_Modulators_Simulator, branch clauded
   bto-sim/ already exists — do NOT modify any file in it
+  Solver type: FDFD (finite-difference frequency-domain), NOT FEM — uniform Yee grid, ARPACK eigensolver
   FDFD solver: bto-sim/py/solvers/BTO_Sandwich_Flat.py — CombinedBTOFlatThinFilmSolver
   KEY TASK: fix mode selection using track_mode_from_reference() / select_seed_mode_max_topconf()
   r42 in SI (m/V): 923 pm/V → 923e-12; set solver.r42 BEFORE every metrics call
@@ -432,3 +433,46 @@ acceptance_criteria:
     - type: command
       run: "C:/Users/20894/miniconda3/envs/bto_ml/python.exe -c \"import json,sys; data=json.load(open('output/plots/literature_comparison.json')); mismatches=[r['structure'] for r in data if not r.get('within_order',True)]; print('Mismatches:', mismatches or 'none'); sys.exit(0)\""
       expect_exit: 0
+
+# ── Implementation constraints (v2.1 — prevent worker parameter override) ────
+
+implementation_constraints:
+  - id: r42-si-units
+    description: "Solver r42 must be set in SI (m/V) using 1e-12 conversion"
+    verify_with: file_contains
+    file: run_bo.py
+    pattern: "r42.*1e-12|1e-12.*r42"
+
+  - id: mode-tracking
+    description: "BO must use track_mode_from_reference or select_seed_mode_max_topconf"
+    verify_with: file_contains
+    file: run_bo.py
+    pattern: "track_mode_from_reference|select_seed_mode_max_topconf"
+
+  - id: utf8-stdout
+    description: "Script must handle Windows cp1252 encoding safely"
+    verify_with: file_contains
+    file: run_bo.py
+    pattern: "reconfigure.*utf-8|encoding.*utf"
+
+  - id: no-hardcoded-gap
+    description: "Sweep script must pass electrode_gap through, not hardcode it"
+    verify_with: file_contains
+    file: run_sweeps_and_plots.py
+    pattern: "def.*gap|electrode_gap.*=.*gap"
+
+  - id: composite-score
+    description: "Results must include composite score = -ln(VpiL * loss)"
+    verify_with: file_contains
+    file: run_bo.py
+    pattern: "log.*[Vv]pi.*loss|ln.*[Vv]pi.*alpha|-.*log.*\\*"
+
+# ── Physics constraints (v2.2) ───────────────────────────────────────────────
+
+physics_constraints:
+  - name: positive_vpiL
+    check: "0 < VpiL < 100 V·cm"
+    message: "VpiL must be positive and below 100 V·cm"
+  - name: neff_range
+    check: "1.4 < n_eff < 2.5"
+    message: "n_eff must be between SiO2 substrate and BTO"

@@ -146,6 +146,21 @@ prompt: |
 
   Run BO for all 8 structures at mesh=0.01 with serious eval budgets.
 
+  MANDATORY PRE-EXECUTION CHECK (P4):
+  Before running run_bo.py, perform a static code trace on every solver parameter.
+  For each, verify the data path is unbroken:
+    loop variable → function argument → solver attribute setter
+  Print a checklist:
+    [PASS] bto_thickness → evaluate(..., d_bto=...) → solver.bto_thickness = d_bto
+    [FAIL] electrode_gap → NOT passed → solver.electrode_gap = CONSTANT
+  Do NOT proceed if any parameter fails. Fix the code first.
+
+  MANDATORY POST-EXECUTION CHECK (P2-Enhanced):
+  After BO completes, validate that different structures produce different scores:
+    rel_range = (max(score) - min(score)) / (|mean(score)| + 1e-15)
+  FAIL if rel_range < 1% — all structures returning identical scores means
+  the solver is not receiving structure-specific parameters.
+
   **Protocol**:
   1. Per structure: max 2000 evals, convergence window=50, rel_tol=0.3%
   2. Extended lower bound: h_rib ∈ [0.02, 0.35] (was 0.05 — allow thinner ribs)
@@ -162,6 +177,20 @@ prompt: |
   Commit: `STAGE-A1: fine-mesh BO — all 8 structures at mesh=0.01`
 
   ### Stage A2 — Deep BO + Electrode Gap Optimisation (~2 days)
+
+  MANDATORY PRE-EXECUTION CHECK (P4):
+  Before running the gap-inclusive BO, verify that electrode_gap flows through:
+    BO suggest_float('gap') → evaluate(..., gap=...) → solver.electrode_gap = gap
+  Also verify: if gap > 7.0, solver.domain_width is set to max(8.0, gap + 2.0).
+  Print the full data-path checklist. Do NOT proceed if any FAIL.
+
+  MANDATORY POST-EXECUTION CHECK (P2-Enhanced):
+  After sweeps complete, verify for EVERY swept parameter:
+    rel_range = (max(y) - min(y)) / (|mean(y)| + 1e-15) > 1%
+  Physics checks:
+    - VpiL vs electrode_gap: must be approximately linear (R² > 0.9)
+    - VpiL vs BTO thickness: must show decreasing trend
+  Do NOT commit results that fail either check.
 
   **Protocol**:
   1. Read A1 results. Rank by score. Select top-4 structures.
@@ -188,6 +217,22 @@ prompt: |
 
   ### Stage A3 — r42 Sensitivity + Crystal Angle (~2 days)
 
+  MANDATORY PRE-EXECUTION CHECK (P4):
+  Before running crystal angle BO, verify:
+    - phi_deg flows through: suggest_float('phi') → solver.phi_deg = phi
+    - r42 is NOT multiplied by cos²(phi) externally — the solver's
+      _get_rotations() handles the full Pockels tensor rotation internally.
+      Multiplying externally would double-count the angular dependence.
+    - r42 sweep: r42_pm flows through → solver.r42 = r42_pm * 1e-12
+  Print the full data-path checklist. Do NOT proceed if any FAIL.
+
+  MANDATORY POST-EXECUTION CHECK (P2-Enhanced):
+  After sweeps complete:
+    - VpiL vs r42: must show decreasing trend (higher r42 = lower VpiL)
+    - VpiL vs phi_deg: must show cos²-like increase from 0° to 90°
+    - rel_range > 1% for all swept outputs
+  Do NOT commit results that fail either check.
+
   **Protocol**:
   1. Read A2 results. Select top-4 structures (gap-optimised).
   2. **r42 sweep**: For each structure, re-run BO at r42 = [200, 400, 600, 800, 923, 1100, 1340] pm/V.
@@ -209,6 +254,13 @@ prompt: |
   Commit: `STAGE-A3: r42 sensitivity + crystal angle`
 
   ### Stage A4 — Multi-Objective Pareto + Fabrication Tolerance (~2 days)
+
+  MANDATORY POST-EXECUTION CHECK (P2-Enhanced):
+  After Pareto BO and tolerance analysis:
+    - Pareto front must contain at least 5 non-dominated points per structure
+    - VpiL and loss must span distinct ranges across the Pareto front
+    - Tolerance analysis: yield must decrease with increasing σ (5% > 10% > 15%)
+  Do NOT commit results that violate these expectations.
 
   **Protocol**:
   1. Read A3 results. Select top-4 structures at r42=923.
@@ -473,17 +525,22 @@ prompt: |
 context_anchors: |
   Repo: BTO_Modulators_Simulator
   bto-sim/ exists — do NOT modify any file in it
+  Solver type: FDFD (finite-difference frequency-domain), NOT FEM
   Python solver: bto-sim/py/solvers/BTO_Sandwich_Flat.py (CombinedBTOFlatThinFilmSolver)
   Existing C# project: bto-sim/ (WPF launcher, Config.cs, SolverCatalog.cs)
   Score: -ln(VpiL * alpha_dB), higher is better
-  Mesh default: 0.01 µm (~32s/eval)
+  Mesh default: 0.01 µm (~32s/eval, 321k vertices on 8×4 µm domain)
   Baseline: output/plots/bo_results.json, output/plots/loss_refined.json
   Python output: output/vacation/python/
   C# output: output/vacation/csharp/
   State: output/vacation/STATE.md + output/vacation/state.json
-  Supervisor checks: _supervisor_sweep_checks.md (P4 + P2-Enhanced)
-  Crystal angle: set solver.phi_deg ONLY, never multiply r42 externally
-  Windows: cp1252-safe logging, forward slashes in Python paths
+  Supervisor checks: _supervisor_sweep_checks.md (P4 + P2-Enhanced) — READ AND APPLY
+  P4: before EVERY sweep script, trace sweep var → func arg → solver setter. FAIL if broken.
+  P2-Enhanced: after EVERY sweep, verify rel_range > 1%. FAIL if flat output detected.
+  Crystal angle: set solver.phi_deg ONLY, never multiply r42 externally (solver handles rotation)
+  Mode selection: use track_mode_from_reference() for BO continuity, select_seed_mode_max_topconf() for seed
+  r42 units: ALWAYS set solver.r42 = r42_pm_V * 1e-12 (SI m/V) before metrics call
+  Windows: cp1252-safe logging — sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 # ── Protocol ──────────────────────────────────────────────────────────────────
 
@@ -578,6 +635,10 @@ acceptance_criteria:
     - type: command
       run: "C:/Users/20894/miniconda3/envs/bto_ml/python.exe -c \"import json,sys; d=json.load(open('output/vacation/python/A1_baseline/bo_results.json')); n=len(d); print(f'Structures: {n}'); sys.exit(0 if n>=8 else 1)\""
       expect_exit: 0
+    # Sweep output validation (P2-Enhanced) — at least one sweep must show >1% variation
+    - type: command
+      run: "C:/Users/20894/miniconda3/envs/bto_ml/python.exe -c \"import json,sys,os; p='output/vacation/python/A1_baseline/bo_results.json'; d=json.load(open(p)); scores=[v.get('score',0) for v in d.values() if isinstance(v,dict)]; rng=max(scores)-min(scores) if scores else 0; avg=sum(scores)/len(scores) if scores else 1; rr=rng/(abs(avg)+1e-15); print(f'Score rel_range: {rr*100:.1f}%'); sys.exit(0 if rr>0.01 else 1)\""
+      expect_exit: 0
     # C# deliverable
     - type: file_exists
       path: output/vacation/csharp/BtoFdfdSolver/BtoFdfdSolver.csproj
@@ -588,3 +649,64 @@ acceptance_criteria:
       path: output/vacation/FINAL_REPORT.md
     - type: file_exists
       path: output/vacation/state.json
+
+# ── Implementation constraints (v2.1 — prevent worker parameter override) ────
+
+implementation_constraints:
+  # BO script must use correct mesh
+  - id: mesh-001
+    description: "BO script must default to fine mesh 0.01 for production"
+    verify_with: file_contains
+    file: output/vacation/python/run_bo.py
+    pattern: "0\\.01"
+
+  # Must set r42 in SI before every metrics call
+  - id: r42-si-units
+    description: "Solver r42 must be set in SI (m/V) using 1e-12 conversion"
+    verify_with: file_contains
+    file: output/vacation/python/run_bo.py
+    pattern: "r42.*1e-12|1e-12.*r42"
+
+  # Must use mode tracking, not just find_fundamental_mode_index
+  - id: mode-tracking
+    description: "BO must use track_mode_from_reference or select_seed_mode_max_topconf"
+    verify_with: file_contains
+    file: output/vacation/python/run_bo.py
+    pattern: "track_mode_from_reference|select_seed_mode_max_topconf"
+
+  # UTF-8 safety on Windows
+  - id: utf8-stdout
+    description: "Script must reconfigure stdout to utf-8 for Windows cp1252 safety"
+    verify_with: file_contains
+    file: output/vacation/python/run_bo.py
+    pattern: "reconfigure.*utf-8|PYTHONIOENCODING|encoding.*utf"
+
+  # Score formula must match spec
+  - id: composite-score
+    description: "Composite score must use -ln(VpiL * loss) formula"
+    verify_with: file_contains
+    file: output/vacation/python/run_bo.py
+    pattern: "log.*[Vv]pi.*loss|ln.*[Vv]pi.*alpha|-.*log.*\\*"
+
+  # Sweep script must NOT hardcode electrode_gap (the P4 lesson)
+  - id: gap-not-hardcoded
+    description: "Sweep function must accept electrode_gap as parameter, not use module constant"
+    verify_with: file_contains
+    file: output/vacation/python/run_sweeps.py
+    pattern: "def.*sweep.*gap|def.*evaluate.*gap|electrode_gap.*=.*gap"
+
+# ── Physics constraints (v2.2 — hard physical invariants) ────────────────────
+
+physics_constraints:
+  - name: positive_vpiL
+    check: "0 < VpiL < 100 V·cm"
+    message: "VpiL must be positive and below 100 V·cm for any BTO structure"
+  - name: positive_loss
+    check: "0 < loss_dB_cm < 100"
+    message: "Propagation loss must be positive and finite"
+  - name: neff_range
+    check: "1.4 < n_eff < 2.5"
+    message: "Effective index must be between substrate (SiO2~1.44) and BTO (~2.4)"
+  - name: te_fraction
+    check: "TE_fraction > 0.7"
+    message: "Target mode must be predominantly TE (TE fraction > 70%)"
