@@ -23,14 +23,13 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .project import AcceptanceCriteria, AcceptanceCheck
+    from .project import AcceptanceCheck, AcceptanceCriteria, ImplementationConstraint
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +60,7 @@ class CheckResult:
 # ---------------------------------------------------------------------------
 
 
-def _check_file_exists(check: "AcceptanceCheck", working_dir: Path) -> Optional[str]:
+def _check_file_exists(check: AcceptanceCheck, working_dir: Path) -> str | None:
     """Return an error string if the file does not exist, else None."""
     if not check.path:
         return "file_exists check is missing 'path'"
@@ -72,7 +71,7 @@ def _check_file_exists(check: "AcceptanceCheck", working_dir: Path) -> Optional[
     return None
 
 
-def _check_file_contains(check: "AcceptanceCheck", working_dir: Path) -> Optional[str]:
+def _check_file_contains(check: AcceptanceCheck, working_dir: Path) -> str | None:
     """Return an error string if the pattern is not found in the file, else None."""
     if not check.path:
         return "file_contains check is missing 'path'"
@@ -91,7 +90,7 @@ def _check_file_contains(check: "AcceptanceCheck", working_dir: Path) -> Optiona
     return None
 
 
-def _check_command(check: "AcceptanceCheck", working_dir: Path) -> Optional[str]:
+def _check_command(check: AcceptanceCheck, working_dir: Path) -> str | None:
     """Return an error string if the command exit code doesn't match, else None."""
     if not check.run:
         return "command check is missing 'run'"
@@ -127,10 +126,10 @@ def _check_command(check: "AcceptanceCheck", working_dir: Path) -> Optional[str]
 
 
 def _check_llm_judge(
-    check: "AcceptanceCheck",
+    check: AcceptanceCheck,
     working_dir: Path,
     api_key: str,
-) -> Optional[str]:
+) -> str | None:
     """
     Call the Anthropic messages API with the judge prompt.
 
@@ -216,9 +215,10 @@ def _check_llm_judge(
 
 
 def run_checks(
-    criteria: "AcceptanceCriteria",
+    criteria: AcceptanceCriteria,
     working_dir: Path,
     api_key: str = "",
+    implementation_constraints: list[ImplementationConstraint] | None = None,
 ) -> CheckResult:
     """
     Evaluate every check in *criteria* against *working_dir*.
@@ -246,7 +246,7 @@ def run_checks(
         label = f"[{i}/{len(criteria.checks)}] type={check.type}"
         logger.info("Acceptance check %s", label)
 
-        error: Optional[str] = None
+        error: str | None = None
         if check.type == "file_exists":
             error = _check_file_exists(check, working_dir)
         elif check.type == "file_contains":
@@ -265,6 +265,21 @@ def run_checks(
         else:
             logger.info("Acceptance check PASSED: %s", label)
             detail_lines.append(f"  PASS {label}")
+
+    # --- Implementation constraints (run only when acceptance checks pass) ---
+    if len(failed) == 0 and implementation_constraints:
+        from .constraint_checker import check_all_constraints  # noqa: PLC0415
+        constraint_results = check_all_constraints(implementation_constraints, working_dir, api_key)
+        for cr in constraint_results:
+            label = f"[constraint/{cr.id}]"
+            if cr.passed:
+                logger.info("Implementation constraint PASSED: %s", label)
+                detail_lines.append(f"  PASS {label}: {cr.reason}")
+            else:
+                msg = f"{label}: {cr.reason}"
+                logger.warning("Implementation constraint FAILED: %s", msg)
+                failed.append(msg)
+                detail_lines.append(f"  FAIL {label}: {cr.reason}")
 
     passed = len(failed) == 0
     details = "\n".join(detail_lines)

@@ -27,6 +27,8 @@ build/
 
 # Testing
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 .tox/
@@ -34,8 +36,13 @@ htmlcov/
 # IDE
 .vscode/
 .idea/
+.vs/
 *.swp
 *.swo
+
+# Claude Code session state (user-level)
+.claude/
+.claude-runner/
 
 # OS
 .DS_Store

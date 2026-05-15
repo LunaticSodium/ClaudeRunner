@@ -21,12 +21,12 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-ENTRY_POINT = PROJECT_ROOT / "claude_runner" / "main.py"
+ENTRY_POINT = PROJECT_ROOT / "claude_runner" / "__main__.py"
 DIST_DIR = PROJECT_ROOT / "dist"
 BUILD_DIR = PROJECT_ROOT / "build"
 SPEC_FILE = PROJECT_ROOT / "claude-runner.spec"
 EXE_NAME = "claude-runner"
-VERSION = "0.1.0"
+VERSION = "1.1.0"
 
 # Submodules that PyInstaller may not detect automatically via static analysis
 HIDDEN_IMPORTS = [
@@ -45,6 +45,23 @@ HIDDEN_IMPORTS = [
     "claude_runner.sandbox",
     "claude_runner.sandbox.docker_sandbox",
     "claude_runner.sandbox.native_sandbox",
+    "claude_runner.cccs_parser",
+    "claude_runner.supervisor_protocol",
+    "claude_runner.worker_supervisor",
+    "claude_runner.thinking_manual",
+    "claude_runner.kpi_collector",
+    "claude_runner.supervisor_audit",
+    "claude_runner.ntfy_client",
+    "claude_runner.inbox",
+    "claude_runner.git_inbox",
+    "claude_runner.preflight",
+    "claude_runner.model_watchdog",
+    "claude_runner.model_resolver",
+    "claude_runner.constraint_checker",
+    "claude_runner.acceptance_runner",
+    "claude_runner.pipeline",
+    "claude_runner.autostart",
+    "claude_runner.daemon",
     # Third-party deps that are sometimes missed
     "click",
     "yaml",
@@ -66,6 +83,7 @@ HIDDEN_IMPORTS = [
 DATA_FILES_WIN = [
     ("docker/Dockerfile", "docker/"),
     ("projects/*.yaml", "projects/"),
+    ("claude_runner/presets/*", "claude_runner/presets/"),
 ]
 
 # apprise loads notification plugins by scanning its own package directory at
@@ -155,6 +173,15 @@ def _build(debug: bool) -> int:
     # Hidden imports
     for mod in HIDDEN_IMPORTS:
         cmd += ["--hidden-import", mod]
+
+    # Exclude modules that pull in large, unneeded Anaconda MKL/MPI/SYCL
+    # dependencies and generate harmless but noisy "Library not found" warnings.
+    for exc in (
+        "mkl", "numpy.distutils", "scipy", "pandas",
+        "matplotlib", "IPython", "notebook", "pytest",
+        "debugpy", "pydevd",
+    ):
+        cmd += ["--exclude-module", exc]
 
     # Data files
     cmd += _resolve_data_args()

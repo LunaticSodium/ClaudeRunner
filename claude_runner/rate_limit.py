@@ -33,7 +33,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -126,7 +126,7 @@ class RateLimitError(Exception):
         message: str,
         *,
         waits_exhausted: int = 0,
-        reset_at: Optional[datetime] = None,
+        reset_at: datetime | None = None,
     ) -> None:
         super().__init__(message)
         self.waits_exhausted = waits_exhausted
@@ -178,15 +178,15 @@ class RateLimitDetector:
 
     def __init__(
         self,
-        on_rate_limit: Optional[Callable[[datetime], None]] = None,
+        on_rate_limit: Callable[[datetime], None] | None = None,
     ) -> None:
         self._on_rate_limit = on_rate_limit
-        self._reset_at: Optional[datetime] = None
+        self._reset_at: datetime | None = None
         self._detected: bool = False
         # Set when a ##RUNNER:COMPLETE## marker is matched.
         self._runner_complete: bool = False
         # Set to the error description when a ##RUNNER:ERROR:...## marker is matched.
-        self._runner_error: Optional[str] = None
+        self._runner_error: str | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -263,7 +263,7 @@ class RateLimitDetector:
 
         return False
 
-    def get_reset_time(self) -> Optional[datetime]:
+    def get_reset_time(self) -> datetime | None:
         """Return the parsed reset ``datetime`` (UTC) if a rate limit was detected."""
         return self._reset_at
 
@@ -277,7 +277,7 @@ class RateLimitDetector:
         return self._runner_complete
 
     @property
-    def matched_runner_error(self) -> Optional[str]:
+    def matched_runner_error(self) -> str | None:
         """
         The error description extracted from ``##RUNNER:ERROR:<description>##``,
         or ``None`` if no such marker was detected.
@@ -308,7 +308,7 @@ class RateLimitDetector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_timestamp(match: re.Match[str]) -> Optional[datetime]:
+    def _parse_timestamp(match: re.Match[str]) -> datetime | None:
         """
         Extract the first capture group from *match* and convert it to a
         UTC-aware ``datetime``.  Returns None if no group was captured or
@@ -397,7 +397,7 @@ class RateLimitWaiter:
         self._tick_interval = max(1.0, float(tick_interval))
         self._buffer_seconds = max(0.0, float(buffer_seconds))
         self._cancelled = False
-        self._cancel_event: Optional[asyncio.Event] = None
+        self._cancel_event: asyncio.Event | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -445,7 +445,7 @@ class RateLimitWaiter:
                 # If we reach here, the cancel event was set.
                 log.info("RateLimitWaiter cancelled after %.1fs", elapsed)
                 return
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass  # Normal path — tick interval elapsed
 
             elapsed += sleep_for

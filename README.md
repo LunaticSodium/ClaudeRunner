@@ -1,4 +1,4 @@
-# claude-runner · v1.0.0
+# claude-runner · v2.0
 
 `claude-runner` is a Windows CLI tool that orchestrates
 [Claude Code](https://docs.anthropic.com/claude/docs/claude-code) as a fully
@@ -7,6 +7,12 @@ point the runner at it, and it drives Claude Code end-to-end: spinning up an
 isolated sandbox, feeding Claude its instructions, monitoring for rate-limit
 pauses, managing context length, routing notifications, and optionally
 switching models as the task progresses through phases.
+
+**v2.0** adds a two-tier adversarial supervision system: a Marathon Runner
+(supervisor) manages N Dash Runner (worker) subprocesses with budget-gated
+interventions, dual-channel enforcement, and two-track analytical reasoning.
+It also adds bidirectional ntfy messaging, a pending.md inbox lifecycle, and
+CLI launch flags for protocol selection.
 
 The result is an unattended, long-running automation loop suitable for
 overnight coding sessions, multi-hour pipelines, and any task too large to
@@ -20,16 +26,18 @@ supervise manually.
 2. [Install](#install)
 3. [Prerequisites](#prerequisites)
 4. [Quick Start](#quick-start)
-5. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
-6. [Phase-Aware Model Switching](#phase-aware-model-switching)
-7. [Project Book Reference](#project-book-reference)
-8. [CLI Reference](#cli-reference)
-9. [Sandbox Modes](#sandbox-modes)
-10. [Notifications](#notifications)
-11. [Acceptance Criteria](#acceptance-criteria)
-12. [Configuration](#configuration)
-13. [Development](#development)
-14. [License](#license)
+5. [Supervisor Protocol](#supervisor-protocol)
+6. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
+7. [Phase-Aware Model Switching](#phase-aware-model-switching)
+8. [Project Book Reference](#project-book-reference)
+9. [CLI Reference](#cli-reference)
+10. [ntfy Messaging](#ntfy-messaging)
+11. [Sandbox Modes](#sandbox-modes)
+12. [Notifications](#notifications)
+13. [Acceptance Criteria](#acceptance-criteria)
+14. [Configuration](#configuration)
+15. [Development](#development)
+16. [License](#license)
 
 ---
 
@@ -134,6 +142,68 @@ claude-runner will:
 3. Stream output to your terminal
 4. Handle rate-limit pauses, context overflows, and retries automatically
 5. Send a desktop notification on completion or error
+
+---
+
+## Supervisor Protocol
+
+The supervisor protocol enables two-tier adversarial supervision.  A Marathon
+Runner (supervisor) manages N Dash Runner (worker) subprocesses, monitoring
+their KPIs, diagnosing underperformance, and intervening when needed.
+
+Enable it with a CLI flag — the project book describes the task, not the
+execution mode:
+
+```cmd
+claude-runner run my-task.yaml --supervisor
+claude-runner run my-task.yaml --supervisor --supervisor-model claude-sonnet-4-6
+```
+
+### What happens at launch
+
+1. **Intake validation** — supervisor LLM checks the project book for
+   completeness (design space, objectives, constraints, output spec, domain
+   anchors).  "Fail" blocks launch.
+2. **Analytical pre-flight** — two-track reasoning (Track 1 creative +
+   Track 2 controlled) surfaces unknown unknowns before any worker starts.
+   Findings written to `audit/preflight_findings.md`.
+
+### Budget system
+
+The supervisor starts with 10 points.  Failed interventions deduct points;
+correct pre-flight predictions earn points back.  At 0 points, interventions
+are blocked (hard gate).
+
+| Event | Points |
+|---|---|
+| Worker crash (L3 restart) | -3 |
+| Worker crash (L1 re-describe) | -1 |
+| Misdiagnosis | -2 |
+| False flag | -4 |
+| Correct pre-flight | +1 |
+
+Budget status is injected into the worker's `pending.md` at each checkpoint
+(soft channel) and enforced in Python before any intervention (hard channel).
+
+### Intervention levels
+
+1. **L1 Re-describe** — rewrite worker's project YAML with clearer target
+2. **L2 Split** — decompose stalled task into two smaller project YAMLs
+3. **L3 Restart** — kill and relaunch with adjusted parameters
+
+All interventions pass a 5-gate check: budget > 0, process not actively
+computing, 30-min cooldown, max 3 per worker, and cause is not
+rate-limit/environment.
+
+### Audit files
+
+| File | Purpose |
+|---|---|
+| `audit/supervisor_log.md` | All events timestamped |
+| `audit/supervisor_budget.md` | Budget state (LLM cannot modify) |
+| `audit/preflight_findings.md` | Pre-flight analysis results |
+| `audit/self_check_log.md` | Post-Dash self-check results |
+| `audit/accident_snapshots/` | Frozen supervisor thinking at each failure |
 
 ---
 
@@ -408,6 +478,10 @@ acceptance_criteria:
 |---|---|
 | `run <project>` | Start a project run.  `<project>` is a YAML path or a name matched against `projects/*.yaml`. |
 | `run <project> --dry-run` | Validate the project book and print the prompt without starting Claude. |
+| `run <project> --marathon` | Run with marathon runway (single model, survives restarts). |
+| `run <project> --cccs` | Run with CCCS protocol enabled. |
+| `run <project> --supervisor` | Run with supervisor protocol (intake, pre-flight, budget). |
+| `run <project> --supervisor-model <id>` | Override model for supervisor LLM calls. |
 | `validate <project>` | Validate a project book's YAML schema.  Exits 0 on success. |
 | `status` | Show all active and recently completed runs. |
 | `status <project>` | Detailed status for a single run. |
@@ -415,13 +489,76 @@ acceptance_criteria:
 | `abort <project> --force` | Kill immediately (SIGKILL). |
 | `logs <project>` | Stream the live log or print the saved log. |
 | `logs <project> --tail 50` | Last 50 lines only. |
-| `configure` | Interactive setup wizard. |
+| `configure` | Interactive setup wizard (auth, notifications, ntfy channels, features). |
 | `configure --show` | Print current configuration (API key masked). |
+| `ntfy send "message"` | Send a message to the human via ntfy out channel. |
+| `ntfy poll` | Poll for new inbound messages on the cmd channel. |
+| `ntfy listen` | Long-poll the cmd channel (blocks until Ctrl-C or sentinel). |
+| `ntfy set-channels --out <name> --cmd <name>` | Configure ntfy channel names directly. |
+| `ntfy show-channels` | Display configured ntfy channel names. |
 | `docker pull` | Pull the latest claude-runner Docker base image. |
 | `docker build` | Rebuild the local Docker image from `docker/Dockerfile`. |
 | `docker prune` | Remove stopped containers and dangling images. |
 | `marathon start` | Start the persistent marathon daemon. |
 | `marathon stop` | Stop the marathon daemon. |
+
+---
+
+## ntfy Messaging
+
+v2.0 adds bidirectional messaging between the runner and a human operator via
+[ntfy.sh](https://ntfy.sh).  Two channels are used:
+
+| Channel | Direction | Purpose |
+|---|---|---|
+| Out channel | runner → human | Notifications, alerts, LLM responses |
+| Cmd channel | human → runner | Commands, overrides, questions |
+
+### Setup
+
+```cmd
+claude-runner ntfy set-channels --out my-topic --cmd my-topic-cmd
+```
+
+Or configure during `claude-runner configure`.  Channel names are stored in
+Windows Credential Manager.
+
+### How messages flow
+
+**Inbound** (human → LLM):
+1. Human sends a message to the cmd channel (via ntfy app or CLI)
+2. Auto-poll script writes it to `~/.claude-runner/inbox/pending.md`
+3. Runner injects "read pending.md" at next natural pause
+4. LLM reads and responds
+
+**Outbound** (LLM → human):
+1. After drain, `processing_pending_message` flag activates response capture
+2. LLM output is buffered until an end marker or 50 lines
+3. Captured response is auto-forwarded to the ntfy out channel
+
+### Standalone usage
+
+The ntfy client works outside the runner — any Claude Code instance or script
+can use it:
+
+```bash
+# Send
+claude-runner ntfy send "Build complete, 0 failures"
+python -m claude_runner.ntfy_client send out "message"
+
+# Receive
+claude-runner ntfy poll
+claude-runner ntfy listen    # long-poll, stops on Ctrl-C or ntfy.stop file
+
+# Direct file access (outsider Claude Code)
+cat ~/.claude-runner/inbox/pending.md
+```
+
+### pending.md lifecycle
+
+- Hard size limit: 32 KB — oldest entries trimmed automatically
+- Two flags: `has_pending_messages` (unread) + `processing_pending_message` (capturing response)
+- Truncated after LLM consumes content
 
 ---
 
@@ -487,6 +624,12 @@ notify:
 | `error` | Unrecoverable failure |
 | `rate_limit` | API rate limit hit |
 | `model_switch` | ModelWatchdog fired (dash runway) |
+| `supervisor_accident` | Supervisor budget points deducted |
+| `intake_pass` / `intake_fail` | After intake validation |
+| `preflight_finding` | Thinking Manual finding surfaced |
+| `kpi_warning` | Worker underperformance detected |
+| `intervention` | Supervisor intervention executed |
+| `escalate_to_human` | Intervention limit reached — human needed |
 
 ---
 
@@ -579,10 +722,13 @@ pip install -e ".[dev]"
 ### Tests
 
 ```cmd
-pytest tests/                    # all 407 tests
+pytest tests/                    # all 523 tests
 pytest tests/ -k cccs            # CCCS parser (32 tests)
 pytest tests/ -k watchdog        # ModelWatchdog (23 tests)
 pytest tests/ -k configure       # configure wizard (15 tests)
+pytest tests/ -k supervisor      # supervisor protocol + worker supervisor
+pytest tests/ -k inbox           # pending.md inbox lifecycle
+pytest tests/ -k ntfy            # ntfy client + CLI
 ```
 
 ### Lint / type-check
@@ -604,6 +750,7 @@ python build_exe.py --clean
 ```
 claude-runner/
   claude_runner/
+    __main__.py            python -m claude_runner entry point
     main.py                CLI entry point (Click)
     runner.py              Core orchestration loop
     config.py              Config loading (config.yaml + secrets)
@@ -614,13 +761,20 @@ claude-runner/
     acceptance_runner.py   Post-completion acceptance checks
     persistence.py         Task state and checkpoint management
     notify.py              Notification dispatch
-    ntfy_client.py         ntfy.sh client
+    ntfy_client.py         ntfy.sh client + CLI (send/poll/listen)
+    inbox.py               pending.md lifecycle (two-flag system)
     rate_limit.py          Rate-limit detection and backoff
     tui.py                 Rich terminal UI
-    daemon.py              Marathon persistent daemon
+    daemon.py              Marathon persistent daemon + worker dispatch
     autostart.py           Windows Task Scheduler registration
     pipeline.py            Inbound message pipeline
     git_inbox.py           Git-based message injection
+    supervisor_protocol.py Budget, protocol enforcement, call_supervisor_llm()
+    worker_supervisor.py   5-gate intervention engine (L1/L2/L3)
+    kpi_collector.py       Worker metrics, progress rate, peer ranking
+    thinking_manual.py     Two-track reasoning (creative + controlled)
+    supervisor_audit.py    Structured audit file writing
+    supervisor_lib.md      LLM spellbook — supervisor tool reference
     sandbox/
       docker_sandbox.py
       native_sandbox.py
@@ -628,10 +782,12 @@ claude-runner/
       cccs-v1.0.cccs.toml  Bundled C# scientific simulation standard
   docs/
     CCCS_SPEC.md           CCCS parser implementation specification
+    IMPLEMENTATION_LOG_v2.0.md  Detailed changelog from v1.1 to v2.0
   projects/
     examples.yaml          Furina ASCII art (example task)
     self-test.yaml         Runner self-diagnostic
-  tests/                   407 tests
+    bto_runner.yaml        BTO modulator simulation project
+  tests/                   523 tests
   docker/
     Dockerfile
   watchdog.py              Standalone process watchdog (restart on crash)

@@ -10,9 +10,7 @@ Usage:
 """
 
 import logging
-import sys
 from pathlib import Path
-from typing import Optional
 
 from .docker_sandbox import DockerSandbox
 from .native_sandbox import NativeSandbox
@@ -32,7 +30,7 @@ _RUNNER_SOURCE_ROOT: Path = Path(__file__).resolve().parent.parent.parent
 
 def resolve_working_dir(
     project_book,
-    book_path: Optional[Path] = None,
+    book_path: Path | None = None,
 ) -> Path:
     """Return the effective working directory for a task.
 
@@ -125,7 +123,7 @@ def resolve_working_dir(
     return wd
 
 
-def create_sandbox(project_book, config, api_key: str, book_path: Optional[Path] = None, *, show_claude: bool = False):
+def create_sandbox(project_book, config, api_key: str, book_path: Path | None = None, *, show_claude: bool = False):
     """
     Returns DockerSandbox if docker backend is configured and Docker is available,
     otherwise falls back to NativeSandbox with a warning log.

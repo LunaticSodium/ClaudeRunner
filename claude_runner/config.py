@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -195,7 +195,7 @@ class Config:
     # ------------------------------------------------------------------
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls) -> Config:
         """Load configuration from ``~/.claude-runner/config.yaml``.
 
         Missing file → silently return defaults.

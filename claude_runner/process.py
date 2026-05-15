@@ -22,15 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
-import os
 import subprocess
 import sys
-import logging
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +70,7 @@ class ProcessError(Exception):
 # Backend detection
 # ---------------------------------------------------------------------------
 
-_BACKEND: Optional[str] = None  # "winpty" | "wexpect" | None (detected lazily)
+_BACKEND: str | None = None  # "winpty" | "wexpect" | None (detected lazily)
 
 
 def _detect_backend() -> str:
@@ -151,12 +150,12 @@ class ClaudeProcess:
         self._cols = cols
         self._rows = rows
 
-        self._backend: Optional[str] = None
+        self._backend: str | None = None
         self._pty = None          # winpty.PtyProcess  or  wexpect child
         self._pid: int = -1
-        self._exit_code: Optional[int] = None
+        self._exit_code: int | None = None
 
-        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -277,7 +276,7 @@ class ClaudeProcess:
         return self._pid
 
     @property
-    def exit_code(self) -> Optional[int]:
+    def exit_code(self) -> int | None:
         """
         Exit code of the subprocess, or None if it is still running.
         -1 indicates an abnormal termination without a retrievable exit status.
@@ -361,7 +360,7 @@ class ClaudeProcess:
                 except Exception as cb_exc:
                     log.warning("on_exit callback raised: %s", cb_exc)
 
-    def _read_chunk(self) -> Optional[str]:
+    def _read_chunk(self) -> str | None:
         """
         Read a chunk of output from the PTY.
 
@@ -382,9 +381,8 @@ class ClaudeProcess:
             log.debug("_read_chunk error (treating as EOF): %s", exc)
             return None
 
-    def _read_chunk_winpty(self) -> Optional[str]:
+    def _read_chunk_winpty(self) -> str | None:
         """Read from a pywinpty PtyProcess."""
-        import winpty
 
         if not self._pty.isalive():
             # Drain any buffered data first
@@ -409,7 +407,7 @@ class ClaudeProcess:
             return data.decode("utf-8", errors="replace")
         return data
 
-    def _read_chunk_wexpect(self) -> Optional[str]:
+    def _read_chunk_wexpect(self) -> str | None:
         """Read from a wexpect child."""
         import wexpect
 
@@ -518,6 +516,7 @@ class PipeProcess:
         on_exit: Callable[[int], None],
         *,
         show_console: bool = False,
+        stdin_text: str | None = None,
         **_kwargs,  # absorb cols/rows that ClaudeProcess accepts
     ) -> None:
         self._command = list(command)
@@ -526,12 +525,13 @@ class PipeProcess:
         self._on_line = on_line
         self._on_exit = on_exit
         self._show_console = show_console
+        self._stdin_text = stdin_text
 
-        self._proc: Optional[subprocess.Popen] = None
+        self._proc: subprocess.Popen | None = None
         self._pid: int = -1
-        self._exit_code: Optional[int] = None
+        self._exit_code: int | None = None
 
-        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         # Set by _deliver_line() when the first output line arrives.
         # Used by start() to verify the process is producing output.
@@ -565,13 +565,13 @@ class PipeProcess:
                 # the pipe handles set in STARTUPINFO.
                 creation_flags = _sp.DETACHED_PROCESS
 
-        # stdin=None: child inherits the parent's stdin handle (the user's terminal).
-        # This is the key fix: with stdin=PIPE and no writer, Claude Code blocks
-        # on a read(stdin) forever because it supports "echo prompt | claude -p".
-        # With an inherited terminal stdin, Claude Code can start immediately.
-        # Both production mode and show_console mode use None; the only difference
-        # between the modes is the creation flags (DETACHED_PROCESS vs CREATE_NEW_CONSOLE).
-        stdin_handle = None
+        # stdin handling:
+        # - When stdin_text is provided (long prompt piped via stdin), use PIPE
+        #   and write+close after spawn.  Claude Code reads the prompt from stdin
+        #   when invoked with `-p -`.
+        # - Otherwise stdin=None: child inherits the parent's stdin handle.
+        #   With stdin=PIPE and no writer, Claude Code blocks forever.
+        stdin_handle = _sp.PIPE if self._stdin_text else None
 
         try:
             self._proc = _sp.Popen(
@@ -585,6 +585,14 @@ class PipeProcess:
             )
         except Exception as exc:
             raise ProcessError(f"Failed to spawn subprocess: {exc}") from exc
+
+        # Pipe the prompt into stdin and close so Claude Code sees EOF.
+        if self._stdin_text and self._proc.stdin:
+            try:
+                self._proc.stdin.write(self._stdin_text.encode("utf-8"))
+                self._proc.stdin.close()
+            except Exception as exc:
+                log.warning("Failed to write prompt to stdin: %s", exc)
 
         self._pid = self._proc.pid
         self._stop_event.clear()
@@ -660,7 +668,16 @@ class PipeProcess:
             try:
                 self._proc.terminate()
             except Exception as exc:
-                log.debug("PipeProcess.stop(): ignoring error on terminate: %s", exc)
+                log.debug("PipeProcess.stop(): terminate failed: %s", exc)
+            # Wait briefly for graceful exit, then force-kill if still alive.
+            try:
+                self._proc.wait(timeout=min(timeout, 3.0))
+            except Exception:
+                try:
+                    log.warning("PipeProcess: terminate did not exit in time — force-killing.")
+                    self._proc.kill()
+                except Exception as exc2:
+                    log.warning("PipeProcess: kill also failed: %s", exc2)
         if self._reader_thread and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=timeout)
         log.info("PipeProcess stopped (exit_code=%s)", self._exit_code)
@@ -686,7 +703,7 @@ class PipeProcess:
         return self._pid
 
     @property
-    def exit_code(self) -> Optional[int]:
+    def exit_code(self) -> int | None:
         return self._exit_code
 
     # ------------------------------------------------------------------
@@ -773,6 +790,21 @@ class PipeProcess:
             self._deliver_line("[·]")
 
         elif event_type == "result":
+            # Emit authoritative token usage BEFORE the success/error markers
+            # so the runner's context manager has the accurate count even when
+            # the orchestrator promptly stops on a ##RUNNER:COMPLETE## or error
+            # marker on the same final line batch.
+            usage = event.get("usage", {})
+            if usage:
+                total = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                    + usage.get("output_tokens", 0)
+                )
+                if total > 0:
+                    self._deliver_line(f"##RUNNER:USAGE:{total}##")
+
             subtype = event.get("subtype", "")
             is_error = event.get("is_error", False)
             if subtype == "success" and not is_error:

@@ -34,7 +34,6 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
-from typing import Optional
 
 import yaml
 from pydantic import ValidationError
@@ -121,7 +120,7 @@ def fetch_branch(branch_ref: str, daemon) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _get_github_token() -> Optional[str]:
+def _get_github_token() -> str | None:
     """Retrieve the GitHub token from Windows Credential Manager."""
     try:
         import keyring  # type: ignore[import-untyped]
@@ -136,7 +135,7 @@ def _get_github_token() -> Optional[str]:
         return None
 
 
-def _get_repo_url() -> Optional[str]:
+def _get_repo_url() -> str | None:
     """Retrieve the GitHub repo URL from keyring, then environment variable."""
     # Try keyring first.
     try:

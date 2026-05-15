@@ -5,18 +5,26 @@ Persistent marathon daemon that polls the ntfy cmd channel and dispatches tasks.
 
 Launched when `claude-runner` is invoked with no arguments in marathon mode,
 or explicitly via `claude-runner marathon`.
+
+v2.0: Multi-worker management. Supervisor dispatches workers by writing
+project books — NEVER executes worker scripts directly. Workers are always
+dash mode, never marathon. Destructive actions cost budget points.
 """
 from __future__ import annotations
 
 import logging
 import os
 import pathlib
+import subprocess
+import sys
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .config import Config as GlobalConfig
+    from .supervisor_protocol import SupervisorProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +40,16 @@ class MarathonDaemon:
     mode, or explicitly via ``claude-runner marathon``.
     """
 
-    def __init__(self, config: "GlobalConfig") -> None:
+    def __init__(self, config: GlobalConfig) -> None:
         self.config = config
         self.start_time: datetime = datetime.now(timezone.utc)
-        self.active_task: Optional[str] = None  # task name string
+        self.active_task: str | None = None  # task name string
         self._shutdown = threading.Event()
-        self._ntfy_client: Optional[object] = None  # NtfyClient, set lazily
+        self._ntfy_client: object | None = None  # NtfyClient, set lazily
+        self._supervisor: SupervisorProtocol | None = None  # set by caller if enabled
+        # v2.0: Multi-worker registry
+        self._workers: dict[str, WorkerHandle] = {}
+        self._worker_counter: int = 0
 
     # ------------------------------------------------------------------
     # Public interface
@@ -70,6 +82,146 @@ class MarathonDaemon:
         """Signal the daemon to exit after the current poll completes."""
         self._shutdown.set()
 
+    def pause_project(self, project_id: str) -> None:
+        """Request a graceful pause of a named running project.
+
+        Writes ``pause_requested=True`` into the project's state file so the
+        running :class:`~claude_runner.runner.TaskRunner` picks it up on its
+        next main-loop iteration.
+
+        Parameters
+        ----------
+        project_id:
+            The project identifier (YAML filename stem) of the running task.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no state file exists for *project_id*.
+        """
+        import json  # noqa: PLC0415
+
+
+        state_dir = pathlib.Path.home() / ".claude-runner" / "state"
+        state_path = state_dir / f"{project_id}.json"
+        if not state_path.exists():
+            raise FileNotFoundError(
+                f"No state file for project {project_id!r} — is it running?"
+            )
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        data["pause_requested"] = True
+        state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        logger.info("pause_project: set pause_requested=True for %r", project_id)
+
+    def resume_project(self, project_id: str) -> None:
+        """Resume a paused project by launching it again with resume=True.
+
+        Rewrites the state file phase to "resuming" and spawns a new
+        ``claude-runner run`` subprocess.
+
+        Parameters
+        ----------
+        project_id:
+            The project identifier of the paused task.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no state file exists for *project_id*.
+        ValueError
+            If the state file exists but the task is not paused.
+        """
+        import json  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        state_dir = pathlib.Path.home() / ".claude-runner" / "state"
+        state_path = state_dir / f"{project_id}.json"
+        if not state_path.exists():
+            raise FileNotFoundError(
+                f"No state file for project {project_id!r}."
+            )
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if data.get("current_phase") != "paused":
+            raise ValueError(
+                f"Project {project_id!r} is not paused "
+                f"(phase={data.get('current_phase')!r})."
+            )
+
+        project_book_path = data.get("project_book_path")
+        if not project_book_path:
+            raise ValueError(
+                f"State file for {project_id!r} has no project_book_path."
+            )
+
+        # Mark as resuming so the runner knows.
+        data["current_phase"] = "resuming"
+        data["paused"] = False
+        data["pause_requested"] = False
+        state_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+        # Spawn a detached resume process.
+        cmd = [sys.executable, "-m", "claude_runner", "resume", project_id]
+        subprocess.Popen(
+            cmd,
+            stdin=None,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x00000008 if hasattr(subprocess, "DETACHED_PROCESS") else 0,
+        )
+        logger.info("resume_project: spawned resume process for %r", project_id)
+
+    def on_dash_complete(self, dash_n: int) -> None:
+        """Called after each Dash task completes.
+
+        If the supervisor protocol is enabled, triggers the post-Dash
+        self-check.
+
+        Parameters
+        ----------
+        dash_n:
+            The Dash number that just completed (1-based).
+        """
+        if self._supervisor is not None:
+            try:
+                self._supervisor.trigger_self_check(dash_n)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on_dash_complete: supervisor self-check failed: %s", exc)
+
+    def supervisor_confirm(self, intent_message: str) -> bool:
+        """Gate an intent through the supervisor confirm loop.
+
+        If supervisor protocol is not enabled, always returns True.
+
+        Parameters
+        ----------
+        intent_message:
+            Description of the intended action.
+
+        Returns
+        -------
+        bool
+            ``True`` if the action should proceed, ``False`` if it should be
+            skipped (timeout or not confirmed).
+        """
+        if self._supervisor is None:
+            return True
+        try:
+            confirmed = self._supervisor.wait_for_confirm(intent_message)
+            if not confirmed:
+                logger.info(
+                    "supervisor_confirm: intent not confirmed (timeout) — action skipped: %s",
+                    intent_message,
+                )
+                self._supervisor.log_event(
+                    "ACTION_SKIPPED",
+                    f"not confirmed within timeout: {intent_message!r}",
+                )
+            return confirmed
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("supervisor_confirm failed: %s", exc)
+            return True  # fail-open so daemon doesn't deadlock
+
     def status(self) -> dict:
         """Return daemon uptime, active task name, and shutdown state."""
         now = datetime.now(timezone.utc)
@@ -99,7 +251,7 @@ class MarathonDaemon:
 
             # Load persisted last_message_id.
             state = _load_ntfy_state()
-            since_id: Optional[str] = state.get("last_message_id")
+            since_id: str | None = state.get("last_message_id")
 
             messages = client.poll("cmd", since_id)
             for msg in messages:
@@ -120,7 +272,7 @@ class MarathonDaemon:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to publish to out channel: %s", exc)
 
-    def _get_ntfy_client(self) -> Optional[object]:
+    def _get_ntfy_client(self) -> object | None:
         """Lazily initialise and return NtfyClient."""
         if self._ntfy_client is None:
             try:
@@ -129,6 +281,120 @@ class MarathonDaemon:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("NtfyClient init failed: %s — daemon continues without ntfy.", exc)
         return self._ntfy_client
+
+    # ------------------------------------------------------------------
+    # v2.0: Multi-worker dispatch
+    # ------------------------------------------------------------------
+
+    def dispatch_worker(self, project_book_path: str) -> str:
+        """Launch a new Dash worker for a project book.
+
+        The supervisor dispatches workers by writing project books and
+        launching sub-runners — it NEVER executes worker scripts directly.
+        Workers always run in dash mode, never marathon.
+
+        Parameters
+        ----------
+        project_book_path:
+            Path to the worker's project book YAML.
+
+        Returns
+        -------
+        str
+            The worker ID assigned (e.g. "D1").
+        """
+        self._worker_counter += 1
+        worker_id = f"D{self._worker_counter}"
+
+        handle = WorkerHandle(
+            worker_id=worker_id,
+            project_book_path=project_book_path,
+            started_at=datetime.now(timezone.utc),
+        )
+
+        # Launch the worker as a detached subprocess
+        cmd = [sys.executable, "-m", "claude_runner", "run", project_book_path]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=None,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x00000008 if hasattr(subprocess, "DETACHED_PROCESS") else 0,
+            )
+            handle.process_pid = proc.pid
+            logger.info("dispatch_worker: launched %s (PID=%d) for %s", worker_id, proc.pid, project_book_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("dispatch_worker: failed to launch %s: %s", worker_id, exc)
+            handle.completed = True
+
+        self._workers[worker_id] = handle
+        self._notify_out(f"Worker {worker_id} dispatched: {project_book_path}")
+        return worker_id
+
+    def terminate_worker(self, worker_id: str, reason: str = "") -> bool:
+        """Terminate a worker and mark as completed.
+
+        WARNING: This is a destructive intervention — costs budget points.
+
+        Parameters
+        ----------
+        worker_id:
+            The worker to terminate.
+        reason:
+            Why the worker is being terminated.
+
+        Returns
+        -------
+        bool
+            True if terminated successfully.
+        """
+        handle = self._workers.get(worker_id)
+        if handle is None:
+            logger.warning("terminate_worker: unknown worker %s", worker_id)
+            return False
+
+        if handle.process_pid is not None:
+            try:
+                import signal  # noqa: PLC0415
+                os.kill(handle.process_pid, signal.SIGTERM)
+                logger.info("terminate_worker: sent SIGTERM to %s (PID=%d)", worker_id, handle.process_pid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("terminate_worker: kill failed for %s: %s", worker_id, exc)
+
+        handle.completed = True
+        handle.completed_at = datetime.now(timezone.utc)
+        self._notify_out(f"Worker {worker_id} terminated. Reason: {reason}")
+        return True
+
+    def list_workers(self) -> dict[str, dict]:
+        """Return status of all workers."""
+        result = {}
+        for wid, handle in self._workers.items():
+            result[wid] = {
+                "project_book": handle.project_book_path,
+                "started_at": handle.started_at.isoformat(),
+                "completed": handle.completed,
+                "pid": handle.process_pid,
+            }
+        return result
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Worker handle
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WorkerHandle:
+    """Tracks a single dispatched Dash worker."""
+
+    worker_id: str
+    project_book_path: str
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    completed: bool = False
+    completed_at: datetime | None = None
+    process_pid: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +422,7 @@ def _remove_pid_file() -> None:
         logger.warning("Failed to remove PID file: %s", exc)
 
 
-def read_daemon_pid() -> Optional[int]:
+def read_daemon_pid() -> int | None:
     """Read the daemon PID from the PID file.  Returns None if not found."""
     try:
         if _PID_FILE.exists():

@@ -18,13 +18,13 @@ from __future__ import annotations
 import datetime
 import logging
 import pathlib
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING
 
 import yaml
 from pydantic import ValidationError
 
-from .project import ProjectBook
 from .ntfy_client import NtfyMessage
+from .project import ProjectBook
 
 if TYPE_CHECKING:
     from .daemon import MarathonDaemon
@@ -69,19 +69,19 @@ class Pipeline:
     RECEIVE → PARSE → CONVERT → LAUNCH → TRASH (on any failure)
     """
 
-    CONTROL_COMMANDS: frozenset = frozenset({"run", "abort", "status", "stop", "fetch"})
+    CONTROL_COMMANDS: frozenset = frozenset({"run", "abort", "status", "stop", "fetch", "pause", "resume"})
 
     # A2: valid branch-ref patterns for the 'fetch' command.
     import re as _re
-    _FETCH_BRANCH_PATTERN: "_re.Pattern" = _re.compile(  # type: ignore[assignment]
+    _FETCH_BRANCH_PATTERN: _re.Pattern = _re.compile(  # type: ignore[assignment]
         r"^(?:task/[A-Za-z0-9_.-]+|inbox/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$"
     )
     MAX_INLINE_YAML_BYTES: int = 4096
 
     def __init__(
         self,
-        daemon: "MarathonDaemon",
-        ntfy_client: "NtfyClient",
+        daemon: MarathonDaemon,
+        ntfy_client: NtfyClient,
     ) -> None:
         self._daemon = daemon
         self._ntfy = ntfy_client
@@ -130,7 +130,7 @@ class Pipeline:
     # Stage 2: PARSE
     # ------------------------------------------------------------------
 
-    def _parse(self, message: NtfyMessage) -> Union[_ControlCommand, _InlineYaml]:
+    def _parse(self, message: NtfyMessage) -> _ControlCommand | _InlineYaml:
         """
         Exact keyword match (case-insensitive, stripped) against CONTROL_COMMANDS.
 
@@ -162,7 +162,7 @@ class Pipeline:
     # Stage 3: CONVERT (inline YAML only)
     # ------------------------------------------------------------------
 
-    def _convert(self, body: str, original_message: NtfyMessage) -> Optional[pathlib.Path]:
+    def _convert(self, body: str, original_message: NtfyMessage) -> pathlib.Path | None:
         """
         Parse and validate inline YAML, write to inbox directory.
 
@@ -294,6 +294,27 @@ class Pipeline:
             self._cmd_stop(original_message)
         elif cmd.keyword == "fetch":
             self._cmd_fetch(cmd.args.strip(), original_message)
+        elif cmd.keyword == "pause":
+            self._cmd_pause(cmd.args.strip(), original_message)
+        elif cmd.keyword == "resume":
+            self._cmd_resume(cmd.args.strip(), original_message)
+
+    def _require_confirm(self, intent_message: str, original_message: NtfyMessage) -> bool:
+        """Gate an action through the supervisor confirm loop (if enabled).
+
+        Returns ``True`` if the action should proceed, ``False`` if it
+        should be skipped.  When the supervisor protocol is not enabled,
+        or when the daemon does not support supervisor_confirm, always
+        returns ``True`` (fail-open).
+        """
+        supervisor_confirm = getattr(self._daemon, "supervisor_confirm", None)
+        if supervisor_confirm is None:
+            return True
+        try:
+            return supervisor_confirm(intent_message)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_require_confirm: supervisor_confirm raised: %s — proceeding.", exc)
+            return True
 
     def _cmd_run(self, name: str, original_message: NtfyMessage) -> None:
         """Find and launch a named project book from the projects/ search path."""
@@ -301,7 +322,6 @@ class Pipeline:
             self._trash("RUN", "run command requires a project name.", original_message.message)
             return
 
-        import os  # noqa: PLC0415
 
         # Search for <name>.yaml in:
         #   1. projects/ relative to cwd
@@ -310,7 +330,7 @@ class Pipeline:
             pathlib.Path.cwd() / "projects",
             _INBOX_DIR,
         ]
-        found: Optional[pathlib.Path] = None
+        found: pathlib.Path | None = None
         for d in search_dirs:
             candidate = d / f"{name}.yaml"
             if candidate.exists():
@@ -321,10 +341,21 @@ class Pipeline:
             self._trash("RUN", f"Project {name!r} not found in search path.", original_message.message)
             return
 
+        if not self._require_confirm(
+            f"Intent: launch project {name!r} from {found}.",
+            original_message,
+        ):
+            logger.info("_cmd_run: action skipped — not confirmed by supervisor.")
+            return
+
         self._launch(found, original_message)
 
     def _cmd_abort(self, name: str, original_message: NtfyMessage) -> None:
         """Abort a named running task (best-effort)."""
+        intent = f"Intent: abort task {name!r}." if name else "Intent: abort current task."
+        if not self._require_confirm(intent, original_message):
+            logger.info("_cmd_abort: action skipped — not confirmed by supervisor.")
+            return
         msg = f"Abort requested for task: {name!r}" if name else "Abort requested."
         logger.info(msg)
         self._ntfy.publish("out", msg, title="claude-runner")
@@ -344,11 +375,56 @@ class Pipeline:
 
     def _cmd_stop(self, original_message: NtfyMessage) -> None:
         """Signal daemon to stop."""
+        if not self._require_confirm("Intent: stop the Marathon daemon.", original_message):
+            logger.info("_cmd_stop: action skipped — not confirmed by supervisor.")
+            return
         self._ntfy.publish("out", "Daemon stop requested.", title="claude-runner")
         try:
             self._daemon.stop()
         except Exception as exc:  # noqa: BLE001
             logger.warning("daemon.stop() failed: %s", exc)
+
+    def _cmd_pause(self, args: str, original_message: NtfyMessage) -> None:
+        """Request a graceful pause of a named running project."""
+        project_id = args.strip()
+        if not project_id:
+            self._trash("PAUSE", "pause command requires a project ID.", original_message.message)
+            return
+        if not self._require_confirm(
+            f"Intent: pause project {project_id!r} at next natural point.",
+            original_message,
+        ):
+            logger.info("_cmd_pause: action skipped — not confirmed by supervisor.")
+            return
+        msg = f"Pause requested for project: {project_id!r}"
+        logger.info(msg)
+        try:
+            self._daemon.pause_project(project_id)
+            self._ntfy.publish("out", msg, title="claude-runner")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daemon.pause_project(%r) failed: %s", project_id, exc)
+            self._ntfy.publish("out", f"[PAUSE] error: {exc}", title="claude-runner")
+
+    def _cmd_resume(self, args: str, original_message: NtfyMessage) -> None:
+        """Resume a paused project."""
+        project_id = args.strip()
+        if not project_id:
+            self._trash("RESUME", "resume command requires a project ID.", original_message.message)
+            return
+        if not self._require_confirm(
+            f"Intent: resume paused project {project_id!r}.",
+            original_message,
+        ):
+            logger.info("_cmd_resume: action skipped — not confirmed by supervisor.")
+            return
+        msg = f"Resume requested for project: {project_id!r}"
+        logger.info(msg)
+        try:
+            self._daemon.resume_project(project_id)
+            self._ntfy.publish("out", msg, title="claude-runner")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daemon.resume_project(%r) failed: %s", project_id, exc)
+            self._ntfy.publish("out", f"[RESUME] error: {exc}", title="claude-runner")
 
     def _cmd_fetch(self, branch_ref: str, original_message: NtfyMessage) -> None:
         """
@@ -367,6 +443,13 @@ class Pipeline:
                 "(task/<name> or inbox/<iso-timestamp>)."
             )
             self._trash("FETCH", reason, original_message.message)
+            return
+
+        if not self._require_confirm(
+            f"Intent: fetch branch {branch_ref!r} and enqueue project books.",
+            original_message,
+        ):
+            logger.info("_cmd_fetch: action skipped — not confirmed by supervisor.")
             return
 
         self._ntfy.publish(

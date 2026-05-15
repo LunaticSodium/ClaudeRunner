@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable
 
 # Sentinel imported lazily to avoid circular imports at module level.
 _OAUTH_SENTINEL: str = "__claude_oauth__"
@@ -33,9 +33,10 @@ logger = logging.getLogger(__name__)
 # is actually used, not at import time of the package.
 # ---------------------------------------------------------------------------
 try:
-    import docker
     import docker.errors
     import docker.types
+
+    import docker
     _DOCKER_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _DOCKER_AVAILABLE = False
@@ -76,7 +77,7 @@ class _DockerClaudeProcess:
         self._container = container
         self._on_line = on_line
         self._on_exit = on_exit
-        self._return_code: Optional[int] = None
+        self._return_code: int | None = None
         self._thread = threading.Thread(target=self._pump, daemon=True, name="docker-pty-pump")
         self._thread.start()
 
@@ -85,10 +86,10 @@ class _DockerClaudeProcess:
     # ------------------------------------------------------------------
 
     @property
-    def return_code(self) -> Optional[int]:
+    def return_code(self) -> int | None:
         return self._return_code
 
-    def wait(self, timeout: Optional[float] = None) -> int:
+    def wait(self, timeout: float | None = None) -> int:
         self._thread.join(timeout=timeout)
         return self._return_code if self._return_code is not None else -1
 
@@ -258,15 +259,15 @@ class DockerSandbox:
         # Derived configuration -----------------------------------------
         sandbox_cfg = getattr(config, "sandbox", None) or {}
         self._image: str = _cfg_get(sandbox_cfg, "image", self.DEFAULT_IMAGE)
-        self._network_allowlist: List[str] = _cfg_get(sandbox_cfg, "network_allowlist", [])
+        self._network_allowlist: list[str] = _cfg_get(sandbox_cfg, "network_allowlist", [])
         self._container_memory: str = _cfg_get(sandbox_cfg, "memory_limit", "2g")
         self._container_cpus: float = float(_cfg_get(sandbox_cfg, "cpu_limit", 2.0))
         self._extra_env: dict = _cfg_get(sandbox_cfg, "extra_env", {})
 
         # Runtime state -------------------------------------------------
-        self._client: Optional["docker.DockerClient"] = None
+        self._client: docker.DockerClient | None = None
         self._container = None
-        self._network_name: Optional[str] = None
+        self._network_name: str | None = None
         self._run_id: str = uuid.uuid4().hex[:12]
 
     # ------------------------------------------------------------------
@@ -452,7 +453,7 @@ class DockerSandbox:
         prompt: str,
         on_line: Callable[[str], None],
         on_exit: Callable[[int], None],
-        model_id: Optional[str] = None,
+        model_id: str | None = None,
     ) -> _DockerClaudeProcess:
         """
         Launch Claude Code inside the running container.
@@ -566,7 +567,7 @@ class DockerSandbox:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _connect(self) -> "docker.DockerClient":
+    def _connect(self) -> docker.DockerClient:
         """Connect to the Docker daemon, raising SandboxError on failure."""
         try:
             client = docker.DockerClient(base_url=self.DOCKER_SOCKET, timeout=10)
@@ -603,7 +604,7 @@ class DockerSandbox:
         deny_all = getattr(pb_network, "deny_all_others", False) if pb_network is not None else False
         make_internal = deny_all and len(self._network_allowlist) == 0
 
-        network = self._client.networks.create(
+        self._client.networks.create(
             name=network_name,
             driver="bridge",
             ipam=ipam_config,

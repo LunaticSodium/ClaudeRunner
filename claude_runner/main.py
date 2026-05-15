@@ -17,7 +17,6 @@ Commands
 from __future__ import annotations
 
 import asyncio
-import glob
 import json
 import logging
 import os
@@ -25,9 +24,7 @@ import pathlib
 import platform
 import shutil
 import smtplib
-import socket
 import sys
-from typing import Optional
 
 import click
 from rich.console import Console
@@ -81,7 +78,7 @@ def _check_docker_quick() -> bool:
     return pathlib.Path("/var/run/docker.sock").exists()
 
 
-def _find_example_template() -> Optional[pathlib.Path]:
+def _find_example_template() -> pathlib.Path | None:
     """Return the path to the bundled examples.yaml template."""
     if getattr(sys, "frozen", False):
         p = pathlib.Path(getattr(sys, "_MEIPASS", "")) / "examples.yaml"
@@ -186,7 +183,7 @@ def _ensure_initialized() -> None:
         return
 
     # Copy example project book next to the exe (frozen builds only)
-    example_dest: Optional[pathlib.Path] = None
+    example_dest: pathlib.Path | None = None
     if getattr(sys, "frozen", False):
         exe_dir = pathlib.Path(sys.argv[0]).parent
         if not list(exe_dir.glob("*.yaml")):
@@ -246,7 +243,7 @@ def _warn(message: str) -> None:
 _OAUTH_SENTINEL = "__claude_oauth__"
 
 
-def _resolve_api_key() -> Optional[str]:
+def _resolve_api_key() -> str | None:
     """
     Resolve ANTHROPIC_API_KEY through the 5-source priority chain.
 
@@ -345,7 +342,7 @@ def _load_global_config():
         _abort(f"Failed to load global config: {exc}")
 
 
-def _find_state_file(task_name: Optional[str]) -> Optional[pathlib.Path]:
+def _find_state_file(task_name: str | None) -> pathlib.Path | None:
     """Locate a state file for the given task name (or the most recent one)."""
     if task_name:
         candidate = _DEFAULT_STATE_DIR / f"{task_name}.json"
@@ -424,7 +421,47 @@ def cli() -> None:
     default=False,
     help="Open Claude Code in a visible console window. Implies --verbose. For diagnosing process communication issues only.",
 )
-def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude: bool) -> None:
+@click.option(
+    "--skip-preflight",
+    is_flag=True,
+    default=False,
+    help="Skip all pre-flight checks (working_dir, env vars, ntfy reachability, …).",
+)
+@click.option(
+    "--marathon",
+    is_flag=True,
+    default=False,
+    help="Enable marathon mode (survival: auto-restart, watchdog, long runtime).",
+)
+@click.option(
+    "--cccs",
+    is_flag=True,
+    default=False,
+    help="Enable CCCS protocol for this run.",
+)
+@click.option(
+    "--supervisor",
+    is_flag=True,
+    default=False,
+    help="Enable supervisor protocol (v2.0: budget, intake, pre-flight, KPI, ntfy).",
+)
+@click.option(
+    "--supervisor-model",
+    default=None,
+    help="Model for supervisor LLM calls (e.g. 'claude-opus-4-6'). Implies --supervisor.",
+)
+def run(
+    project_book: str,
+    tui: bool,
+    dry_run: bool,
+    verbose: bool,
+    show_claude: bool,
+    skip_preflight: bool,
+    marathon: bool,
+    cccs: bool,
+    supervisor: bool,
+    supervisor_model: str | None,
+) -> None:
     """Run a claude-runner project book.
 
     PROJECT_BOOK is the path to a .yaml project book file.  A bare filename
@@ -446,6 +483,32 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude:
     # ── Load project book ──────────────────────────────────────────────────────
     pb = _load_project_book(project_book)
     config = _load_global_config()
+
+    # ── Apply CLI launch flags (override project book) ─────────────────────────
+    if marathon:
+        pb.marathon_mode = True
+        _info("Marathon mode enabled (CLI flag).")
+    if cccs:
+        if hasattr(pb, "cccs") and pb.cccs is not None:
+            pb.cccs.enabled = True
+        _info("CCCS protocol enabled (CLI flag).")
+    if supervisor or supervisor_model:
+        # Build or override supervisor_protocol config from CLI
+        from .project import SupervisorProtocolConfig  # noqa: PLC0415
+        sp_existing = getattr(pb, "supervisor_protocol", None)
+        if sp_existing is not None:
+            sp_existing.enabled = True
+            if supervisor_model:
+                sp_existing.supervisor_model = supervisor_model
+        else:
+            pb.supervisor_protocol = SupervisorProtocolConfig(
+                enabled=True,
+                supervisor_model=supervisor_model or "",
+            )
+        _info(
+            f"Supervisor protocol enabled (CLI flag)."
+            + (f" Model: {supervisor_model}" if supervisor_model else "")
+        )
 
     # ── Dry run ────────────────────────────────────────────────────────────────
     if dry_run:
@@ -536,6 +599,7 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude:
             resume=resume_session,
             project_book_path=project_book,
             show_claude=show_claude,
+            skip_preflight=skip_preflight,
         )
 
         # ── Register cleanup handlers ──────────────────────────────────────
@@ -557,9 +621,15 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude:
                 return
             try:
                 if hasattr(proc, "stop"):
-                    proc.stop(timeout=3.0)
+                    proc.stop(timeout=8.0)
                 elif hasattr(proc, "terminate"):
                     proc.terminate()
+                    # Give a moment, then force-kill.
+                    import time as _time  # noqa: PLC0415
+                    _time.sleep(2.0)
+                    if hasattr(proc, "is_alive") and proc.is_alive():
+                        if hasattr(proc, "kill"):
+                            proc.kill()
             except Exception:
                 pass
 
@@ -604,6 +674,173 @@ def run(project_book: str, tui: bool, dry_run: bool, verbose: bool, show_claude:
         _err_console.print(
             f"[bold red][FAIL][/bold red] Task '{pb.name}' failed: {msg}"
         )
+        sys.exit(1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# pause
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("pause")
+@click.argument("project")
+def pause_cmd(project: str) -> None:
+    """Request a graceful pause of a running session.
+
+    PROJECT is the project ID (YAML filename stem) of the running task.
+    The runner will pause at the next safe point and write state to disk.
+    Resume with: claude-runner resume PROJECT
+    """
+    _ensure_initialized()
+
+    state_path = _DEFAULT_STATE_DIR / f"{project}.json"
+    if not state_path.exists():
+        _abort(
+            f"No running session found for project {project!r}.  "
+            f"(Looked for: {state_path})"
+        )
+
+    # Write pause_requested flag into the state file so the runner picks it up
+    # on its next heartbeat check.
+    try:
+        import json as _json  # noqa: PLC0415
+        with state_path.open("r", encoding="utf-8") as fh:
+            state_data = _json.load(fh)
+
+        if state_data.get("current_phase") in ("complete", "failed", "paused"):
+            _warn(
+                f"Session for {project!r} is already in phase "
+                f"'{state_data['current_phase']}' — nothing to pause."
+            )
+            return
+
+        state_data["pause_requested"] = True
+        with state_path.open("w", encoding="utf-8") as fh:
+            _json.dump(state_data, fh, indent=2)
+
+        _ok(
+            f"Pause requested for {project!r}.  "
+            "The runner will pause at the next safe point."
+        )
+        _info(f"Resume with:  claude-runner resume {project}")
+    except Exception as exc:
+        _abort(f"Could not update state file for {project!r}: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# resume
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.command("resume")
+@click.argument("project")
+@click.option("--tui/--no-tui", default=True, help="Show the Rich terminal UI.")
+@click.option(
+    "--skip-preflight",
+    is_flag=True,
+    default=False,
+    help="Skip pre-flight checks.",
+)
+def resume_cmd(project: str, tui: bool, skip_preflight: bool) -> None:
+    """Resume a paused session.
+
+    PROJECT is the project ID (YAML filename stem) of the paused task.
+    """
+    _ensure_initialized()
+
+    state_path = _DEFAULT_STATE_DIR / f"{project}.json"
+    if not state_path.exists():
+        _abort(
+            f"No paused session found for project {project!r}.  "
+            f"(Looked for: {state_path})"
+        )
+
+    try:
+        import json as _json  # noqa: PLC0415
+        with state_path.open("r", encoding="utf-8") as fh:
+            state_data = _json.load(fh)
+    except Exception as exc:
+        _abort(f"Could not read state file for {project!r}: {exc}")
+        return
+
+    if state_data.get("current_phase") != "paused":
+        _warn(
+            f"Session for {project!r} is not paused "
+            f"(phase={state_data.get('current_phase')!r}).  "
+            "Use 'claude-runner run' to start a fresh session."
+        )
+        return
+
+    # Load the project book path from the state file.
+    project_book_path = state_data.get("project_book_path")
+    if not project_book_path:
+        _abort(f"State file for {project!r} does not contain a project_book_path.")
+        return
+
+    pb = _load_project_book(project_book_path)
+    config = _load_global_config()
+    api_key = _resolve_api_key()
+    if not api_key:
+        _abort("ANTHROPIC_API_KEY not found.")
+        return
+
+    tui_manager = None
+    if tui:
+        try:
+            from claude_runner.tui import TUIManager  # type: ignore[import]
+            timeout_hours = getattr(pb.execution, "timeout_hours", 4.0)
+            tui_manager = TUIManager(
+                task_name=pb.name,
+                project_book_path=project_book_path,
+                timeout_hours=float(timeout_hours),
+            )
+            tui_manager.start()
+        except ImportError:
+            _warn("TUI unavailable. Continuing without TUI.")
+            tui_manager = None
+
+    _info(f"Resuming paused session for {project!r} …")
+
+    # Mark state as running again before handing control to the runner.
+    try:
+        state_data["current_phase"] = "resuming"
+        state_data["paused"] = False
+        state_data["pause_requested"] = False
+        with state_path.open("w", encoding="utf-8") as fh:
+            import json as _json2  # noqa: PLC0415
+            _json2.dump(state_data, fh, indent=2)
+    except Exception as exc:
+        _warn(f"Could not update state before resume: {exc}")
+
+    try:
+        from claude_runner.runner import ClaudeRunner  # type: ignore[import]
+        runner = ClaudeRunner(
+            project_book=pb,
+            config=config,
+            tui=tui_manager,
+            api_key=api_key,
+            resume=True,
+            project_book_path=project_book_path,
+            skip_preflight=skip_preflight,
+        )
+        result = asyncio.run(runner.run())
+    except KeyboardInterrupt:
+        _warn("Interrupted by user.")
+        sys.exit(130)
+    except Exception as exc:
+        if tui_manager:
+            tui_manager.stop()
+        _abort(f"Runner error: {exc}")
+        return
+    finally:
+        if tui_manager:
+            tui_manager.stop()
+
+    if result.status == "complete":
+        _ok(f"Task '{pb.name}' completed successfully after resume.")
+    else:
+        msg = result.error_message or result.status
+        _err_console.print(f"[bold red][FAIL][/bold red] Task '{pb.name}': {msg}")
         sys.exit(1)
 
 
@@ -680,7 +917,7 @@ def queue(queue_file: str, tui: bool) -> None:
 
     _ensure_initialized()
 
-    with open(queue_file, "r", encoding="utf-8") as fh:
+    with open(queue_file, encoding="utf-8") as fh:
         queue_cfg = yaml.safe_load(fh)
 
     tasks = queue_cfg.get("tasks", [])
@@ -717,7 +954,7 @@ def queue(queue_file: str, tui: bool) -> None:
                 failed.append(pb_path)
                 _warn(f"Task failed: {pb_path}")
                 if fail_fast:
-                    _abort(f"Stopping queue after failure (fail_fast=true).")
+                    _abort("Stopping queue after failure (fail_fast=true).")
                     break
 
     if failed:
@@ -862,9 +1099,20 @@ context resets.
             try:
                 import subprocess as _sp  # noqa: PLC0415
                 _sp.run(["git", "init", str(work_dir)], check=True, capture_output=True)
-                # Basic .gitignore
+                # Basic .gitignore — exclude runner internals and common build artifacts
                 (work_dir / ".gitignore").write_text(
-                    "# claude-runner internals\n.claude-runner/\n", encoding="utf-8"
+                    "# claude-runner internals\n"
+                    ".claude-runner/\n"
+                    "\n"
+                    "# Build / runtime artifacts\n"
+                    "__pycache__/\n"
+                    "*.pyc\n"
+                    "*.pyd\n"
+                    "*.exe\n"
+                    "dist/\n"
+                    "build/\n"
+                    ".pytest_cache/\n",
+                    encoding="utf-8",
                 )
                 # Initial commit with .gitignore and .claude/ scaffold.
                 _sp.run(
@@ -929,7 +1177,7 @@ def validate(project_book: str) -> None:
 
 @cli.command("status")
 @click.option("--task", default=None, help="YAML filename stem to inspect, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
-def status(task: Optional[str]) -> None:
+def status(task: str | None) -> None:
     """Check the status of a running or completed task.
 
     If --task is omitted, shows the most recently modified state file.
@@ -978,7 +1226,7 @@ def status(task: Optional[str]) -> None:
 @cli.command("abort")
 @click.option("--task", default=None, help="YAML filename stem to abort, e.g. 'my-task' for my-task.yaml (defaults to most recent).")
 @click.option("--force", is_flag=True, default=False, help="Skip confirmation prompt.")
-def abort(task: Optional[str], force: bool) -> None:
+def abort(task: str | None, force: bool) -> None:
     """Abort a running task.
 
     This sends a termination signal to the Claude Code process and cleans up the
@@ -1050,7 +1298,7 @@ def abort(task: Optional[str], force: bool) -> None:
 @click.option("--raw", is_flag=True, default=False, help="Print raw log without formatting.")
 @click.option("--trash", "show_trash", is_flag=True, default=False, help="List trash log entries from ~/.claude-runner/trash/.")
 @click.option("--last", "last_n", default=None, type=int, help="With --trash: show full content of N most recent trash entries (default 1 when flag given).")
-def logs(task: Optional[str], tail: int, raw: bool, show_trash: bool, last_n: Optional[int]) -> None:
+def logs(task: str | None, tail: int, raw: bool, show_trash: bool, last_n: int | None) -> None:
     """View logs from a task's last run.
 
     Searches ~/.claude-runner/logs/ for a log file matching the task name.
@@ -1097,8 +1345,8 @@ def logs(task: Optional[str], tail: int, raw: bool, show_trash: bool, last_n: Op
             for tf in trash_files:
                 try:
                     first_lines = tf.read_text(encoding="utf-8", errors="replace").splitlines()
-                    stage = next((l.replace("stage: ", "") for l in first_lines if l.startswith("stage: ")), "?")
-                    reason = next((l.replace("reason: ", "") for l in first_lines if l.startswith("reason: ")), "")
+                    stage = next((ln.replace("stage: ", "") for ln in first_lines if ln.startswith("stage: ")), "?")
+                    reason = next((ln.replace("reason: ", "") for ln in first_lines if ln.startswith("reason: ")), "")
                     reason_preview = reason[:80]
                 except Exception:
                     stage = "?"
@@ -1327,6 +1575,36 @@ def configure() -> None:
     else:
         _info("Feature defaults unchanged (both off).")
 
+    # ── ntfy channels ─────────────────────────────────────────────────────────
+    _console.print(
+        "\n[bold]ntfy channels[/bold]\n"
+        "Two ntfy.sh channels for supervisor ↔ human communication.\n"
+        "Channel names are stored in Windows Credential Manager.\n"
+        "Leave blank to skip (ntfy features will be disabled).\n"
+    )
+    ntfy_out = click.prompt(
+        "  ntfy OUT channel (supervisor → human)",
+        default="", show_default=False,
+    ).strip()
+    ntfy_cmd = click.prompt(
+        "  ntfy CMD channel (human → supervisor)",
+        default="", show_default=False,
+    ).strip()
+
+    if ntfy_out or ntfy_cmd:
+        try:
+            from .ntfy_client import store_channel_in_keyring  # noqa: PLC0415
+            if ntfy_out:
+                store_channel_in_keyring("claude-runner-ntfy-out", ntfy_out)
+                _ok(f"ntfy OUT channel stored: {ntfy_out}")
+            if ntfy_cmd:
+                store_channel_in_keyring("claude-runner-ntfy-cmd", ntfy_cmd)
+                _ok(f"ntfy CMD channel stored: {ntfy_cmd}")
+        except RuntimeError as exc:
+            _warn(f"Could not store ntfy channels: {exc}")
+    else:
+        _info("ntfy channels skipped.")
+
     # ═══════════════════════════════════════════════════════════════════════════
     # Step C: Save credentials
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1391,8 +1669,8 @@ def _run_ntfy_guide(secrets: dict) -> None:
     # Send a test notification.
     _info(f"Sending test notification to {ntfy_url} …")
     try:
+        import urllib.error  # noqa: PLC0415
         import urllib.request  # noqa: PLC0415
-        import urllib.error    # noqa: PLC0415
         req = urllib.request.Request(
             ntfy_url,
             data=b"claude-runner is configured and ready.",
@@ -1440,10 +1718,10 @@ def _run_gmail_app_password_guide(email_address: str, secrets: dict) -> None:
         "  → Under [italic]'How you sign in to Google'[/italic], click [italic]'2-Step Verification'[/italic]\n"
         "  → Follow the setup flow, then return here.\n"
     )
-    choice = click.prompt(
+    click.prompt(
         "Press Enter when ready, or type S to skip if already enabled",
         default="",
-    ).strip().upper()
+    )
 
     # ── Step 2 of 4: Create an App Password ───────────────────────────────────
     _console.print(
@@ -1536,7 +1814,7 @@ def _run_generic_smtp_guide(email_address: str, secrets: dict) -> None:
             "Saving anyway — re-run 'configure' to retry."
         )
     else:
-        _ok(f"SMTP test successful.")
+        _ok("SMTP test successful.")
 
     secrets.update(
         {
@@ -1583,7 +1861,7 @@ def _test_smtp(
             )
             server.sendmail(username, [to_address], message)
         return True
-    except (smtplib.SMTPException, socket.error, OSError) as exc:
+    except (smtplib.SMTPException, OSError) as exc:
         _warn(f"SMTP error: {exc}")
         return False
 
@@ -1750,7 +2028,7 @@ def docker_update_cmd(no_cache: bool) -> None:
         pathlib.Path(__file__).parent.parent / "docker" / "Dockerfile",
         pathlib.Path.cwd() / "docker" / "Dockerfile",
     ]
-    dockerfile_path: Optional[pathlib.Path] = None
+    dockerfile_path: pathlib.Path | None = None
     for candidate in dockerfile_candidates:
         if candidate.exists():
             dockerfile_path = candidate
@@ -1833,7 +2111,7 @@ def _wait_for_key(prompt: str = "\nPress any key to exit...") -> None:
     print()
 
 
-def _bundled_projects_dir() -> Optional[pathlib.Path]:
+def _bundled_projects_dir() -> pathlib.Path | None:
     """Return the directory to scan for project YAML files.
 
     In a frozen PyInstaller exe this is the folder containing the exe itself,
@@ -1872,7 +2150,7 @@ def _resolve_project_path(user_input: str) -> str:
     return user_input
 
 
-def _pick_project_interactively() -> Optional[str]:
+def _pick_project_interactively() -> str | None:
     """List bundled project YAML files and let the user pick one by number,
     or type a custom path.  Returns the resolved path, or None to cancel.
     """
@@ -1968,8 +2246,8 @@ def marathon_cmd() -> None:
     Publishes startup/shutdown notifications to the ntfy out channel.
     """
     _ensure_initialized()
-    from .daemon import MarathonDaemon  # noqa: PLC0415
     from .config import Config  # noqa: PLC0415
+    from .daemon import MarathonDaemon  # noqa: PLC0415
 
     cfg = Config.load()
     daemon = MarathonDaemon(config=cfg)
@@ -1996,8 +2274,9 @@ def stop_cmd() -> None:
     """
     _ensure_initialized()
     import signal  # noqa: PLC0415
-    from .daemon import read_daemon_pid  # noqa: PLC0415
+
     from .autostart import unregister  # noqa: PLC0415
+    from .daemon import read_daemon_pid  # noqa: PLC0415
 
     pid = read_daemon_pid()
     if pid is not None:
@@ -2015,6 +2294,93 @@ def stop_cmd() -> None:
         _info("Autostart task unregistered.")
     except Exception as exc:  # noqa: BLE001
         _warn(f"Could not unregister autostart task: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ntfy
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@cli.group("ntfy")
+def ntfy_group() -> None:
+    """Send, poll, or listen on ntfy channels.
+
+    \b
+    Used by the supervisor, the marathon daemon, and any Claude Code
+    instance that needs to communicate via ntfy.
+    """
+
+
+@ntfy_group.command("send")
+@click.argument("message")
+@click.option("-c", "--channel", default="out", help="Logical channel: 'out' or 'cmd' (default: out).")
+@click.option("-t", "--title", default="", help="Optional message title.")
+def ntfy_send_cmd(message: str, channel: str, title: str) -> None:
+    """Publish a message to an ntfy channel."""
+    from .ntfy_client import cli_send  # noqa: PLC0415
+    cli_send(channel, message, title=title)
+
+
+@ntfy_group.command("poll")
+@click.option("-c", "--channel", default="cmd", help="Logical channel (default: cmd).")
+def ntfy_poll_cmd(channel: str) -> None:
+    """Poll an ntfy channel once and print new messages."""
+    from .ntfy_client import cli_poll  # noqa: PLC0415
+    cli_poll(channel)
+
+
+@ntfy_group.command("listen")
+@click.option("-c", "--channel", default="cmd", help="Logical channel (default: cmd).")
+@click.option("-i", "--interval", default=10.0, type=float, help="Poll interval in seconds (default: 10).")
+@click.option("--stop-file", default="", help="Sentinel file path — exit when it exists.")
+def ntfy_listen_cmd(channel: str, interval: float, stop_file: str) -> None:
+    """Long-poll an ntfy channel, printing messages as they arrive.
+
+    \b
+    Runs until Ctrl-C or until the stop sentinel file exists.
+    Follows the watchdog safe-stop pattern.
+    """
+    from .ntfy_client import cli_listen  # noqa: PLC0415
+    cli_listen(channel, interval_s=interval, stop_file=stop_file)
+
+
+@ntfy_group.command("set-channels")
+@click.option("--out", "out_channel", default=None, help="ntfy OUT channel name (supervisor → human).")
+@click.option("--cmd", "cmd_channel", default=None, help="ntfy CMD channel name (human → supervisor).")
+def ntfy_set_channels_cmd(out_channel: str | None, cmd_channel: str | None) -> None:
+    """Store ntfy channel names in Windows Credential Manager.
+
+    \b
+    Examples:
+      claude-runner ntfy set-channels --out claude-runner-honacoo --cmd claude-runner-honacoo-cmd
+      claude-runner ntfy set-channels --out my-project-out
+    """
+    from .ntfy_client import store_channel_in_keyring  # noqa: PLC0415
+
+    if not out_channel and not cmd_channel:
+        _warn("Provide at least one of --out or --cmd.")
+        return
+
+    try:
+        if out_channel:
+            store_channel_in_keyring("claude-runner-ntfy-out", out_channel)
+            _ok(f"OUT channel stored: {out_channel}")
+        if cmd_channel:
+            store_channel_in_keyring("claude-runner-ntfy-cmd", cmd_channel)
+            _ok(f"CMD channel stored: {cmd_channel}")
+    except RuntimeError as exc:
+        _abort(f"Failed to store channel: {exc}")
+
+
+@ntfy_group.command("show-channels")
+def ntfy_show_channels_cmd() -> None:
+    """Show currently configured ntfy channel names."""
+    from .ntfy_client import _get_channel_from_keyring  # noqa: PLC0415
+
+    out = _get_channel_from_keyring("claude-runner-ntfy-out")
+    cmd = _get_channel_from_keyring("claude-runner-ntfy-cmd")
+    _info(f"OUT channel: {out or '(not set)'}")
+    _info(f"CMD channel: {cmd or '(not set)'}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

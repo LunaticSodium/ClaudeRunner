@@ -154,14 +154,17 @@ class TestReadCurrentPhase:
 # ---------------------------------------------------------------------------
 
 def _watchdog_with_phase(tmp_path, rules, apply_fn, phase=0, token_pct=0.0, get_token_pct=None):
-    """Build a watchdog and patch _read_current_phase to return *phase*."""
+    """Build a watchdog and patch _read_current_phase_and_sha to return *phase*."""
     watchdog = ModelWatchdog(
         working_dir=tmp_path,
         rules=rules,
         apply_fn=apply_fn,
         get_token_pct=get_token_pct,
     )
+    # Patch both _read_current_phase (for callers that use it directly) and
+    # _read_current_phase_and_sha (used by _tick after the SHA-dedup refactor).
     watchdog._read_current_phase = lambda: phase
+    watchdog._read_current_phase_and_sha = lambda: (phase, "")
     return watchdog
 
 
@@ -206,6 +209,7 @@ class TestModelWatchdogFiring:
 
         # Advance phase to 4 — rule1 now matches.
         watchdog._read_current_phase = lambda: 4
+        watchdog._read_current_phase_and_sha = lambda: (4, "")
         watchdog._tick()
         assert calls == ["haiku", "sonnet"]
 

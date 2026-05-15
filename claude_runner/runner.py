@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -42,13 +41,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable
 
 from .context_manager import (
-    CHECKPOINT_PROMPT,
     STRATEGY_CONTINUE,
-    STRATEGY_RESTATE,
-    STRATEGY_SUMMARIZE,
     ContextManager,
 )
 
@@ -61,6 +57,12 @@ if TYPE_CHECKING:
     from .rate_limit import RateLimitDetector, RateLimitWaiter
 
 logger = logging.getLogger(__name__)
+
+# Authoritative token-usage marker emitted by PipeProcess from each
+# stream-json ``result`` event (process.py:_process_stream_event). Replaces
+# the chars-to-tokens estimate with the API's actual usage figure for the
+# just-completed turn. Format: ``##RUNNER:USAGE:<int>##`` on its own line.
+_USAGE_MARKER_RE: re.Pattern[str] = re.compile(r"^##RUNNER:USAGE:(\d+)##$")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -143,6 +145,14 @@ _PROGRESS_LOG_INSTRUCTION = textwrap.dedent(
     The progress log is the authoritative external record of this session.
     It will be read by claude-runner to recover context if execution is interrupted.
 
+    LONG-RUNNING COMMANDS
+    ---------------------
+    Never run a command that takes more than 5 minutes directly in your shell.
+    Instead, write a small Python/shell script that does the work and launch it
+    as a detached subprocess (e.g. subprocess.Popen with start_new_session=True).
+    Then poll its output or exit status in a loop with short sleeps.  This keeps
+    each shell invocation well within timeout limits.
+
     ========================================
     TASK
     ========================================
@@ -189,7 +199,7 @@ class TaskResult:
     change_summary: str   # git diff --stat or filesystem snapshot diff
     progress_log: str     # contents of .claude-runner/progress.log at end of run
     fault_log: list[str] = field(default_factory=list)
-    error_message: Optional[str] = None
+    error_message: str | None = None
 
     # ------------------------------------------------------------------
     # Derived properties
@@ -248,15 +258,16 @@ class TaskRunner:
 
     def __init__(
         self,
-        project_book: "ProjectBook",
-        config: "Config",
+        project_book: ProjectBook,
+        config: Config,
         api_key: str,
-        tui_callback: Optional[Callable[[str, dict], None]] = None,
+        tui_callback: Callable[[str, dict], None] | None = None,
         sandbox=None,
         tui=None,
         resume: bool = False,
-        project_book_path: Optional[str] = None,
+        project_book_path: str | None = None,
         show_claude: bool = False,
+        skip_preflight: bool = False,
     ) -> None:
         self._book = project_book
         self._config = config
@@ -265,7 +276,7 @@ class TaskRunner:
         self._tui = tui
         self._resume = resume
         self._show_claude = show_claude
-        self._book_path: Optional[Path] = Path(project_book_path) if project_book_path else None
+        self._book_path: Path | None = Path(project_book_path) if project_book_path else None
         # Unique filesystem identifier derived from the YAML filename stem.
         # Keying off the filename (not book.name) prevents collisions when two
         # project books share the same name: field but live in the same folder.
@@ -275,39 +286,41 @@ class TaskRunner:
             else _safe_name(self._book.name)
         )
         self._secrets_config = self._load_secrets_config()
+        self._skip_preflight = skip_preflight
 
         # Resolved lazily once run() begins.
         self._sandbox = sandbox  # may be pre-provided; if None, created in _initialise()
-        self._notifier: Optional["NotificationManager"] = None
-        self._persistence: Optional["PersistenceManager"] = None
-        self._rate_detector: Optional["RateLimitDetector"] = None
-        self._rate_waiter: Optional["RateLimitWaiter"] = None
-        self._context_manager: Optional[ContextManager] = None
+        self._notifier: NotificationManager | None = None
+        self._persistence: PersistenceManager | None = None
+        self._rate_detector: RateLimitDetector | None = None
+        self._rate_waiter: RateLimitWaiter | None = None
+        self._context_manager: ContextManager | None = None
 
         # Runtime state
-        self._start_time: Optional[datetime] = None
+        self._start_time: datetime | None = None
         self._rate_limit_cycles: int = 0
         self._fault_log: list[str] = []
         self._process = None           # the live ClaudeProcess (or equivalent)
         self._output_lines: list[str] = []  # all stripped output collected
 
         # asyncio.Event used to signal a detected rate-limit from the detector callback.
-        self._rate_limit_event: Optional[asyncio.Event] = None
-        self._rate_limit_reset_time: Optional[datetime] = None
+        self._rate_limit_event: asyncio.Event | None = None
+        self._rate_limit_reset_time: datetime | None = None
 
         # asyncio.Events for runner protocol markers (##RUNNER:COMPLETE## / ##RUNNER:ERROR##).
         # Initialised in _initialise() once an event loop is available (NOT here).
-        self._runner_complete_event: Optional[asyncio.Event] = None
-        self._runner_error_event: Optional[asyncio.Event] = None
-        self._runner_error_message: Optional[str] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner_complete_event: asyncio.Event | None = None
+        self._runner_error_event: asyncio.Event | None = None
+        self._runner_error_message: str | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Acceptance-criteria retry counter.
         self._acceptance_retries: int = 0
 
         # Silence watchdog: tracks last output time and the background task.
         self._last_output_time: float = time.monotonic()
-        self._silence_watchdog_task: Optional[asyncio.Task] = None
+        self._silence_watchdog_task: asyncio.Task | None = None
+        self._rate_limit_paused: bool = False  # suppresses silence watchdog during RL waits
 
         # Filesystem snapshot taken at task start (fallback when git unavailable).
         self._fs_snapshot_start: dict[str, tuple[int, float]] = {}  # path → (size, mtime)
@@ -319,20 +332,29 @@ class TaskRunner:
         self._milestones_fired: set[str] = set()
 
         # Set by _state_checkpoint_loop to allow cancellation.
-        self._checkpoint_task: Optional[asyncio.Task] = None
+        self._checkpoint_task: asyncio.Task | None = None
 
         # CLAUDE.md content read from <working_dir>/.claude/CLAUDE.md at task start.
         # None means no file was found or it was empty.
-        self._claude_md_content: Optional[str] = None
+        self._claude_md_content: str | None = None
 
         # Phase-aware model switching state.
         # _model_override is set by the ModelWatchdog apply_fn and consumed on the
         # next launch_claude() call.  None means "use the default model".
-        self._model_override: Optional[str] = None
+        self._model_override: str | None = None
         self._model_watchdog = None  # ModelWatchdog instance, started in _run_inner
         # asyncio events for model switch — initialised in _initialise().
-        self._model_switch_event: Optional[asyncio.Event] = None
-        self._model_switch_reason: Optional[str] = None
+        self._model_switch_event: asyncio.Event | None = None
+        self._model_switch_reason: str | None = None
+
+        # Pause/resume flag — set by request_pause(); checked in main loop.
+        self._pause_requested: bool = False
+
+        # v2.0: Supervisor components — initialised in _initialise() when enabled.
+        self._supervisor_budget: object | None = None   # SupervisorBudget
+        self._worker_supervisor: object | None = None   # WorkerSupervisor
+        self._thinking_manual: object | None = None     # ThinkingManual
+        self._supervisor_enabled: bool = False
 
     # ------------------------------------------------------------------
     # Secrets config loader
@@ -380,6 +402,28 @@ class TaskRunner:
             self._persistence.append_fault(message)
 
     # ------------------------------------------------------------------
+    # Pause/resume
+    # ------------------------------------------------------------------
+
+    def request_pause(self) -> None:
+        """Request a graceful pause of the running session.
+
+        Sets an internal flag that is checked after the current work unit
+        (main-loop iteration) completes.  The runner will:
+          1. Write the paused state to disk.
+          2. Fire a "paused" ntfy notification.
+          3. Return a ``TaskResult`` with ``status="aborted"`` and a
+             ``pause`` annotation so the caller can detect the pause.
+
+        Thread-safe: may be called from any thread.
+        """
+        self._pause_requested = True
+        logger.info(
+            "[PAUSE] Pause requested for task %r.  Will pause at next safe point.",
+            self._project_id,
+        )
+
+    # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
@@ -406,23 +450,31 @@ class TaskRunner:
         logger.info("TaskRunner.run() starting: task=%r at %s", self._book.name, start_str)
 
         try:
-            await self._initialise()
-        except Exception as exc:
-            msg = f"Initialisation failed: {exc}"
-            logger.exception(msg)
-            return self._make_result("failed", error_message=msg)
+            try:
+                await self._initialise()
+            except Exception as exc:
+                msg = f"Initialisation failed: {exc}"
+                logger.exception(msg)
+                return self._make_result("failed", error_message=msg)
 
-        try:
             result = await self._run_inner()
         except Exception as exc:
             # Catch-all: log, dispatch error notification, persist, return failed result.
             msg = f"Unexpected error in run loop: {exc}"
             logger.exception(msg)
             self._fault_log.append(f"[FATAL] {msg}")
-            await self._dispatch("error", {"error": msg, "task": self._book.name})
+            try:
+                await self._dispatch("error", {"error": msg, "task": self._book.name})
+            except Exception as dispatch_exc:
+                logger.warning("Failed to dispatch error notification: %s", dispatch_exc)
             result = self._make_result("failed", error_message=msg)
         finally:
             await self._cleanup()
+
+        # Write a human-readable final state summary into the workspace so it
+        # is visible alongside the output artifacts (the authoritative state
+        # lives in ~/.claude-runner/state/ but is hard to find).
+        self._write_final_state_summary(result)
 
         return result
 
@@ -434,9 +486,23 @@ class TaskRunner:
         """Set up all helper objects and the sandbox."""
         # Deferred imports to avoid circular dependencies at module load time.
         from .notify import NotificationManager  # noqa: PLC0415
-        from .persistence import PersistenceManager, TaskState  # noqa: PLC0415
+        from .persistence import PersistenceManager  # noqa: PLC0415
+        from .preflight import PreflightError, run_preflight  # noqa: PLC0415
         from .rate_limit import RateLimitDetector  # noqa: PLC0415
-        from .sandbox import create_sandbox  # noqa: PLC0415
+        from .sandbox import create_sandbox, resolve_working_dir  # noqa: PLC0415
+
+        # --- Preflight checks (before sandbox setup) ----------------------
+        try:
+            working_dir_for_preflight = resolve_working_dir(self._book, book_path=self._book_path)
+            preflight_warnings = run_preflight(
+                self._book,
+                working_dir_for_preflight,
+                skip=self._skip_preflight,
+            )
+            for w in preflight_warnings:
+                logger.warning("[PREFLIGHT] %s", w)
+        except PreflightError as exc:
+            raise RuntimeError(f"Pre-flight check failed: {exc}") from exc
 
         # --- Sandbox -------------------------------------------------------
         if self._sandbox is None:
@@ -471,6 +537,12 @@ class TaskRunner:
         # to CLAUDE.md before Claude is launched.  This is entirely optional;
         # omitting the cccs key (or setting enabled: false) skips this step.
         self._inject_cccs_fragment()
+
+        # --- Context anchors → CLAUDE.md ----------------------------------
+        # v2.0a: context_anchors are already prepended to every prompt via
+        # ContextManager, but they don't survive context compaction.  Writing
+        # them to CLAUDE.md ensures they persist.
+        self._inject_context_anchors_to_claude_md()
 
         # --- CLAUDE.md injection -------------------------------------------
         self._claude_md_content = self._read_claude_md()
@@ -534,7 +606,7 @@ class TaskRunner:
         # background thread) when a rule fires.  Handled in the main loop by
         # stopping the current Claude process and re-launching with the new model.
         self._model_switch_event = asyncio.Event()
-        self._model_switch_reason: Optional[str] = None
+        self._model_switch_reason: str | None = None
 
         self._loop = asyncio.get_event_loop()
 
@@ -551,6 +623,51 @@ class TaskRunner:
             secrets_config=self._secrets_config,
             on_fault=self._on_fault,
         )
+
+        # --- v2.0: Auto-forward pending.md responses to ntfy out --------------
+        from . import inbox  # noqa: PLC0415
+        inbox.set_response_callback(self._forward_response_to_ntfy)
+
+        # --- v2.0: Supervisor pipeline (when supervisor_protocol enabled) ----
+        sp_config = getattr(self._book, "supervisor_protocol", None)
+        sp_enabled = getattr(sp_config, "enabled", False) if sp_config else False
+        if sp_enabled:
+            self._supervisor_enabled = True
+            from .supervisor_protocol import SupervisorBudget  # noqa: PLC0415
+            from .worker_supervisor import WorkerSupervisor  # noqa: PLC0415
+            from .thinking_manual import ThinkingManual  # noqa: PLC0415
+
+            audit_dir = self._working_dir() / getattr(sp_config, "audit_dir", "audit")
+            initial_pts = getattr(sp_config, "initial_budget_points", 10)
+
+            # Budget system (dual-channel enforcement)
+            self._supervisor_budget = SupervisorBudget(
+                audit_dir=audit_dir, initial_points=initial_pts,
+            )
+            logger.info(
+                "[SUPERVISOR] Budget initialised: %d/%d points",
+                self._supervisor_budget.remaining_points,
+                initial_pts,
+            )
+
+            # Worker supervisor (KPI assessment + intervention gating)
+            self._worker_supervisor = WorkerSupervisor(
+                config=sp_config,
+                budget=self._supervisor_budget,
+                audit_dir=audit_dir,
+                ntfy_client=None,  # wired later if ntfy available
+            )
+
+            # Thinking Manual (two-track reasoning)
+            self._thinking_manual = ThinkingManual()
+
+            # --- Intake validation (all-LLM, §8) ---
+            self._run_intake_validation(sp_config)
+
+            # --- Analytical pre-flight (§9, Thinking Manual) ---
+            self._run_analytical_preflight(sp_config)
+
+            logger.info("[SUPERVISOR] v2.0 pipeline initialised.")
 
         # --- Persistence ---------------------------------------------------
         state_dir = Path.home() / ".claude-runner" / "state"
@@ -644,6 +761,10 @@ class TaskRunner:
         #
 
         while True:
+            # --- Pause check (before deadline check) -----------------------
+            if self._pause_requested:
+                return await self._handle_pause()
+
             # Check overall deadline.
             now = datetime.now(tz=timezone.utc)
             if now >= deadline:
@@ -785,6 +906,60 @@ class TaskRunner:
                 self._checkpoint_state()
 
     # ------------------------------------------------------------------
+    # Pause handling
+    # ------------------------------------------------------------------
+
+    async def _handle_pause(self) -> TaskResult:
+        """Respond to a ``request_pause()`` call.
+
+        1. Stop the Claude Code subprocess gracefully (best effort).
+        2. Write paused state to disk.
+        3. Fire an ntfy notification: "[PAUSED] {project_id} — resume with: …".
+        4. Return a TaskResult with status "aborted" and an error_message that
+           indicates this was a requested pause (not a real error).
+        """
+        logger.info("[PAUSE] Pausing session for task %r.", self._project_id)
+
+        # Stop the running process gracefully.
+        if self._process is not None:
+            try:
+                if hasattr(self._process, "stop"):
+                    self._process.stop(timeout=5.0)
+                elif hasattr(self._process, "terminate"):
+                    self._process.terminate()
+            except Exception as exc:
+                logger.warning("[PAUSE] Could not stop process: %s", exc)
+
+        # Write paused state.
+        if self._persistence is not None:
+            try:
+                state = self._make_state(
+                    "paused",
+                    rate_limit_wait_count=self._rate_limit_cycles,
+                    token_estimate=(
+                        self._context_manager.estimated_tokens
+                        if self._context_manager else 0
+                    ),
+                )
+                self._persistence.write_paused_state(state)
+            except Exception as exc:
+                logger.warning("[PAUSE] Could not write paused state: %s", exc)
+
+        # Fire ntfy notification.
+        resume_cmd = f"claude-runner resume {self._project_id}"
+        pause_msg = f"[PAUSED] {self._project_id} — resume with: {resume_cmd}"
+        try:
+            await self._dispatch("complete", {"task": self._book.name, "pause_msg": pause_msg})
+        except Exception as exc:
+            logger.warning("[PAUSE] Notification dispatch failed: %s", exc)
+
+        logger.info("[PAUSE] Session paused. %s", pause_msg)
+        return self._make_result(
+            "aborted",
+            error_message=f"Session paused by request. {resume_cmd}",
+        )
+
+    # ------------------------------------------------------------------
     # Rate-limit handling
     # ------------------------------------------------------------------
 
@@ -793,7 +968,7 @@ class TaskRunner:
         reset_time: datetime,
         max_rl_waits: int,
         resume_strategy: str,
-    ) -> Optional[TaskResult]:
+    ) -> TaskResult | None:
         """
         Handle a single rate-limit cycle.
 
@@ -837,6 +1012,9 @@ class TaskRunner:
             self._persistence.save(self._make_state("failed"))
             return self._make_result("failed", error_message=msg)
 
+        # --- Suppress silence watchdog during wait -------------------------
+        self._rate_limit_paused = True
+
         # --- Wait with TUI countdown -------------------------------------
         from .rate_limit import RateLimitWaiter  # noqa: PLC0415
         logger.info("[ACTION] Waiting for rate limit to reset at %s.", wait_until_str)
@@ -845,7 +1023,13 @@ class TaskRunner:
             on_tick=self._on_countdown_tick,
             on_resume=lambda: None,  # resume is handled after wait returns
         )
-        await waiter.wait()
+        try:
+            await waiter.wait()
+        finally:
+            self._rate_limit_paused = False
+            # Reset silence timer so watchdog doesn't immediately fire after
+            # the long (expected) silence during the rate-limit wait.
+            self._last_output_time = time.monotonic()
         logger.info("Rate limit wait complete.  Resuming task.")
 
         # --- Dispatch resume notification --------------------------------
@@ -854,6 +1038,15 @@ class TaskRunner:
             "resume",
             {"task": self._book.name, "cycle": self._rate_limit_cycles},
         )
+
+        # --- Verify the process survived the wait --------------------------
+        if self._process is not None and hasattr(self._process, "is_alive"):
+            if not self._process.is_alive():
+                msg = "Worker process died during rate-limit wait."
+                logger.error(msg)
+                self._fault_log.append(f"[ERROR] {msg}")
+                await self._dispatch("error", {"error": msg, "task": self._book.name})
+                return self._make_result("failed", error_message=msg)
 
         # --- Build and send resume prompt --------------------------------
         resume_prompt = self._context_manager.build_resume_prompt(
@@ -881,7 +1074,7 @@ class TaskRunner:
     # Model-switch handler
     # ------------------------------------------------------------------
 
-    async def _handle_model_switch(self, resume_strategy: str) -> Optional[TaskResult]:
+    async def _handle_model_switch(self, resume_strategy: str) -> TaskResult | None:
         """
         Handle a model-switch event fired by the ModelWatchdog.
 
@@ -907,13 +1100,16 @@ class TaskRunner:
         # --- Stop the current process -------------------------------------
         if self._process is not None:
             try:
-                if hasattr(self._process, "is_alive") and self._process.is_alive():
-                    if hasattr(self._process, "terminate"):
-                        self._process.terminate()
-                    elif hasattr(self._process, "stop"):
-                        self._process.stop()
-                    # Give the process a moment to terminate gracefully.
-                    await asyncio.sleep(1.0)
+                if hasattr(self._process, "stop"):
+                    self._process.stop(timeout=5.0)
+                elif hasattr(self._process, "terminate"):
+                    self._process.terminate()
+                    await asyncio.sleep(2.0)
+                    # Force-kill if still alive after grace period.
+                    if hasattr(self._process, "is_alive") and self._process.is_alive():
+                        if hasattr(self._process, "kill"):
+                            self._process.kill()
+                        logger.warning("Model switch: force-killed lingering process.")
             except Exception as exc:
                 logger.warning("Model switch: error stopping current process: %s", exc)
             self._process = None
@@ -1032,7 +1228,7 @@ class TaskRunner:
     # Completion handler
     # ------------------------------------------------------------------
 
-    async def _complete_or_retry(self) -> Optional[TaskResult]:
+    async def _complete_or_retry(self) -> TaskResult | None:
         """
         Run acceptance checks (if configured); complete or retry accordingly.
 
@@ -1047,17 +1243,37 @@ class TaskRunner:
         from .acceptance_runner import run_checks  # noqa: PLC0415
 
         criteria = getattr(self._book, "acceptance_criteria", None)
-        if criteria is None or not criteria.checks:
-            # No acceptance gate configured — complete immediately.
+        impl_constraints = getattr(self._book, "implementation_constraints", []) or []
+
+        if (criteria is None or not criteria.checks) and not impl_constraints:
+            # No acceptance gate and no constraints configured — complete immediately.
             return await self._handle_completion()
 
         working_dir = self._working_dir()
+        n_checks = len(criteria.checks) if criteria and criteria.checks else 0
         logger.info(
-            "[ACCEPTANCE] Running %d check(s) in %s …",
-            len(criteria.checks),
+            "[ACCEPTANCE] Running %d check(s) + %d constraint(s) in %s …",
+            n_checks,
+            len(impl_constraints),
             working_dir,
         )
-        check_result = run_checks(criteria, working_dir, api_key=self._api_key)
+
+        # When there is no acceptance criteria but there are constraints, create
+        # a minimal stub criteria so run_checks can run.
+        if criteria is None or not criteria.checks:
+            from .project import AcceptanceCriteria  # noqa: PLC0415
+            criteria = AcceptanceCriteria()
+
+        check_result = run_checks(
+            criteria,
+            working_dir,
+            api_key=self._api_key,
+            implementation_constraints=impl_constraints or None,
+        )
+
+        # Persist acceptance results to the workspace audit directory so the
+        # human can inspect them after the run without digging into runner state.
+        self._write_acceptance_results(check_result, working_dir)
 
         if check_result.passed:
             logger.info("[ACCEPTANCE] All checks passed.")
@@ -1087,6 +1303,53 @@ class TaskRunner:
         if criteria.on_failure in ("retry", "notify"):
             await self._dispatch("error", {"error": msg, "task": self._book.name})
         return self._make_result("failed", error_message=msg)
+
+    def _write_final_state_summary(self, result) -> None:
+        """Write a human-readable final state file into the workspace."""
+        import json as _json  # noqa: PLC0415
+        try:
+            working_dir = self._working_dir()
+            cr_dir = working_dir / ".claude-runner"
+            cr_dir.mkdir(parents=True, exist_ok=True)
+            summary = {
+                "task": self._book.name,
+                "status": result.status if result else "unknown",
+                "started": self._start_time.isoformat() if self._start_time else None,
+                "finished": datetime.now(tz=timezone.utc).isoformat(),
+                "rate_limit_cycles": self._rate_limit_cycles,
+                "acceptance_retries": self._acceptance_retries,
+                "checkpoint_count": self._context_manager.checkpoint_count if self._context_manager else 0,
+                "fault_log": self._fault_log,
+                "error": result.error_message if result and hasattr(result, "error_message") else None,
+            }
+            (cr_dir / "final_state.json").write_text(
+                _json.dumps(summary, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info("Final state summary written to .claude-runner/final_state.json")
+        except Exception as exc:
+            logger.warning("Failed to write final state summary: %s", exc)
+
+    def _write_acceptance_results(self, check_result, working_dir) -> None:
+        """Write acceptance check results to audit/acceptance_results.json."""
+        import json as _json  # noqa: PLC0415
+        try:
+            audit_dir = working_dir / "audit"
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            result_data = {
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "passed": check_result.passed,
+                "failed_checks": check_result.failed_checks,
+                "details": check_result.details,
+                "retry_attempt": self._acceptance_retries,
+            }
+            (audit_dir / "acceptance_results.json").write_text(
+                _json.dumps(result_data, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.info("[ACCEPTANCE] Results written to audit/acceptance_results.json")
+        except Exception as exc:
+            logger.warning("[ACCEPTANCE] Failed to write results file: %s", exc)
 
     async def _launch_acceptance_retry(self, check_result) -> None:
         """
@@ -1150,7 +1413,6 @@ class TaskRunner:
         ntfy_completion_message: str | None = None
         if self._notifier is not None:
             try:
-                from .notify import extract_completion_summary  # noqa: PLC0415
                 ntfy_completion_message = self._notifier.build_completion_ntfy_message(
                     task_name=self._book.name,
                     duration_str=duration_str,
@@ -1266,11 +1528,26 @@ class TaskRunner:
 
         # Token counting + checkpoint-end detection.
         if self._context_manager is not None:
-            self._context_manager.count_output(clean)
+            # Prefer the API's authoritative usage when PipeProcess emits the
+            # ##RUNNER:USAGE:<N>## marker from a result event. Falls back to
+            # the chars-to-tokens estimate for every other line.
+            usage_match = _USAGE_MARKER_RE.match(clean) if clean else None
+            if usage_match is not None:
+                try:
+                    self._context_manager.set_authoritative_tokens(int(usage_match.group(1)))
+                except (ValueError, OverflowError):
+                    pass
+            else:
+                self._context_manager.count_output(clean)
             self._context_manager.notify_output_line(clean)
 
         # TUI update.
         self._tui_update("output_line", {"line": clean, "raw": line})
+
+        # v2.0: Feed response capture buffer (auto-forward pending.md responses).
+        if clean:
+            from . import inbox as _inbox  # noqa: PLC0415
+            _inbox.capture_line(clean)
 
         # Milestone detection — runs on every clean output line.
         if clean and self._milestone_patterns:
@@ -1388,13 +1665,31 @@ class TaskRunner:
             freshly_initted = True
             logger.info("Git workflow: initialised new repo in %s", working_dir)
 
-        # --- Write .gitattributes for fresh repos -------------------------
+        # --- Write .gitattributes and .gitignore for fresh repos -----------
         # Only written when we just called git init (new workspace with no
         # prior git history).  Existing repos — including those where Claude
         # cloned or pulled code from GitHub during the task — are left alone
         # so we don't override their established line-ending conventions.
         if freshly_initted:
             _write_gitattributes(working_dir)
+            # Ensure common build artifacts are never committed.
+            gitignore_path = Path(working_dir) / ".gitignore"
+            if not gitignore_path.exists():
+                gitignore_path.write_text(
+                    "# claude-runner internals\n"
+                    ".claude-runner/\n"
+                    "\n"
+                    "# Build / runtime artifacts\n"
+                    "__pycache__/\n"
+                    "*.pyc\n"
+                    "*.pyd\n"
+                    "*.exe\n"
+                    "dist/\n"
+                    "build/\n"
+                    ".pytest_cache/\n",
+                    encoding="utf-8",
+                )
+                logger.info("Git workflow: wrote .gitignore for fresh repo.")
 
         # --- Configure remote origin from remote_url (if given) ----------
         if remote_url:
@@ -1562,6 +1857,20 @@ class TaskRunner:
                 + "\n--- End of project context ---"
             )
             task_prompt = claude_md_block + "\n\n" + task_prompt
+
+        # Inject implementation_constraints section if any are configured.
+        constraints = getattr(self._book, "implementation_constraints", []) or []
+        if constraints:
+            constraint_lines = "\n".join(
+                f"- [{c.id}] {c.description}" for c in constraints
+            )
+            constraints_block = (
+                "\n\n## Implementation Requirements (MANDATORY)\n"
+                "The following algorithmic constraints MUST be implemented exactly as specified:\n"
+                f"{constraint_lines}\n"
+                "These will be verified automatically after acceptance checks complete."
+            )
+            task_prompt = task_prompt + constraints_block
 
         # Apply RUNNER_PROTOCOL + context_anchors via ContextManager so the
         # ordering is always: runner protocol → anchors → CLAUDE.md → task.
@@ -1732,6 +2041,107 @@ class TaskRunner:
         except OSError as exc:
             logger.warning("Could not write phase contract to CLAUDE.md: %s", exc)
 
+    # Context-anchors marker so we never double-inject across reruns.
+    _CONTEXT_ANCHORS_MARKER = "<!-- BEGIN claude-runner context-anchors"
+
+    # Default spellbook preset name — matches presets/supervisor-v2.0.spellbook.md
+    _DEFAULT_SPELLBOOK = "supervisor-v2.0"
+
+    def _inject_context_anchors_to_claude_md(self) -> None:
+        """
+        Append a context-anchors **pointer** to CLAUDE.md and copy the
+        spellbook into the workspace so the LLM can find it by name.
+
+        The full context_anchors text is already prepended to every prompt via
+        ContextManager.  This method writes a short pointer that explicitly
+        names the spellbook file so the LLM can ``cat`` it after context
+        compaction.  Keeps CLAUDE.md lean for smaller LLMs while giving them
+        a concrete path to follow.
+
+        Silently skipped when:
+        - No ``context_anchors`` field in the project book.
+        - The marker is already present (idempotent — safe on resume).
+        - The working directory is unavailable.
+        """
+        context_anchors = getattr(self._book, "context_anchors", None)
+        if not context_anchors or not context_anchors.strip():
+            return
+
+        try:
+            wd = self._working_dir()
+        except Exception:
+            return
+
+        claude_dir = wd / ".claude"
+        try:
+            claude_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("Could not create .claude/ for context anchors: %s", exc)
+            return
+
+        claude_md = claude_dir / "CLAUDE.md"
+
+        existing = ""
+        if claude_md.exists():
+            try:
+                existing = claude_md.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
+        if self._CONTEXT_ANCHORS_MARKER in existing:
+            logger.debug("CLAUDE.md context anchors already present — skipping injection.")
+            return
+
+        # --- Copy spellbook into workspace ---
+        spellbook_dest = claude_dir / "spellbook.md"
+        spellbook_placed = False
+        if not spellbook_dest.exists():
+            try:
+                from .cccs_parser import load_spellbook  # noqa: PLC0415
+                content = load_spellbook(self._DEFAULT_SPELLBOOK)
+                spellbook_dest.write_text(content, encoding="utf-8")
+                spellbook_placed = True
+                logger.info(
+                    "[ACTION] Spellbook '%s' copied to %s (%d chars).",
+                    self._DEFAULT_SPELLBOOK, spellbook_dest, len(content),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not place spellbook in workspace: %s", exc)
+        else:
+            spellbook_placed = True
+
+        # --- Pointer block naming the spellbook file ---
+        spellbook_line = ""
+        if spellbook_placed:
+            spellbook_line = (
+                "\n"
+                "A **spellbook** with detailed function references and domain\n"
+                "instructions has been placed at `.claude/spellbook.md`.  Read it\n"
+                "when you need to find a tool, capability, or constraint.\n"
+            )
+
+        block = (
+            "\n"
+            "<!-- BEGIN claude-runner context-anchors — do not remove -->\n"
+            "## Project Anchors\n\n"
+            "This project has standing context anchors injected by claude-runner.\n"
+            "They appear at the top of every prompt.  If your context was compacted\n"
+            "and you no longer see them, re-read the most recent prompt carefully —\n"
+            "they are always present.  Follow them in every phase.\n"
+            f"{spellbook_line}"
+            "<!-- END claude-runner context-anchors -->\n"
+        )
+
+        try:
+            with claude_md.open("a", encoding="utf-8") as fh:
+                fh.write(block)
+            logger.info(
+                "[ACTION] Context anchors pointer appended to CLAUDE.md (%d chars).",
+                len(block),
+            )
+        except OSError as exc:
+            logger.warning("Could not write context anchors to CLAUDE.md: %s", exc)
+
     def _inject_cccs_fragment(self) -> None:
         """Append a rendered CCCS CLAUDE.md fragment when ``cccs`` is configured.
 
@@ -1767,7 +2177,7 @@ class TaskRunner:
             logger.warning("CCCS render error for preset '%s': %s", preset_name, exc)
             return
 
-        working_dir = self._sandbox.working_dir if self._sandbox else self._book.working_dir
+        working_dir = self._sandbox.get_working_dir_path() if self._sandbox else self._book.working_dir
         claude_dir = Path(working_dir) / ".claude"
         claude_md = claude_dir / "CLAUDE.md"
 
@@ -1789,7 +2199,7 @@ class TaskRunner:
         except OSError as exc:
             logger.warning("Could not write CCCS fragment to CLAUDE.md: %s", exc)
 
-    def _read_claude_md(self) -> Optional[str]:
+    def _read_claude_md(self) -> str | None:
         """
         Read <working_dir>/.claude/CLAUDE.md if it exists and is non-empty.
 
@@ -1862,7 +2272,7 @@ class TaskRunner:
 
         lines = [
             "=" * 72,
-            f"claude-runner — Task Report",
+            "claude-runner — Task Report",
             "=" * 72,
             f"Task:              {result.task_name}",
             f"Status:            {result.status.upper()}",
@@ -1947,6 +2357,202 @@ class TaskRunner:
             await asyncio.sleep(_STATE_CHECKPOINT_INTERVAL_S)
             logger.debug("Heartbeat checkpoint: saving state.")
             self._checkpoint_state()
+            # v2.0: Inject supervisor budget status into pending.md (soft channel)
+            self._inject_budget_status()
+
+    # ------------------------------------------------------------------
+    # v2.0: Supervisor pipeline helpers
+    # ------------------------------------------------------------------
+
+    def _run_intake_validation(self, sp_config) -> None:
+        """Run all-LLM intake validation (§8) before task launch.
+
+        Logs the result and notifies. Does NOT block the run on partial pass —
+        only a hard 'fail' prevents launch.
+        """
+        from .supervisor_protocol import (  # noqa: PLC0415
+            build_intake_prompt,
+            call_supervisor_llm,
+            parse_intake_response,
+        )
+
+        # Read the project book YAML for the LLM prompt
+        book_yaml = ""
+        if self._book_path and self._book_path.exists():
+            book_yaml = self._book_path.read_text(encoding="utf-8")
+        else:
+            logger.warning("[SUPERVISOR] No project book path for intake — skipping validation.")
+            return
+
+        # Read preset file (the checklist)
+        preset_path = getattr(sp_config, "preset_file", None)
+        preset_content = ""
+        if preset_path:
+            p = Path(preset_path)
+            if p.exists():
+                preset_content = p.read_text(encoding="utf-8")
+            else:
+                logger.warning("[SUPERVISOR] Preset file not found: %s", preset_path)
+
+        prompt = build_intake_prompt(book_yaml, preset_content)
+        logger.info("[SUPERVISOR] Intake validation prompt built (%d chars).", len(prompt))
+
+        # Call the supervisor LLM
+        supervisor_model = getattr(sp_config, "supervisor_model", None) or None
+        try:
+            response = call_supervisor_llm(
+                prompt=prompt,
+                model_id=supervisor_model,
+                timeout_s=300,
+                working_dir=self._working_dir(),
+            )
+        except RuntimeError as exc:
+            logger.error("[SUPERVISOR] Intake LLM call failed: %s", exc)
+            self._fault_log.append(f"[SUPERVISOR] Intake call failed: {exc}")
+            return  # fail-open: don't block the run
+
+        result = parse_intake_response(response)
+        outcome = result.get("outcome", "partial")
+        gaps = result.get("gaps", [])
+
+        logger.info(
+            "[SUPERVISOR] Intake validation outcome=%s, gaps=%d",
+            outcome, len(gaps),
+        )
+
+        # Log gaps
+        for gap in gaps:
+            logger.info(
+                "[SUPERVISOR] Intake gap: %s — %s [%s]",
+                gap.get("field", "?"),
+                gap.get("description", "?"),
+                gap.get("severity", "?"),
+            )
+
+        # Notify
+        if self._notifier:
+            event = f"intake_{outcome}"
+            detail = f"Intake validation: {outcome}, {len(gaps)} gap(s)"
+            try:
+                import asyncio  # noqa: PLC0415
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._dispatch(event, {"detail": detail, "gaps": gaps}))
+                else:
+                    loop.run_until_complete(self._dispatch(event, {"detail": detail, "gaps": gaps}))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[SUPERVISOR] Intake notification failed: %s", exc)
+
+        # Hard fail blocks launch
+        if outcome == "fail":
+            raise RuntimeError(
+                f"Intake validation FAILED — {len(gaps)} critical gap(s). "
+                "Fix the project book before launching."
+            )
+
+    def _run_analytical_preflight(self, sp_config) -> None:
+        """Run Thinking Manual pre-flight (§9) before worker launch.
+
+        Uses Track 1 (creative) + Track 2 (controlled) to surface risks.
+        Findings are logged to audit and notified but do not block launch.
+        """
+        if self._thinking_manual is None:
+            return
+
+        from .supervisor_protocol import call_supervisor_llm  # noqa: PLC0415
+
+        # Build context from project book
+        book_yaml = ""
+        if self._book_path and self._book_path.exists():
+            book_yaml = self._book_path.read_text(encoding="utf-8")
+
+        prompt = self._thinking_manual.build_prompt(
+            context=book_yaml,
+            stage="preflight",
+        )
+        logger.info("[SUPERVISOR] Pre-flight prompt built (%d chars).", len(prompt))
+
+        supervisor_model = getattr(sp_config, "supervisor_model", None) or None
+        try:
+            response = call_supervisor_llm(
+                prompt=prompt,
+                model_id=supervisor_model,
+                timeout_s=300,
+                working_dir=self._working_dir(),
+            )
+        except RuntimeError as exc:
+            logger.error("[SUPERVISOR] Pre-flight LLM call failed: %s", exc)
+            self._fault_log.append(f"[SUPERVISOR] Pre-flight call failed: {exc}")
+            return  # fail-open
+
+        result = self._thinking_manual.parse_response(response, "preflight")
+
+        # Log to audit
+        if self._supervisor_enabled:
+            audit_text = self._thinking_manual.format_for_audit(result)
+            audit_dir = self._working_dir() / getattr(sp_config, "audit_dir", "audit")
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            preflight_log = audit_dir / "preflight_findings.md"
+            try:
+                with preflight_log.open("a", encoding="utf-8") as f:
+                    f.write(f"\n{'=' * 60}\n")
+                    f.write(f"Run: {datetime.now(timezone.utc).isoformat()}\n\n")
+                    f.write(audit_text)
+                    f.write("\n")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[SUPERVISOR] Failed to write preflight log: %s", exc)
+
+        logger.info(
+            "[SUPERVISOR] Pre-flight complete: %d finding(s), top_priority=%s",
+            len(result.findings),
+            result.top_priority.severity if result.top_priority else "none",
+        )
+
+        # Credit budget for findings (correct preflight)
+        if result.has_findings and self._supervisor_budget is not None:
+            self._supervisor_budget.credit_points(
+                f"Pre-flight found {len(result.findings)} issue(s)"
+            )
+
+    def _forward_response_to_ntfy(self, response_text: str) -> None:
+        """Auto-forward the LLM's response to a pending.md message via ntfy out.
+
+        Registered as the inbox response callback. Called automatically when
+        the LLM finishes responding to an injected pending.md message.
+        """
+        try:
+            from .ntfy_client import NtfyClient  # noqa: PLC0415
+            ntfy_cfg = getattr(self._book, "ntfy", None)
+            client = NtfyClient(
+                out_channel_override=ntfy_cfg.out_channel if ntfy_cfg else None,
+                cmd_channel_override=ntfy_cfg.cmd_channel if ntfy_cfg else None,
+            )
+            # Truncate very long responses for ntfy (4KB limit on free tier).
+            truncated = response_text[:4000]
+            if len(response_text) > 4000:
+                truncated += f"\n… (truncated, {len(response_text)} chars total)"
+            client.publish("out", truncated, title=f"claude-runner — {self._book.name}")
+            logger.info(
+                "[AUTOFORWARD] LLM response forwarded to ntfy out (%d chars).",
+                len(truncated),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[AUTOFORWARD] Failed to forward response to ntfy: %s", exc)
+
+    def _inject_budget_status(self) -> None:
+        """Inject supervisor budget status into pending.md (soft channel).
+
+        Called periodically from the checkpoint loop so the LLM sees
+        its shrinking budget and adjusts behavior voluntarily.
+        """
+        if not self._supervisor_enabled or self._supervisor_budget is None:
+            return
+        try:
+            from . import inbox  # noqa: PLC0415
+            status = self._supervisor_budget.format_budget_status()
+            inbox.append_message(status)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("_inject_budget_status failed: %s", exc)
 
     async def _silence_watchdog(self, silence_timeout_s: float) -> None:
         """
@@ -1963,6 +2569,13 @@ class TaskRunner:
         """
         while True:
             await asyncio.sleep(silence_timeout_s)
+
+            # Skip probes while the runner is in a rate-limit wait — the
+            # silence is expected and sending "continue" would trigger Claude
+            # Code to make API calls, burning tokens for no reason.
+            if self._rate_limit_paused:
+                logger.debug("Silence watchdog: skipping — rate-limit pause active.")
+                continue
 
             elapsed = time.monotonic() - self._last_output_time
             if elapsed < silence_timeout_s:
@@ -1982,6 +2595,12 @@ class TaskRunner:
 
             # Wait one more window; if output resumes, the next cycle is a no-op.
             await asyncio.sleep(silence_timeout_s)
+
+            # Re-check pause flag after second sleep — rate limit may have
+            # been detected while we were waiting for the probe response.
+            if self._rate_limit_paused:
+                logger.debug("Silence watchdog: skipping error escalation — rate-limit pause active.")
+                continue
 
             elapsed2 = time.monotonic() - self._last_output_time
             if elapsed2 >= silence_timeout_s:
@@ -2017,6 +2636,21 @@ class TaskRunner:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+        # Explicitly kill the worker process before sandbox teardown — the
+        # sandbox.teardown() is best-effort and may hang or fail, leaving the
+        # subprocess orphaned.
+        if self._process is not None:
+            try:
+                if hasattr(self._process, "is_alive") and self._process.is_alive():
+                    logger.info("[CLEANUP] Stopping worker process …")
+                    if hasattr(self._process, "stop"):
+                        self._process.stop(timeout=5.0)
+                    elif hasattr(self._process, "terminate"):
+                        self._process.terminate()
+            except Exception as exc:
+                logger.warning("[CLEANUP] Error stopping worker process: %s", exc)
+            self._process = None
 
         if self._sandbox is not None:
             try:
@@ -2196,7 +2830,7 @@ class TaskRunner:
         """Return the absolute path to progress.log inside the working directory."""
         return self._working_dir() / _RUNNER_DIR / _PROGRESS_LOG_NAME
 
-    def _host_log_dir(self) -> Optional[Path]:
+    def _host_log_dir(self) -> Path | None:
         """Return the host-side log directory, creating it if necessary."""
         output_cfg = getattr(self._book, "output", None)
         log_dir_str = getattr(output_cfg, "log_dir", None)
@@ -2238,7 +2872,7 @@ class TaskRunner:
     # State factory
     # ------------------------------------------------------------------
 
-    def _make_state(self, phase: str, **kwargs) -> "TaskState":  # type: ignore[name-defined]
+    def _make_state(self, phase: str, **kwargs) -> TaskState:  # type: ignore[name-defined]
         """
         Build a TaskState for the given phase, incorporating current runtime state.
 
@@ -2284,7 +2918,7 @@ class TaskRunner:
     def _make_result(
         self,
         status: str,
-        error_message: Optional[str] = None,
+        error_message: str | None = None,
     ) -> TaskResult:
         """Build a TaskResult from current runner state."""
         end_time = datetime.now(tz=timezone.utc)

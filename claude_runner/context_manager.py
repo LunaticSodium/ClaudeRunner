@@ -28,10 +28,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -140,9 +140,9 @@ class ContextManager:
         threshold_tokens: int = 150_000,
         reset_on_rate_limit: bool = True,
         inject_log_on_resume: bool = True,
-        progress_log_path: Optional[Path] = None,
-        on_inject_checkpoint: Optional[Callable[[str], None]] = None,
-        context_anchors: Optional[str] = None,
+        progress_log_path: Path | None = None,
+        on_inject_checkpoint: Callable[[str], None] | None = None,
+        context_anchors: str | None = None,
     ) -> None:
         if threshold_tokens <= 0:
             raise ValueError(
@@ -152,11 +152,11 @@ class ContextManager:
         self._threshold_tokens: int = threshold_tokens
         self.reset_on_rate_limit: bool = reset_on_rate_limit
         self.inject_log_on_resume: bool = inject_log_on_resume
-        self.progress_log_path: Optional[Path] = progress_log_path
-        self._on_inject_checkpoint: Optional[Callable[[str], None]] = on_inject_checkpoint
+        self.progress_log_path: Path | None = progress_log_path
+        self._on_inject_checkpoint: Callable[[str], None] | None = on_inject_checkpoint
         # context_anchors: stripped plain-text instructions prepended verbatim to
         # every outbound prompt.  None means the feature is disabled.
-        self._context_anchors: Optional[str] = context_anchors.strip() if context_anchors else None
+        self._context_anchors: str | None = context_anchors.strip() if context_anchors else None
 
         # Mutable state
         self._token_estimate: int = 0
@@ -166,6 +166,9 @@ class ContextManager:
         # Checkpoint response exclusion: while True, count_output() is a no-op
         # so Claude's checkpoint-response tokens don't inflate the estimate.
         self._in_checkpoint: bool = False
+        self._in_checkpoint_since: float = 0.0  # monotonic time when checkpoint started
+        _CHECKPOINT_TIMEOUT_S = 60.0  # auto-reset if signal not detected within this window
+        self._checkpoint_timeout_s: float = _CHECKPOINT_TIMEOUT_S
         # Becomes True when a blank line or "Then continue" appears in output
         # while _in_checkpoint is set; the next non-empty line clears both.
         self._checkpoint_saw_signal: bool = False
@@ -224,12 +227,51 @@ class ContextManager:
             return
         # While Claude is writing its checkpoint response, skip token counting
         # so the response itself does not push us immediately over threshold again.
+        # Safety: auto-reset after timeout so a missed signal never freezes counting forever.
         if self._in_checkpoint:
-            return
+            if (time.monotonic() - self._in_checkpoint_since) > self._checkpoint_timeout_s:
+                logger.warning(
+                    "Checkpoint response timeout (%.0fs) — signal was never detected. "
+                    "Resuming token counting.",
+                    self._checkpoint_timeout_s,
+                )
+                self.acknowledge_checkpoint_end()
+            else:
+                return
         tokens = _chars_to_tokens(len(text))
         with self._lock:
             self._token_estimate += tokens
         logger.debug("count_output: +%d tokens (%d chars) → total %d", tokens, len(text), self._token_estimate)
+
+    def set_authoritative_tokens(self, total: int) -> None:
+        """
+        Replace ``_token_estimate`` with an authoritative value from the
+        Claude Code stream-json ``result.usage`` field.
+
+        Unlike :meth:`count_input` / :meth:`count_output` (which accumulate
+        chars-to-tokens estimates), this sets the estimate to the API's true
+        token count for the just-completed turn. We use ``max(current, total)``
+        so a single low-cache turn never silently rolls the estimate back —
+        the conversation context can only grow within a single ``claude -p``
+        invocation.
+
+        Parameters
+        ----------
+        total:
+            ``usage.input_tokens + cache_creation_input_tokens
+                + cache_read_input_tokens + output_tokens`` from the
+            ``result`` event.  Negative or zero values are ignored.
+        """
+        if total <= 0:
+            return
+        with self._lock:
+            if total > self._token_estimate:
+                old = self._token_estimate
+                self._token_estimate = total
+                logger.debug(
+                    "set_authoritative_tokens: %d → %d (authoritative; was %d)",
+                    old, total, old,
+                )
 
     # ------------------------------------------------------------------
     # Threshold check
@@ -308,6 +350,7 @@ class ContextManager:
         # a signal that it has finished (blank line, "Then continue", or the
         # next substantive output line after either of those).
         self._in_checkpoint = True
+        self._in_checkpoint_since = time.monotonic()
         self._checkpoint_saw_signal = False
         logger.info("Token counter reset after checkpoint injection (checkpoint #%d).", self._checkpoint_count)
 
@@ -395,6 +438,16 @@ class ContextManager:
                     "inject_log_on_resume is True but progress.log is empty/missing — "
                     "no log prepended."
                 )
+
+        # Append progress-log maintenance reminder so the worker continues
+        # writing structured entries even after model switches / rate-limit
+        # resumes (the original _PROGRESS_LOG_INSTRUCTION is only in the
+        # initial prompt and is lost on context reset).
+        core += (
+            "\n\nREMINDER: Continue maintaining `.claude-runner/progress.log` "
+            "with `[TIMESTAMP] [PHASE/DONE/BLOCK/DECISION] description` entries "
+            "for every significant action."
+        )
 
         # Prepend context_anchors last so they always appear at the very top,
         # regardless of strategy or inject_log_on_resume ordering.

@@ -23,7 +23,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 _OAUTH_SENTINEL: str = "__claude_oauth__"
 
@@ -90,8 +90,8 @@ class NativeSandbox:
         self._extra_env: dict = _cfg_get(sandbox_cfg, "extra_env", {})
 
         # Runtime state ------------------------------------------------
-        self._env: Optional[dict] = None
-        self._process: Optional[object] = None
+        self._env: dict | None = None
+        self._process: object | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -147,7 +147,9 @@ class NativeSandbox:
         # Probe common install locations and inject CLAUDE_CODE_GIT_BASH_PATH
         # if it is not already set.  Without this, 'claude' exits with code 1
         # and the message "Claude Code on Windows requires git-bash".
-        if "CLAUDE_CODE_GIT_BASH_PATH" not in self._env:
+        # No-op on non-Windows (the candidate paths can't exist; emitting the
+        # "git bash may fail on Windows" warning on Linux is misleading).
+        if sys.platform == "win32" and "CLAUDE_CODE_GIT_BASH_PATH" not in self._env:
             _bash_candidates = [
                 Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
                 / "Git" / "usr" / "bin" / "bash.exe",
@@ -176,7 +178,7 @@ class NativeSandbox:
         prompt: str,
         on_line: Callable[[str], None],
         on_exit: Callable[[int], None],
-        model_id: Optional[str] = None,
+        model_id: str | None = None,
     ) -> object:
         """
         Launch Claude Code as a local subprocess using ConPTY (via ClaudeProcess).
@@ -205,7 +207,7 @@ class NativeSandbox:
 
         PipeProcess = _import_pipe_process()
 
-        cmd = self._build_command(prompt)
+        cmd, stdin_text = self._build_command(prompt)
         working_dir = self.get_working_dir_path()
 
         # Apply model override via env vars when requested.
@@ -215,9 +217,10 @@ class NativeSandbox:
             logger.info("Model override active: %s", model_id)
 
         logger.info(
-            "Launching Claude (native/pipe): %s  [cwd=%s]",
+            "Launching Claude (native/pipe): %s  [cwd=%s]%s",
             " ".join(cmd[:3]),  # omit the prompt from the log line
             working_dir,
+            " (stdin prompt)" if stdin_text else "",
         )
 
         self._process = PipeProcess(
@@ -227,6 +230,7 @@ class NativeSandbox:
             on_line=on_line,
             on_exit=on_exit,
             show_console=self._show_claude,
+            stdin_text=stdin_text,
         )
         try:
             self._process.start()
@@ -268,24 +272,50 @@ class NativeSandbox:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _build_command(self, prompt: str) -> list[str]:
-        """Construct the claude CLI command list."""
+    # Windows command-line limit is ~8191 chars.  Leave headroom for the
+    # executable path and flags.
+    _WIN_CMD_LIMIT = 7500
+
+    def _build_command(self, prompt: str) -> tuple[list[str], str | None]:
+        """Construct the claude CLI command list.
+
+        Returns (cmd, stdin_text).  When the prompt is short enough for the
+        Windows command-line limit it is passed inline via ``-p <prompt>``.
+        When it exceeds the limit, the command uses ``-p -`` and the prompt
+        is returned as *stdin_text* to be piped to the subprocess.
+        """
         cmd = ["claude", "--dangerously-skip-permissions"]
 
         if self._use_sandbox_flag and getattr(self, "_has_sandbox_flag", False):
             cmd.append("--sandbox")
 
         cmd += ["--output-format", "stream-json", "--verbose"]
-        cmd += ["-p", prompt]
-        return cmd
+
+        use_stdin = sys.platform == "win32" and len(prompt) > self._WIN_CMD_LIMIT
+        if use_stdin:
+            cmd += ["-p", "-"]
+            logger.info("Prompt too long for CLI (%d chars) — piping via stdin", len(prompt))
+            return cmd, prompt
+        else:
+            cmd += ["-p", prompt]
+            return cmd, None
 
     @staticmethod
     def _probe_sandbox_flag(claude_path: str) -> bool:
         """
         Return True if the installed Claude Code accepts the --sandbox flag.
 
-        We do this by running ``claude --help`` and checking for "sandbox" in
-        the output. This avoids actually launching a session.
+        We do this by running ``claude --help`` and checking for the literal
+        ``--sandbox`` flag in the output. This avoids actually launching a
+        session.
+
+        NOTE: the check must match the flag form (``--sandbox``), not the bare
+        word ``sandbox``. Modern Claude Code (>= 2.1.x) mentions "sandbox" in
+        the description text of unrelated flags such as
+        ``--dangerously-skip-permissions`` ("Recommended only for sandboxes
+        with no internet access."); a bare-word match falsely concludes the
+        flag is supported, ``--sandbox`` then gets appended to the launch
+        command, and Claude Code dies with ``unknown option '--sandbox'``.
         """
         try:
             result = subprocess.run(
@@ -295,7 +325,7 @@ class NativeSandbox:
                 timeout=10,
             )
             combined = (result.stdout + result.stderr).lower()
-            return "--sandbox" in combined or "sandbox" in combined
+            return "--sandbox" in combined
         except Exception as exc:  # noqa: BLE001
             logger.debug("Could not probe claude --help: %s", exc)
             return False

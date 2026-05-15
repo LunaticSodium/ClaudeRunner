@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import logging
 import re
+from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .config import ConfigError
 
 # ---------------------------------------------------------------------------
 # Custom YAML loader — YAML 1.2-style booleans only
@@ -61,7 +63,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ResumeStrategy = Literal["continue", "restate", "summarize"]
-NotifyEvent = Literal["start", "rate_limit", "resume", "complete", "error", "model_switch"]
+NotifyEvent = Literal[
+    "start", "rate_limit", "resume", "complete", "error", "milestone",
+    "model_switch",
+    "supervisor_accident", "intake_pass", "intake_partial", "intake_fail",
+    "preflight_finding", "preflight_action", "kpi_warning", "intervention",
+    "escalate_to_human",
+]
 
 # ---------------------------------------------------------------------------
 # Model-schedule sub-models
@@ -223,6 +231,121 @@ class CccsConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Supervisor protocol config
+# ---------------------------------------------------------------------------
+
+
+class SupervisorProtocolConfig(BaseModel):
+    """Hardcoded behavioral layer for Marathon.
+
+    Once enabled, all mechanisms are mandatory and cannot be disabled,
+    overridden, or bypassed by Claude Code, any Dash agent, or any internal
+    script.  Mutually exclusive with ``cccs``.
+
+    v2.0 additions: supervisor_model, intervention limits, budget system.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    supervisor_model: str = Field(
+        default="",
+        description=(
+            "Model ID for supervisor reasoning (intake, preflight, thinking manual). "
+            "e.g. 'claude-opus-4-6'. If empty, resolved to best available at bootup. "
+            "Supervisor thinks deeply but briefly — needs reasoning power, not token endurance."
+        ),
+    )
+    self_check_limit: int = Field(default=10, ge=1)
+    confirm_timeout_minutes: int = Field(default=5, ge=1)
+    intervention_limit: int = Field(
+        default=3, ge=1,
+        description="Max autonomous interventions per worker before escalating to human.",
+    )
+    intervention_cooldown_min: int = Field(
+        default=30, ge=1,
+        description="Minimum minutes between interventions on the same worker.",
+    )
+    initial_budget_points: int = Field(
+        default=10, ge=1,
+        description="Starting accident point budget for the supervisor.",
+    )
+    audit_dir: str = "audit/"
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Domain anchors and physics constraints
+# ---------------------------------------------------------------------------
+
+
+class DomainAnchor(BaseModel):
+    """A published reference result for validation (Element 5).
+
+    Declared in project book, compared against worker output during supervision.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(..., description="Paper/report citation.")
+    configuration: str = Field(..., description="What was measured.")
+    metric: str = Field(..., description="What the number represents.")
+    value: float = Field(..., description="The numerical target.")
+    unit: str = Field(..., description="Unit of measurement.")
+    tolerance_pct: float = Field(
+        default=50.0,
+        description="How far off (%) before flagging.",
+    )
+
+
+class PhysicsConstraint(BaseModel):
+    """A hard physical invariant that no output may violate (Element 6).
+
+    Declared in project book — NO hardcoded domain constants in runner code.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., description="Short identifier (e.g. 'positive_vpiL').")
+    check: str = Field(
+        ...,
+        description="Expression from project book (e.g. '0 < vpiL < 100').",
+    )
+    message: str = Field(..., description="Explanation if violated.")
+
+
+class IntakeSpec(BaseModel):
+    """Optional section for intake validation hints (§8).
+
+    All fields are optional — the LLM evaluates completeness against the
+    preset file, not against this schema.  This just provides structured hints.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    design_space_description: str | None = None
+    objectives: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+    output_spec: str | None = None
+    domain_anchors: list[DomainAnchor] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# v2.0: Worker handle for multi-worker dispatch
+# ---------------------------------------------------------------------------
+
+
+class WorkerConfig(BaseModel):
+    """Configuration for a single Dash worker dispatched by the supervisor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    worker_id: str = Field(..., description="Unique worker identifier (e.g. 'D1').")
+    project_book_path: str = Field(..., description="Path to this worker's project book YAML.")
+    working_dir: str = Field(..., description="Path to this worker's working directory.")
+    model_id: str = Field(default="", description="Model for this worker (empty = default).")
+
+
+# ---------------------------------------------------------------------------
 # Sandbox sub-models
 # ---------------------------------------------------------------------------
 
@@ -310,7 +433,7 @@ class SandboxConfig(BaseModel):
             "'native' (runs on host, no container), or 'auto' (docker if available)."
         ),
     )
-    working_dir: Optional[Path] = Field(
+    working_dir: Path | None = Field(
         default=None,
         description=(
             "Host-side working directory for the task.  When omitted, claude-runner "
@@ -339,12 +462,12 @@ class SandboxConfig(BaseModel):
 
     @field_validator("working_dir", mode="before")
     @classmethod
-    def coerce_working_dir(cls, v: Any) -> Optional[Path]:
+    def coerce_working_dir(cls, v: Any) -> Path | None:
         return Path(v) if v is not None else None
 
     @field_validator("working_dir")
     @classmethod
-    def working_dir_must_be_dir(cls, v: Optional[Path]) -> Optional[Path]:
+    def working_dir_must_be_dir(cls, v: Path | None) -> Path | None:
         """If working_dir is set, validate it is (or can become) a directory."""
         if v is None:
             return None
@@ -477,7 +600,7 @@ class ExecutionConfig(BaseModel):
     )
     context: ContextConfig = Field(default_factory=ContextConfig)
     milestones: list[Milestone] = Field(default_factory=list)
-    silence_timeout_minutes: Optional[int] = Field(
+    silence_timeout_minutes: int | None = Field(
         default=None,
         ge=1,
         description=(
@@ -583,7 +706,7 @@ class NotifyChannel(BaseModel):
     url: str | None = Field(default=None, description="Endpoint URL for webhook channels.")
 
     @model_validator(mode="after")
-    def validate_channel_fields(self) -> "NotifyChannel":
+    def validate_channel_fields(self) -> NotifyChannel:
         if self.type == "email" and not self.to:
             raise ValueError("notify channel of type 'email' requires a 'to' address.")
         if self.type == "webhook" and not self.url:
@@ -614,7 +737,7 @@ class NotifyConfig(BaseModel):
     channels: list[NotifyChannel] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def channels_required_when_events_set(self) -> "NotifyConfig":
+    def channels_required_when_events_set(self) -> NotifyConfig:
         if self.on and not self.channels:
             logger.warning(
                 "notify.on lists events %s but no channels are configured — "
@@ -622,6 +745,103 @@ class NotifyConfig(BaseModel):
                 self.on,
             )
         return self
+
+
+# ---------------------------------------------------------------------------
+# ntfy.sh channel configuration (v2.0a)
+# ---------------------------------------------------------------------------
+
+
+class NtfyChannelConfig(BaseModel):
+    """ntfy.sh channel names declared in the project book.
+
+    The project book is the primary source of truth for ntfy channels —
+    like a supervisor leaving their phone number in the project spec.
+    Channels declared here take priority over Windows Credential Manager
+    and hardcoded defaults.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    out_channel: str | None = Field(
+        default=None,
+        description="ntfy.sh channel name for outbound notifications (runner → human).",
+    )
+    cmd_channel: str | None = Field(
+        default=None,
+        description="ntfy.sh channel name for inbound commands (human → runner).",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Implementation constraints sub-models
+# ---------------------------------------------------------------------------
+
+
+class ConstraintVerifyBackend(str, Enum):
+    """Backend used to verify an implementation constraint."""
+
+    file_contains = "file_contains"
+    llm_judge = "llm_judge"
+
+
+class ImplementationConstraint(BaseModel):
+    """A verifiable algorithmic requirement for the task output.
+
+    Attributes
+    ----------
+    id:
+        Short unique identifier for this constraint (e.g. ``"use-redis"``).
+    description:
+        Human-readable description injected into the initial prompt and
+        visible in reports.
+    verify_with:
+        Verification backend.  ``file_contains`` runs a regex/grep search;
+        ``llm_judge`` asks a lightweight model to confirm compliance.
+    file:
+        Relative path (from working directory) of the file to inspect.
+        Required for ``file_contains``; optional for ``llm_judge``.
+    pattern:
+        Python regex pattern searched in *file*.  Required for
+        ``file_contains``.
+    prompt:
+        Instruction sent to the LLM judge.  Required for ``llm_judge``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    verify_with: ConstraintVerifyBackend
+    # file_contains fields
+    file: str | None = None
+    pattern: str | None = None
+    # llm_judge fields
+    prompt: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Preflight sub-model
+# ---------------------------------------------------------------------------
+
+
+class PreflightConfig(BaseModel):
+    """Optional pre-flight checks run before Claude Code subprocess is spawned.
+
+    Attributes
+    ----------
+    required_env:
+        List of environment variable names that must be set.  A missing
+        variable causes a hard ``PreflightError`` before Claude is launched.
+    skip:
+        When ``True`` all preflight checks are skipped for this project book.
+        Equivalent to passing ``--skip-preflight`` on the CLI.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    required_env: list[str] = Field(default_factory=list)
+    skip: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -659,12 +879,12 @@ class AcceptanceCheck(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["file_exists", "file_contains", "command", "llm_judge"]
-    path: Optional[str] = None
-    pattern: Optional[str] = None
-    run: Optional[str] = None
-    expect_exit: Optional[int] = 0
-    prompt: Optional[str] = None
-    expect: Optional[Literal["pass", "fail"]] = "pass"
+    path: str | None = None
+    pattern: str | None = None
+    run: str | None = None
+    expect_exit: int | None = 0
+    prompt: str | None = None
+    expect: Literal["pass", "fail"] | None = "pass"
 
 
 class AcceptanceCriteria(BaseModel):
@@ -780,7 +1000,14 @@ class ProjectBook(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
-    acceptance_criteria: Optional[AcceptanceCriteria] = Field(
+    ntfy: NtfyChannelConfig | None = Field(
+        default=None,
+        description=(
+            "ntfy.sh channel names for push notifications and inbound commands.  "
+            "Takes priority over Windows Credential Manager and hardcoded defaults."
+        ),
+    )
+    acceptance_criteria: AcceptanceCriteria | None = Field(
         default=None,
         description=(
             "Optional post-completion acceptance gate.  When set, claude-runner "
@@ -788,9 +1015,58 @@ class ProjectBook(BaseModel):
             "On failure the task is retried, notified, or failed per on_failure."
         ),
     )
+    preflight: PreflightConfig | None = Field(
+        default=None,
+        description=(
+            "Optional pre-flight checks evaluated before Claude Code is spawned.  "
+            "Fails hard on missing required_env variables; warns on other issues."
+        ),
+    )
+    implementation_constraints: list[ImplementationConstraint] = Field(
+        default_factory=list,
+        description=(
+            "Verifiable algorithmic requirements injected into the initial prompt and "
+            "verified automatically after acceptance checks complete."
+        ),
+    )
+    supervisor_protocol: SupervisorProtocolConfig = Field(
+        default_factory=SupervisorProtocolConfig,
+        description=(
+            "Supervisor protocol configuration.  When enabled=true, activates the "
+            "hardcoded marathon behavioral layer.  Mutually exclusive with cccs."
+        ),
+    )
+    intake: IntakeSpec | None = Field(
+        default=None,
+        description=(
+            "Optional intake validation hints (§8). Domain anchors, objectives, "
+            "constraints, design space description. LLM evaluates project book "
+            "against the preset file using these as structured hints."
+        ),
+    )
+    physics_constraints: list[PhysicsConstraint] = Field(
+        default_factory=list,
+        description=(
+            "Hard physical invariants that no output may violate (Element 6). "
+            "Declared here, not hardcoded in the runner. The runner provides the "
+            "evaluation engine; the project book provides the constraints."
+        ),
+    )
 
     @model_validator(mode="after")
-    def resolve_skip_permissions(self) -> "ProjectBook":
+    def validate_supervisor_cccs_exclusive(self) -> ProjectBook:
+        """Raise ConfigError if both supervisor_protocol and cccs are enabled."""
+        cccs_enabled = self.cccs is not None and self.cccs.enabled
+        sp_enabled = self.supervisor_protocol.enabled
+        if sp_enabled and cccs_enabled:
+            raise ConfigError(
+                "supervisor_protocol and cccs cannot both be enabled — "
+                "they are mutually exclusive protocol layers."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def resolve_skip_permissions(self) -> ProjectBook:
         """Resolve skip_permissions to a concrete bool based on sandbox mode.
 
         - Docker sandbox present → default True (safe inside container)
@@ -802,7 +1078,7 @@ class ProjectBook(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def warn_skip_permissions_without_docker(self) -> "ProjectBook":
+    def warn_skip_permissions_without_docker(self) -> ProjectBook:
         """Emit a log warning (not an error) when skip_permissions is enabled
         without the Docker sandbox, because this grants Claude unrestricted
         access to the host filesystem without any containment boundary."""
@@ -816,7 +1092,7 @@ class ProjectBook(BaseModel):
         return self
 
     @classmethod
-    def from_yaml(cls, path) -> "ProjectBook":
+    def from_yaml(cls, path) -> ProjectBook:
         """Load and validate a project book from a YAML file.
 
         Convenience classmethod that delegates to :func:`load_project_book`.
