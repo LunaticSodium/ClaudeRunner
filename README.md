@@ -1,12 +1,18 @@
 # claude-runner · v2.0
 
-`claude-runner` is a Windows CLI tool that orchestrates
+`claude-runner` is a CLI tool that orchestrates
 [Claude Code](https://docs.anthropic.com/claude/docs/claude-code) as a fully
 autonomous subprocess.  You describe a project in a YAML **project book**,
 point the runner at it, and it drives Claude Code end-to-end: spinning up an
 isolated sandbox, feeding Claude its instructions, monitoring for rate-limit
 pauses, managing context length, routing notifications, and optionally
 switching models as the task progresses through phases.
+
+**Supported platforms:** Windows 10 / 11 natively, plus Linux / WSL2 via the
+editable Python install (see [Install on Linux / WSL](#install-on-linux--wsl)).
+The pre-built `claude-runner.exe` is Windows-only; on Linux the runner is
+invoked via the `claude-runner` console script installed into a venv or
+conda env.
 
 **v2.0** adds a two-tier adversarial supervision system: a Marathon Runner
 (supervisor) manages N Dash Runner (worker) subprocesses with budget-gated
@@ -60,6 +66,41 @@ git clone https://github.com/LunaticSodium/ClaudeRunner.git
 cd ClaudeRunner/claude-runner
 pip install -e ".[dev]"
 ```
+
+---
+
+## Install on Linux / WSL
+
+Tested on WSL2 + Ubuntu 26.04 with Python 3.11 via miniconda. Should work on
+any glibc-based distribution.
+
+```bash
+# 1. Ensure Node.js + Claude Code are installed inside the Linux env:
+sudo apt install -y nodejs npm     # or use nvm / your distro's installer
+npm install -g @anthropic-ai/claude-code
+claude                              # one-time OAuth login (browser handoff
+                                    # or paste-the-URL-into-Windows-browser)
+
+# 2. Install claude-runner editable in a venv or conda env:
+git clone https://github.com/LunaticSodium/ClaudeRunner.git
+cd ClaudeRunner
+/path/to/env/bin/pip install -e ".[dev]"
+
+# 3. Verify:
+/path/to/env/bin/claude-runner --version
+```
+
+The `pyproject.toml` uses platform markers so the Windows-only `pywinpty`
+dependency is skipped on Linux (the runtime uses `ptyprocess` + plain
+`subprocess.Popen` instead). The native sandbox path does not require a PTY
+layer on Linux because Claude Code's `-p` stream-json mode is pipe-friendly.
+
+A shell-script wrapper analogous to `run.ps1` is straightforward to write
+on Linux; the three-stage pattern (env bootstrap → preflight → `claude-runner
+run <project>.yaml`) ports directly. If your acceptance commands use names
+like `pytest` / `python` / `ruff`, ensure the wrapper exports `PATH` so the
+env's `bin/` is first — otherwise the runner's subprocess shell-out will
+fail with `/bin/sh: 1: <cmd>: not found` (exit 127).
 
 ---
 
