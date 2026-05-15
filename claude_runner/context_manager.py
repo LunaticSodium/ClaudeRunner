@@ -243,6 +243,36 @@ class ContextManager:
             self._token_estimate += tokens
         logger.debug("count_output: +%d tokens (%d chars) → total %d", tokens, len(text), self._token_estimate)
 
+    def set_authoritative_tokens(self, total: int) -> None:
+        """
+        Replace ``_token_estimate`` with an authoritative value from the
+        Claude Code stream-json ``result.usage`` field.
+
+        Unlike :meth:`count_input` / :meth:`count_output` (which accumulate
+        chars-to-tokens estimates), this sets the estimate to the API's true
+        token count for the just-completed turn. We use ``max(current, total)``
+        so a single low-cache turn never silently rolls the estimate back —
+        the conversation context can only grow within a single ``claude -p``
+        invocation.
+
+        Parameters
+        ----------
+        total:
+            ``usage.input_tokens + cache_creation_input_tokens
+                + cache_read_input_tokens + output_tokens`` from the
+            ``result`` event.  Negative or zero values are ignored.
+        """
+        if total <= 0:
+            return
+        with self._lock:
+            if total > self._token_estimate:
+                old = self._token_estimate
+                self._token_estimate = total
+                logger.debug(
+                    "set_authoritative_tokens: %d → %d (authoritative; was %d)",
+                    old, total, old,
+                )
+
     # ------------------------------------------------------------------
     # Threshold check
     # ------------------------------------------------------------------

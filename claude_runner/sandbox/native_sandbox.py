@@ -147,7 +147,9 @@ class NativeSandbox:
         # Probe common install locations and inject CLAUDE_CODE_GIT_BASH_PATH
         # if it is not already set.  Without this, 'claude' exits with code 1
         # and the message "Claude Code on Windows requires git-bash".
-        if "CLAUDE_CODE_GIT_BASH_PATH" not in self._env:
+        # No-op on non-Windows (the candidate paths can't exist; emitting the
+        # "git bash may fail on Windows" warning on Linux is misleading).
+        if sys.platform == "win32" and "CLAUDE_CODE_GIT_BASH_PATH" not in self._env:
             _bash_candidates = [
                 Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
                 / "Git" / "usr" / "bin" / "bash.exe",
@@ -303,8 +305,17 @@ class NativeSandbox:
         """
         Return True if the installed Claude Code accepts the --sandbox flag.
 
-        We do this by running ``claude --help`` and checking for "sandbox" in
-        the output. This avoids actually launching a session.
+        We do this by running ``claude --help`` and checking for the literal
+        ``--sandbox`` flag in the output. This avoids actually launching a
+        session.
+
+        NOTE: the check must match the flag form (``--sandbox``), not the bare
+        word ``sandbox``. Modern Claude Code (>= 2.1.x) mentions "sandbox" in
+        the description text of unrelated flags such as
+        ``--dangerously-skip-permissions`` ("Recommended only for sandboxes
+        with no internet access."); a bare-word match falsely concludes the
+        flag is supported, ``--sandbox`` then gets appended to the launch
+        command, and Claude Code dies with ``unknown option '--sandbox'``.
         """
         try:
             result = subprocess.run(
@@ -314,7 +325,7 @@ class NativeSandbox:
                 timeout=10,
             )
             combined = (result.stdout + result.stderr).lower()
-            return "--sandbox" in combined or "sandbox" in combined
+            return "--sandbox" in combined
         except Exception as exc:  # noqa: BLE001
             logger.debug("Could not probe claude --help: %s", exc)
             return False

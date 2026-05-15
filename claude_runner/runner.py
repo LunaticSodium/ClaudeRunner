@@ -58,6 +58,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Authoritative token-usage marker emitted by PipeProcess from each
+# stream-json ``result`` event (process.py:_process_stream_event). Replaces
+# the chars-to-tokens estimate with the API's actual usage figure for the
+# just-completed turn. Format: ``##RUNNER:USAGE:<int>##`` on its own line.
+_USAGE_MARKER_RE: re.Pattern[str] = re.compile(r"^##RUNNER:USAGE:(\d+)##$")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1522,7 +1528,17 @@ class TaskRunner:
 
         # Token counting + checkpoint-end detection.
         if self._context_manager is not None:
-            self._context_manager.count_output(clean)
+            # Prefer the API's authoritative usage when PipeProcess emits the
+            # ##RUNNER:USAGE:<N>## marker from a result event. Falls back to
+            # the chars-to-tokens estimate for every other line.
+            usage_match = _USAGE_MARKER_RE.match(clean) if clean else None
+            if usage_match is not None:
+                try:
+                    self._context_manager.set_authoritative_tokens(int(usage_match.group(1)))
+                except (ValueError, OverflowError):
+                    pass
+            else:
+                self._context_manager.count_output(clean)
             self._context_manager.notify_output_line(clean)
 
         # TUI update.

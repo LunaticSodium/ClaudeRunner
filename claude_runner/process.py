@@ -790,6 +790,21 @@ class PipeProcess:
             self._deliver_line("[·]")
 
         elif event_type == "result":
+            # Emit authoritative token usage BEFORE the success/error markers
+            # so the runner's context manager has the accurate count even when
+            # the orchestrator promptly stops on a ##RUNNER:COMPLETE## or error
+            # marker on the same final line batch.
+            usage = event.get("usage", {})
+            if usage:
+                total = (
+                    usage.get("input_tokens", 0)
+                    + usage.get("cache_creation_input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0)
+                    + usage.get("output_tokens", 0)
+                )
+                if total > 0:
+                    self._deliver_line(f"##RUNNER:USAGE:{total}##")
+
             subtype = event.get("subtype", "")
             is_error = event.get("is_error", False)
             if subtype == "success" and not is_error:
