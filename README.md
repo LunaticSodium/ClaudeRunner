@@ -33,17 +33,18 @@ supervise manually.
 3. [Prerequisites](#prerequisites)
 4. [Quick Start](#quick-start)
 5. [Supervisor Protocol](#supervisor-protocol)
-6. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
-7. [Phase-Aware Model Switching](#phase-aware-model-switching)
-8. [Project Book Reference](#project-book-reference)
-9. [CLI Reference](#cli-reference)
-10. [ntfy Messaging](#ntfy-messaging)
-11. [Sandbox Modes](#sandbox-modes)
-12. [Notifications](#notifications)
-13. [Acceptance Criteria](#acceptance-criteria)
-14. [Configuration](#configuration)
-15. [Development](#development)
-16. [License](#license)
+6. [NSuicide Principle (NSP)](#nsuicide-principle-nsp)
+7. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
+8. [Phase-Aware Model Switching](#phase-aware-model-switching)
+9. [Project Book Reference](#project-book-reference)
+10. [CLI Reference](#cli-reference)
+11. [ntfy Messaging](#ntfy-messaging)
+12. [Sandbox Modes](#sandbox-modes)
+13. [Notifications](#notifications)
+14. [Acceptance Criteria](#acceptance-criteria)
+15. [Configuration](#configuration)
+16. [Development](#development)
+17. [License](#license)
 
 ---
 
@@ -245,6 +246,102 @@ rate-limit/environment.
 | `audit/preflight_findings.md` | Pre-flight analysis results |
 | `audit/self_check_log.md` | Post-Dash self-check results |
 | `audit/accident_snapshots/` | Frozen supervisor thinking at each failure |
+
+---
+
+## NSuicide Principle (NSP)
+
+claude-runner's failure-handling design follows the **NSuicide Principle**
+(NSP): *no part of the runner voluntarily kills itself under any condition
+that could equivalently be handled by notifying the human and continuing.*
+Self-termination is reserved for genuine impossibilities (uncaught
+exceptions in core orchestration, missing required dependencies, manual
+SIGTERM/SIGINT). Everything else stays alive.
+
+### Motivation
+
+The cost asymmetry is large. An orchestrator self-killing in the middle
+of a multi-hour scientific simulation costs the human a relaunch + state
+reset + context rebuild + supervision time. In bad cases it also severs
+the only process tracking a detached long-running worker, forcing manual
+re-attachment via PID files. **Notifying-and-staying-alive costs roughly
+nothing comparable.** A runner that hangs around uselessly for an extra
+ten minutes is strictly better than one that died ten minutes before
+the worker finished a 3-hour compute.
+
+### What NSP enforces
+
+1. **`acceptance_criteria` failures default to `notify`, not `retry`.**
+   The runner evaluates all checks, reports which gates passed/failed,
+   dispatches the configured notification, and remains running. Retries
+   are opt-in (`on_failure: retry, max_retries: N`) and only meaningful
+   when the human expects the agent to attempt a fix in-session — never
+   the right default for partial-deliverable workflows, where the
+   missing-files check is *intentional* and retrying just burns tokens.
+2. **Detached workers always outlive the orchestrator.** When a project's
+   CLAUDE.md mandates the detached-compute pattern (cf. the FDTD
+   grating-coupler example's §5.7), long-running compute is launched via
+   `subprocess.Popen(start_new_session=True)` with a PID file. The
+   orchestrator dying — rate-limit timeout, OS suspend, manual abort —
+   does NOT kill these workers. The next orchestrator launch re-attaches
+   to the running PID and resumes monitoring.
+3. **Rate-limit waits never abandon mid-sleep.** `RateLimitWaiter` holds
+   until the API reset epoch + buffer regardless of orchestrator-side
+   interruption signals. The waiter is interruptible by explicit
+   cancel(), not by transient host events.
+4. **The TUI keeps redrawing on background-task failures.** A failed
+   monitor task, dead notification channel, or unreachable ntfy server
+   does not abort the supervisor or the worker — those errors are logged
+   and surfaced via the audit log, while the main session continues.
+5. **Hard errors that DO require exit still write a final-state
+   checkpoint before exiting**, so the next orchestrator launch picks up
+   exactly where the previous one died. NSP is not "never exit"; it's
+   "exit only when there's no alternative, and exit in a way that the
+   next session can recover."
+
+### Project-book pattern under NSP
+
+For the common case (partial-deliverable workflows, multi-day overnight
+sweeps, anything where the agent might *legitimately* leave acceptance
+gates unmet), set:
+
+```yaml
+acceptance_criteria:
+  on_failure: notify              # NSP default
+  max_retries: 0
+  checks:
+    - type: command
+      run: pytest tests/ -q
+    - type: file_exists
+      path: output/final_result.json
+    # ...
+```
+
+The runner now reports the gate status as part of the completion
+notification rather than reading "5/10 fail" as a fatal condition.
+
+### How to break NSP (when you actually want to)
+
+If the human wants the runner to exit-fail on acceptance failure (e.g.
+for CI usage, where a non-zero exit is the only signal a build system
+respects), set `on_failure: fail` explicitly. NSP is a default, not a
+hard constraint — it's the answer to "what should the runner do when
+it has the option to live or die?".
+
+### Where NSP is currently NOT enforced (known gaps)
+
+- **`max_rate_limit_waits`** in `execution:` still exits the orchestrator
+  when exhausted, instead of notifying + waiting for human resume. This
+  is a known historical default that pre-dates NSP. Future revision: if
+  the worker is using OAuth (no API key budget concern), the count can
+  default to effectively-unlimited; if API-key-based, the human can
+  raise the ceiling. A `--no-self-kill` flag is planned to honour NSP
+  across all such legacy ceilings without per-project YAML overrides.
+- **Acceptance-criteria evaluation** currently happens unconditionally
+  after `##RUNNER:COMPLETE##` even when the agent has explicitly emitted
+  a partial-deliverable signal (`output/phase{N}_skipped.md`). A future
+  revision will treat the presence of `output/phase{N}_acceptance_partial.md`
+  as a notify-only branch rather than a hard gate.
 
 ---
 
