@@ -579,6 +579,73 @@ the human-supplied range is automatic justification for an L1
 re-describe or a `[BLOCK]` event, even if all the acceptance_criteria
 file_exists checks pass.
 
+### Default resource-utilisation policy (CPU / RAM / GPU)
+
+Without an explicit override in the project book, the worker agent
+SHOULD target the following utilisation on the host machine:
+
+| Resource | Target | Peak ceiling | Rationale |
+|---|---|---|---|
+| CPU | ~75% of cores | — | Leave ~4 cores or ~20% (whichever is greater) for the OS, the orchestrator process, and the user's interactive session. |
+| RAM | 65% steady-state | 75% peak | Above ~85% of system RAM the OS thrashes (paging / swap); the wall-clock penalty cancels the gain from using the extra RAM. |
+| GPU compute | full when used | — | GPU compute is effectively binary — one kernel uses the whole device until done; capping by percentage has no meaningful semantics. |
+| GPU VRAM | ≤ 85% per device | — | CUDA OOM is brutal: no graceful degradation. Stay below the ceiling, fail loudly rather than swap. |
+
+These are sweet-spot defaults for **unattended overnight runs on a
+typical shared workstation**. They keep the box responsive enough that
+the human can still log in and inspect mid-run without choking the
+worker, and they leave headroom for incidental OS / antivirus / backup
+spikes that would otherwise stall the simulation.
+
+The numbers translate to concrete env vars / arg defaults in the
+worker entry point — for example a 20-core box at 75% CPU becomes:
+
+```python
+# At the top of every worker entrypoint, BEFORE numpy/meep imports:
+N_THREADS = max(1, total_cores - max(4, total_cores // 5))   # ≈ 75% of cores
+for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+            "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(var, str(N_THREADS))
+```
+
+For a parallel sweep (e.g. PHASE-5 in the FDTD example), the same
+budget is split: `N_workers × threads_per_worker ≈ 75% of cores`.
+
+#### Overriding the default in a project book
+
+Two patterns are supported.
+
+**(1) Whole-machine override** — when the host is a dedicated
+workstation and the user explicitly grants full utilisation:
+
+```yaml
+context_anchors: |
+  Resource policy (overrides the runner default 75%/65%/85%):
+  This host is a dedicated workstation; the human is not actively
+  using it during long runs. Use the FULL compute budget — saturate
+  all 20 CPU cores at 100%, allow RAM peaks up to ~90%, no headroom
+  reservation needed. GPU policy unchanged (compute full / VRAM ≤ 85%).
+```
+
+**(2) Per-phase fine-tuning** — when different phases want different
+budgets (e.g. exploratory probes vs. final sweeps):
+
+```yaml
+context_anchors: |
+  Resource policy:
+    PHASE 0..3: low compute (small probes, code work); 4 threads max.
+    PHASE 4   : single 3D solve, OMP_NUM_THREADS = total_cores - 4.
+    PHASE 5   : 4 worker processes × OMP_NUM_THREADS=4 = 16 active.
+    PHASE 6   : single BO probe, OMP_NUM_THREADS = total_cores - 4.
+```
+
+The runner has **no built-in resource enforcement** — these are soft
+conventions the agent honours via env-var pinning at the worker
+entrypoint. If hard enforcement is required (shared HPC, multi-tenant
+hosts), use the Docker sandbox with `--cpus` / `--memory` flags or
+host-level `cgroups` / `taskset` outside the runner.
+
 ---
 
 ## CLI Reference
