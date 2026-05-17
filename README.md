@@ -511,6 +511,74 @@ acceptance_criteria:
       run: dotnet test
 ```
 
+### Adding literature / paper anchors as conditions from the human
+
+When the project is a research or design task where the agent's
+intermediate numbers cannot be independently verified by you (no
+alternative tool, no domain expertise, no oracle), inject
+**authoritative paper citations and expected result ranges** directly
+into the project book — usually in `context_anchors` or near the
+relevant phase in `prompt`. The agent uses these as ground-truth
+comparison: a result that disagrees with the literature range by more
+than the stated tolerance is treated as a **likely pipeline bug**, not
+a real physical or empirical result.
+
+Why this matters: an autonomous agent under budget pressure tends to
+optimise for "the acceptance check passes" rather than "the result is
+correct". Without an anchor, a metric bug (sign convention,
+normalisation, wrong units) can return a plausible-looking number and
+slip through. With an anchor, the same bug shows up as an unambiguous
+out-of-range result the agent (or supervisor) must surface.
+
+```yaml
+context_anchors: |
+  === Literature benchmarks (anchor data from the human) ===
+  Expected coupling efficiency at the literature baseline (uniform
+  single-etch SOI grating coupler, 220 nm Si, 70 nm etch, 1550 nm TE):
+
+  Plausible range:     -5 to -10 dB
+  Theoretical ceiling: ~-1 dB (Gaussian-fibre 80% overlap limit)
+  Implausible:         < -15 dB  -->  metric pipeline bug
+
+  Papers:
+    * Taillaert et al., IEEE JQE 38(7), 949-955 (2002).
+      DOI: 10.1109/JQE.2002.1017613.  Canonical uniform-grating
+      result: ~-7 dB at 1550 nm.
+    * Yang et al., Sci. Rep. 13:18101 (2023).
+      DOI: 10.1038/s41598-023-45168-2.  220 nm / 70 nm-etch AGC:
+      simulated -3 dB, measured -5.86 dB.
+    * Vermeulen et al., Opt. Express 18(17), 18278 (2010).
+      DOI: 10.1364/OE.18.018278.  Upper-bound reference (multi-layer
+      overlay, -1.6 dB).
+
+  When a simulated value disagrees with this range by >5 dB, the FIRST
+  hypothesis is a post-processing bug (sign of k_x, DFT convention,
+  alignment search range, missing polarisation component) — NOT a
+  poor physical design.
+```
+
+Pair this with a CLAUDE.md rule like:
+
+```
+A result that disagrees with the context_anchors literature range by
+more than 5 dB MUST be surfaced as `output/<deviation_name>.md` and
+treated as a probable bug. Never silently report it as the deliverable.
+```
+
+The pattern generalises beyond optics — any domain with established
+benchmarks (e.g. reaction rate constants from NIST, free-energy values
+from CCCBDB, RANS turbulence-model validation cases) is a candidate.
+**Cite specific DOIs/URLs; don't trust the agent to remember them.**
+The agent reads the project book and the spec; it does not browse the
+web mid-run unless you give it `WebSearch` tool access AND a research
+mandate.
+
+This also gives the supervisor protocol (`--supervisor`) a concrete
+disagreement criterion to act on: a worker reporting a value outside
+the human-supplied range is automatic justification for an L1
+re-describe or a `[BLOCK]` event, even if all the acceptance_criteria
+file_exists checks pass.
+
 ---
 
 ## CLI Reference
