@@ -70,6 +70,12 @@ class CCCSSpec:
             "reproducibility.config_required": True,
             "reproducibility.metadata_logged": True,
             "reproducibility.seed_logged": True,
+            # Added in CCCS v1.1.0 — mandatory agent-free launch path for scisim
+            "deliverability.agent_free_driver_required": True,
+            "deliverability.agent_free_config_required": True,
+            "deliverability.agent_free_documented": True,
+            "deliverability.agent_free_partial_deliverable": True,
+            "deliverability.agent_free_idempotent_resume": True,
             ...
         }
         """

@@ -17,7 +17,16 @@
 [meta]
 spec_name    = "CCCS"
 full_name    = "Claude Code C# Standards for Scientific Simulation"
-version      = "1.0.0"
+version      = "1.1.0"
+# Changelog:
+#   1.1.0 — Add [tail.scisim.deliverability_gate]: agent-free launch path
+#           (driver script + user-editable config + partial-deliverable
+#           safety net + idempotent resume) is now MANDATORY for scisim
+#           projects. Science simulations must remain runnable past LLM
+#           subscription expiry and during agent rate-limit incidents.
+#           Backward-compatible: pure addition; engineering profile
+#           unchanged.
+#   1.0.0 — Initial release.
 language     = "C#"
 runtime      = ".NET 8+"
 domain       = "scientific-simulation"
@@ -389,6 +398,27 @@ required_columns = ["point_estimate", "standard_error", "confidence_interval", "
 ademp_structure  = true              # Aims/Data-generating/Estimands/Methods/Performance
 negative_results_documented = true   # failed configurations must not be silently omitted
 ref = "morris2019"
+
+[tail.scisim.deliverability_gate]
+# An agent-free launch path is MANDATORY for scisim projects. Science
+# simulations must remain runnable past the operator's LLM subscription
+# expiry, past agent rate-limit issues, and for hand-off to non-coder
+# researchers. The runner verifies, before declaring the project
+# delivered, that the operator can execute the work without any
+# LLM-in-the-loop.
+#
+# ref: Wilson 2014 "Best Practices for Scientific Computing" (operator
+# autonomy); FAIR4RS principle R1.1 (reusable software must be runnable
+# by independent researchers); CSDD2025 (rollback to deterministic
+# pipeline when agent supervision is interrupted).
+agent_free_driver_required    = true   # a driver script (drive_*.sh, run_*.sh, Makefile, etc.) exists at the project root that does NOT invoke claude-runner / claude / any LLM
+agent_free_config_required    = true   # a co-located, user-editable config file (drive_config.sh, .yaml, .toml, etc.) parametrises the driver
+agent_free_documented         = true   # the project's CLAUDE.md (or README) documents the agent-free launch path with hand-off instructions for an operator without a Claude subscription
+agent_free_partial_deliverable = true  # the driver can produce a partial deliverable from interrupted state (e.g. finalize.sh or `make snapshot`)
+agent_free_idempotent_resume  = true   # re-invocation skips completed work rather than redoing it; partial sweep / training state is recoverable
+ref_autonomy        = "wilson2014"
+ref_reusability     = "fair4rs2022"
+ref_rollback        = "csdd2025"
 
 
 # ── 4.2 Profile: engineering (pure software engineering) ─────────────────────

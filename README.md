@@ -35,16 +35,17 @@ supervise manually.
 5. [Supervisor Protocol](#supervisor-protocol)
 6. [NSuicide Principle (NSP)](#nsuicide-principle-nsp)
 7. [CCCS — C# Standards Preset](#cccs--c-standards-preset)
-8. [Phase-Aware Model Switching](#phase-aware-model-switching)
-9. [Project Book Reference](#project-book-reference)
-10. [CLI Reference](#cli-reference)
-11. [ntfy Messaging](#ntfy-messaging)
-12. [Sandbox Modes](#sandbox-modes)
-13. [Notifications](#notifications)
-14. [Acceptance Criteria](#acceptance-criteria)
-15. [Configuration](#configuration)
-16. [Development](#development)
-17. [License](#license)
+8. [Agent-free fallback launch *(optional pattern)*](#agent-free-fallback-launch-optional-pattern)
+9. [Phase-Aware Model Switching](#phase-aware-model-switching)
+10. [Project Book Reference](#project-book-reference)
+11. [CLI Reference](#cli-reference)
+12. [ntfy Messaging](#ntfy-messaging)
+13. [Sandbox Modes](#sandbox-modes)
+14. [Notifications](#notifications)
+15. [Acceptance Criteria](#acceptance-criteria)
+16. [Configuration](#configuration)
+17. [Development](#development)
+18. [License](#license)
 
 ---
 
@@ -416,6 +417,80 @@ stays under 150 lines to maintain >92% adherence.
 
 The preset file lives at `claude_runner/presets/cccs-v1.0.cccs.toml` and can
 be forked for custom domain standards.
+
+---
+
+## Agent-free fallback launch *(optional pattern)*
+
+A pattern the agent **may** apply when a project's work needs to keep running
+after the agent or the operator's Claude subscription becomes unavailable:
+ship the project with a fully scripted launch path that does not depend on
+claude-runner or any LLM.
+
+### When the agent should consider this pattern
+
+- The project is a long-running compute pipeline (multi-hour to multi-day
+  sweeps, training loops, simulations).
+- A non-coder researcher will operate the project after hand-off.
+- The operator's Claude subscription has a known expiry window inside the
+  project's runtime budget.
+- The agent's own rate-limit recovery has been unreliable on this host (in
+  which case shifting from agent-driven to scripted execution removes a
+  fragile dependency).
+
+### What "agent-free launch" means in practice
+
+A single entry-point script the operator can invoke directly, paired with a
+user-editable config file. Concretely:
+
+```
+project_root/
+├── drive_<phase>.sh          # idempotent driver: env check, run, commit
+├── drive_config.sh           # user-editable parameters (sourced by driver)
+├── finalize.sh               # produces a partial deliverable at any point
+└── ... (the project's own code)
+```
+
+Properties the driver should hold:
+
+- **Idempotent.** Re-running picks up where it left off; completed work is
+  detected and skipped. No re-doing committed phases.
+- **Detachable.** Designed to be wrapped in `setsid nohup … &` so the work
+  survives the operator walking away from the terminal.
+- **No agent dependency.** Pure bash / python / make. Does not need
+  `claude`, `claude-runner`, or network access to Anthropic to function.
+- **Partial-deliverable safety net.** A separate `finalize.sh` can produce
+  a closeout artefact (best result, plots, README) from whatever state
+  exists, so an interrupted run still ships something.
+- **User-editable parameters.** All knobs (rank counts, target metrics,
+  sweep slices, BO toggles) live in a config file the researcher can
+  edit, not buried in the driver.
+
+### Mandatory under the `scisim` CCCS profile
+
+For projects using `cccs.profile: scisim` the agent-free launch path is
+**mandatory** rather than optional. Science simulations are exactly the
+class of work where full operator autonomy and full customisability matter
+most: the researcher must be able to run, restart, and re-parameterise the
+simulation without LLM mediation. See `claude_runner/presets/cccs-v1.0.cccs.toml`
+section `[tail.scisim.deliverability_gate]` for the checked criteria.
+
+For other profiles (`engineering`, custom) the pattern is recommended but
+not gated. The agent decides per project whether the operational risk
+profile justifies the extra scripting.
+
+### Why this co-exists with claude-runner rather than replacing it
+
+The agent-led path (`run.sh` + claude-runner) and the agent-free path
+(`drive_*.sh`) are two views of the same project, sharing the same git
+state and output directory. Either path can resume the other's work
+without re-running completed phases. The agent path is the productive
+default while an agent is available; the agent-free path is the route
+home if it is not.
+
+This composes naturally with the [NSuicide Principle](#nsuicide-principle-nsp):
+NSP keeps the agent from voluntarily exiting; the agent-free path is what
+the operator runs after the agent has been forced to exit anyway.
 
 ---
 
