@@ -41,7 +41,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .context_manager import (
     STRATEGY_CONTINUE,
@@ -1018,11 +1018,15 @@ class TaskRunner:
         # --- Wait with TUI countdown -------------------------------------
         from .rate_limit import RateLimitWaiter  # noqa: PLC0415
         logger.info("[ACTION] Waiting for rate limit to reset at %s.", wait_until_str)
-        waiter = RateLimitWaiter(
-            reset_at=reset_time,
-            on_tick=self._on_countdown_tick,
-            on_resume=lambda: None,  # resume is handled after wait returns
-        )
+        probe_interval = float(getattr(self._config, "rate_limit_probe_interval_s", 0.0))
+        waiter_kwargs: dict[str, Any] = {
+            "on_tick": self._on_countdown_tick,
+            "on_resume": lambda: None,  # resume is handled after wait returns
+        }
+        if probe_interval > 0:
+            waiter_kwargs["on_probe"] = self._on_rate_limit_probe
+            waiter_kwargs["probe_interval_s"] = probe_interval
+        waiter = RateLimitWaiter(reset_at=reset_time, **waiter_kwargs)
         try:
             await waiter.wait()
         finally:
@@ -2747,6 +2751,60 @@ class TaskRunner:
                 "task": self._book.name,
             },
         )
+
+    def _on_rate_limit_probe(self) -> bool:
+        """
+        Probe the Anthropic API to detect early lift of a rate limit.
+
+        Wired into ``RateLimitWaiter`` when ``Config.rate_limit_probe_interval_s``
+        is > 0.  The waiter calls this every probe_interval seconds during a
+        rate-limit cooldown.  Returns True iff a tiny ``claude -p`` probe
+        succeeds (rate limit has lifted ahead of the advertised ``reset_at``).
+
+        Failure modes are deliberately silent: any non-zero exit code,
+        timeout, missing-binary, or stderr message is treated as "still
+        rate-limited; keep waiting".  This callback runs in synchronous
+        context inside the RateLimitWaiter loop, so a 30 s timeout is
+        applied to keep the wait loop responsive.
+        """
+        import shutil  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+
+        claude_bin = shutil.which("claude")
+        if claude_bin is None:
+            logger.debug("rate-limit probe: 'claude' not on PATH; skipping")
+            return False
+
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [claude_bin, "-p", "Reply with only: ok"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.info("rate-limit probe: 30 s timeout — treating as not-lifted")
+            return False
+        except OSError as exc:
+            logger.info("rate-limit probe: OSError %s — treating as not-lifted", exc)
+            return False
+
+        if proc.returncode != 0:
+            # Truncate stderr to a single short line for the log.
+            err = (proc.stderr or "").strip().splitlines()[:1]
+            err_one_line = err[0][:120] if err else "(no stderr)"
+            logger.info(
+                "rate-limit probe: exit %s — still limited (%s)",
+                proc.returncode,
+                err_one_line,
+            )
+            return False
+
+        # Success: the API answered. Treat as lifted regardless of the
+        # exact reply text — we just need to know the quota window is open.
+        logger.info("rate-limit probe: claude -p succeeded — limit appears lifted")
+        return True
 
     # ------------------------------------------------------------------
     # A1: Inbox drain helper

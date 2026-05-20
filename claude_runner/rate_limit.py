@@ -21,6 +21,16 @@ RateLimitWaiter
     TUI layer can display a live countdown, and fires ``on_resume()`` when
     the wait completes.
 
+    Optional early-resume probe: pass ``on_probe`` and ``probe_interval_s``
+    to have the waiter call ``on_probe()`` every N seconds during the wait.
+    If the probe returns True (rate limit lifted), the waiter exits early
+    and fires ``on_resume()``.  This mitigates two failure modes observed
+    in the wild: (a) the Anthropic ``retry-after`` window being
+    conservative (the limit lifts earlier than advertised), and (b) the
+    long idle wait correlating with worker-subprocess death.  Even when
+    the probe returns False, the act of probing keeps the orchestrator
+    code path warm and provides a heartbeat log line every probe cycle.
+
 RateLimitError
     Raised by higher-level orchestration code when the configured maximum
     number of consecutive rate-limit waits has been exceeded.
@@ -375,10 +385,23 @@ class RateLimitWaiter:
         Extra seconds added on top of the calculated wait to account for
         clock skew between the local machine and Anthropic's servers.
         Defaults to 5 s.
+    on_probe:
+        Optional callback invoked every ``probe_interval_s`` seconds to
+        check whether the rate limit has lifted EARLIER than ``reset_at``.
+        Signature: ``on_probe() -> bool`` — returns True if the API is
+        usable again (wait can exit early and fire ``on_resume``), False
+        otherwise.  If the callback raises, the exception is logged and
+        the wait continues normally.  Defaults to None (no probing).
+    probe_interval_s:
+        Seconds between probe attempts.  Has no effect when ``on_probe``
+        is None.  Defaults to 300 s (5 min) — a compromise between
+        cheaply burning quota with too-frequent probes and missing an
+        early-lift opportunity by checking too rarely.
     """
 
     _DEFAULT_TICK_INTERVAL: float = 30.0
     _DEFAULT_BUFFER_SECONDS: float = 5.0
+    _DEFAULT_PROBE_INTERVAL: float = 300.0
 
     def __init__(
         self,
@@ -388,6 +411,8 @@ class RateLimitWaiter:
         *,
         tick_interval: float = _DEFAULT_TICK_INTERVAL,
         buffer_seconds: float = _DEFAULT_BUFFER_SECONDS,
+        on_probe: Callable[[], bool] | None = None,
+        probe_interval_s: float = _DEFAULT_PROBE_INTERVAL,
     ) -> None:
         if reset_at.tzinfo is None:
             raise ValueError("reset_at must be a timezone-aware datetime (use UTC)")
@@ -396,8 +421,12 @@ class RateLimitWaiter:
         self._on_resume = on_resume
         self._tick_interval = max(1.0, float(tick_interval))
         self._buffer_seconds = max(0.0, float(buffer_seconds))
+        self._on_probe = on_probe
+        self._probe_interval_s = max(30.0, float(probe_interval_s))
         self._cancelled = False
         self._cancel_event: asyncio.Event | None = None
+        # Tracks last probe time (set on entry to wait()).
+        self._last_probe_at: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -411,6 +440,7 @@ class RateLimitWaiter:
         This method is safe to call in any asyncio event loop.
         """
         self._cancel_event = asyncio.Event()
+        self._last_probe_at = time.monotonic()
 
         total_wait = self._seconds_until_reset() + self._buffer_seconds
 
@@ -420,9 +450,10 @@ class RateLimitWaiter:
             return
 
         log.info(
-            "Rate limit wait started: reset_at=%s, total_wait=%.1fs",
+            "Rate limit wait started: reset_at=%s, total_wait=%.1fs, probe=%s",
             self._reset_at.isoformat(),
             total_wait,
+            "every %.0fs" % self._probe_interval_s if self._on_probe else "off",
         )
 
         elapsed = 0.0
@@ -433,6 +464,21 @@ class RateLimitWaiter:
 
             # Fire tick callback
             self._fire_tick(remaining)
+
+            # Optional probe: every `probe_interval_s`, ask the caller if
+            # the rate limit has actually lifted. If yes, exit early.
+            if self._on_probe is not None:
+                since_last_probe = time.monotonic() - self._last_probe_at
+                if since_last_probe >= self._probe_interval_s:
+                    self._last_probe_at = time.monotonic()
+                    if self._fire_probe():
+                        log.info(
+                            "Rate-limit probe reported availability "
+                            "after %.1fs (%.1fs ahead of reset_at)",
+                            elapsed,
+                            remaining,
+                        )
+                        break
 
             # Sleep for the smaller of tick_interval or remaining time,
             # but also watch for cancellation.
@@ -499,3 +545,17 @@ class RateLimitWaiter:
             self._on_resume()
         except Exception as exc:
             log.warning("on_resume callback raised: %s", exc)
+
+    def _fire_probe(self) -> bool:
+        """Call the optional rate-limit-lift probe.  Returns True if the
+        probe reports the limit has lifted; False otherwise (including the
+        case where the probe raised an exception)."""
+        if self._on_probe is None:
+            return False
+        try:
+            result = bool(self._on_probe())
+        except Exception as exc:
+            log.warning("on_probe callback raised: %s — treating as not-lifted", exc)
+            return False
+        log.info("Rate-limit probe returned %s", result)
+        return result

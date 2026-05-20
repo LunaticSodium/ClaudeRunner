@@ -8,6 +8,7 @@ management, timestamp validation, and RateLimitWaiter async behaviour.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -357,6 +358,112 @@ class TestRateLimitWaiter:
             buffer_seconds=-99,
         )
         assert waiter._buffer_seconds == 0.0
+
+    def test_probe_interval_clamped_to_minimum(self):
+        """probe_interval_s below 30 s is clamped to 30 s."""
+        dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        waiter = RateLimitWaiter(
+            reset_at=dt,
+            on_tick=lambda r: None,
+            on_resume=lambda: None,
+            on_probe=lambda: False,
+            probe_interval_s=1.0,
+        )
+        assert waiter._probe_interval_s == 30.0
+
+    def test_probe_defaults_to_disabled(self):
+        """Without on_probe, the waiter does not call any probe."""
+        dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        waiter = RateLimitWaiter(
+            reset_at=dt,
+            on_tick=lambda r: None,
+            on_resume=lambda: None,
+        )
+        assert waiter._on_probe is None
+
+    def test_fire_probe_true(self):
+        """_fire_probe returns True when on_probe returns True."""
+        dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        waiter = RateLimitWaiter(
+            reset_at=dt,
+            on_tick=lambda r: None,
+            on_resume=lambda: None,
+            on_probe=lambda: True,
+        )
+        assert waiter._fire_probe() is True
+
+    def test_fire_probe_false(self):
+        """_fire_probe returns False when on_probe returns False."""
+        dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        waiter = RateLimitWaiter(
+            reset_at=dt,
+            on_tick=lambda r: None,
+            on_resume=lambda: None,
+            on_probe=lambda: False,
+        )
+        assert waiter._fire_probe() is False
+
+    def test_fire_probe_exception(self):
+        """_fire_probe swallows exceptions and treats them as not-lifted."""
+        dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+
+        def boom() -> bool:
+            raise RuntimeError("probe failed")
+
+        waiter = RateLimitWaiter(
+            reset_at=dt,
+            on_tick=lambda r: None,
+            on_resume=lambda: None,
+            on_probe=boom,
+        )
+        # Must not raise; returns False.
+        assert waiter._fire_probe() is False
+
+    def test_fire_probe_no_callback(self):
+        """_fire_probe returns False when on_probe is None."""
+        dt = datetime.now(tz=timezone.utc) + timedelta(hours=1)
+        waiter = RateLimitWaiter(
+            reset_at=dt,
+            on_tick=lambda r: None,
+            on_resume=lambda: None,
+        )
+        assert waiter._fire_probe() is False
+
+    @pytest.mark.asyncio
+    async def test_probe_returning_true_exits_early(self):
+        """A probe that returns True exits the wait ahead of reset_at."""
+        # Reset 60 s in the future. Probe interval 30 s (the minimum).
+        # We backdate _last_probe_at after entry by patching wait() flow:
+        # we monkey-patch via a wrapper that resets _last_probe_at to far
+        # in the past so the FIRST loop iteration fires the probe.
+        reset_at = datetime.now(tz=timezone.utc) + timedelta(seconds=60)
+        resumes: list[bool] = []
+        probe_calls: list[int] = []
+
+        def probe() -> bool:
+            probe_calls.append(1)
+            return True
+
+        waiter = RateLimitWaiter(
+            reset_at=reset_at,
+            on_tick=lambda r: None,
+            on_resume=lambda: resumes.append(True),
+            tick_interval=0.02,
+            buffer_seconds=0.0,
+            on_probe=probe,
+            probe_interval_s=30.0,
+        )
+
+        # Race: set last_probe_at to ago AFTER wait() initialises it.
+        async def force_probe() -> None:
+            await asyncio.sleep(0.01)
+            waiter._last_probe_at = time.monotonic() - 60.0
+
+        await asyncio.gather(waiter.wait(), force_probe())
+        assert len(probe_calls) >= 1
+        assert len(resumes) == 1
+        # We should have exited well before the 60 s reset.
+        # (No strict timing assertion to avoid CI flakiness.)
 
 
 # ---------------------------------------------------------------------------

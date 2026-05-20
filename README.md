@@ -1036,6 +1036,11 @@ docker_socket: "npipe:////./pipe/docker_engine"
 # Session behaviour
 resume_strategy: continue        # continue | restate | summarize
 max_rate_limit_waits: 20
+# Probe interval during a rate-limit wait, in seconds. When > 0, runs a
+# tiny `claude -p` probe every N seconds; if the API answers, the waiter
+# exits early instead of sleeping the full retry-after window. Set to 0
+# to disable (legacy behaviour). Min 30 s when enabled. Default 300 s.
+rate_limit_probe_interval_s: 300
 
 # UI
 tui: true                        # false = plain log lines (CI-friendly)

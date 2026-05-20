@@ -131,6 +131,15 @@ class Config:
     max_rate_limit_waits:
         How many consecutive Anthropic rate-limit responses to tolerate before
         the task is considered failed.  0 = fail immediately on first limit.
+    rate_limit_probe_interval_s:
+        During a rate-limit wait, how often (in seconds) to probe the
+        Anthropic API to detect early lift of the limit.  When the probe
+        succeeds, the waiter exits early and the worker resumes ahead of
+        the ``retry-after`` window.  This mitigates two failure modes
+        observed in the wild: (a) Anthropic's ``retry-after`` is
+        conservative, and (b) long idle waits correlate with worker
+        subprocess death.  Set to 0 to disable probing entirely (legacy
+        behaviour).  Default: 300 s (5 min).  Minimum: 30 s.
     docker_base_image:
         Docker image used as the base for task containers.  Must have
         ``node``, ``git``, and the Claude CLI pre-installed.
@@ -150,6 +159,7 @@ class Config:
     tui: bool = True
     resume_strategy: str = "continue"
     max_rate_limit_waits: int = 20
+    rate_limit_probe_interval_s: float = 300.0
     docker_base_image: str = "claude-runner-base:latest"
     docker_socket: str = "npipe:////./pipe/docker_engine"
 
@@ -183,6 +193,7 @@ class Config:
         self.marathon_mode_default = Config.marathon_mode_default
         self.resume_strategy = Config.resume_strategy
         self.max_rate_limit_waits = Config.max_rate_limit_waits
+        self.rate_limit_probe_interval_s = Config.rate_limit_probe_interval_s
         self.docker_base_image = Config.docker_base_image
         self.docker_socket = Config.docker_socket
 
@@ -326,8 +337,9 @@ class Config:
         _path_fields = {"log_dir", "state_dir"}
         _bool_fields = {"tui", "cccs_enabled", "marathon_mode_default"}
         _int_fields = {"max_rate_limit_waits"}
+        _float_fields = {"rate_limit_probe_interval_s"}
 
-        known_fields = _str_fields | _path_fields | _bool_fields | _int_fields
+        known_fields = _str_fields | _path_fields | _bool_fields | _int_fields | _float_fields
 
         for key, value in data.items():
             if key not in known_fields:
@@ -348,6 +360,13 @@ class Config:
                 except (TypeError, ValueError) as exc:
                     raise ConfigError(
                         f"Invalid value for {key!r} in {source}: expected integer, got {value!r}"
+                    ) from exc
+            elif key in _float_fields:
+                try:
+                    setattr(self, key, float(value))
+                except (TypeError, ValueError) as exc:
+                    raise ConfigError(
+                        f"Invalid value for {key!r} in {source}: expected float, got {value!r}"
                     ) from exc
 
         # Post-load validation
